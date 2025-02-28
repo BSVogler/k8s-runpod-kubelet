@@ -689,7 +689,7 @@ func (c *JobController) cleanupDeletedJobs() error {
 	}
 
 	// Track jobs to remove from map
-	jobsToRemove := []string{}
+	var jobsToRemove []string
 
 	// Check each tracked job
 	for jobKey, runpodID := range c.deletedJobs {
