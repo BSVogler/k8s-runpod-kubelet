@@ -1,4 +1,7 @@
 name: Docker Image CI
+permissions:
+  packages: write
+  contents: read
 on:
   push:
     branches: [ "master" ]
