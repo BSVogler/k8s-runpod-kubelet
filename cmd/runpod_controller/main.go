@@ -7,8 +7,8 @@ import (
 	"syscall"
 	"time"
 
-	"k8s-runpod-controller/pkg/config"
-	"k8s-runpod-controller/pkg/controller"
+	"github.com/bsvogler/k8s-runpod-controller/pkg/config"
+	"github.com/bsvogler/k8s-runpod-controller/pkg/runpod_controller"
 
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
