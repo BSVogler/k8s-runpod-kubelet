@@ -4,8 +4,6 @@
 *.dll
 *.so
 *.dylib
-controller
-!cmd/controller
 
 # Test binary, built with `go test -c`
 *.test

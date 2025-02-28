@@ -88,7 +88,7 @@ spec:
       serviceAccountName: runpod-controller
       containers:
       - name: controller
-        image: your-registry/runpod-controller:latest
+        image: bsvogler/runpod-controller:latest
         args:
         - "--reconcile-interval=30"
         - "--pending-job-threshold=5"

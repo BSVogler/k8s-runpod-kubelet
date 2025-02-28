@@ -8,11 +8,11 @@ RUN go mod download
 COPY cmd/ cmd/
 COPY pkg/ pkg/
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -o controller cmd/controller/main.go
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -o runpod_controller cmd/controller/main.go
 
 FROM gcr.io/distroless/static:nonroot
 WORKDIR /
 COPY --from=builder /workspace/controller .
 USER 65532:65532
 
-ENTRYPOINT ["/controller"]
+ENTRYPOINT ["/runpod_controller"]

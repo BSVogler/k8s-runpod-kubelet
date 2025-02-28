@@ -149,26 +149,6 @@ kubectl get job my-job -o jsonpath='{.metadata.annotations}'
 
 ## Development
 
-### Project Structure
-
-```
-k8s-runpod-controller/
-├── cmd/
-│   └── controller/
-│       └── main.go
-├── pkg/
-│   ├── config/
-│   │   └── config.go
-│   └── controller/
-│       └── job_controller.go
-├── deploy/
-│   ├── runpod-controller.yaml
-│   └── virtual-node-setup.yaml
-├── go.mod
-├── go.sum
-└── README.md
-```
-
 ### Local Development
 
 For local development, you can run:
