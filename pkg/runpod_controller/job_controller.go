@@ -5,7 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/bsvogler/k8s-runpod-controller/pkg/config"
+	"github.com/go-logr/logr"
 	"io"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	"net/http"
 	"os"
 	"sort"
@@ -13,23 +19,16 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"github.com/bsvogler/k8s-runpod-controller/pkg/config"
-	batchv1 "k8s.io/api/batch/v1"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/client-go/kubernetes"
-	"github.com/go-logr/logr"
 )
 
 const (
 	// Constants for RunPod integration
-	RunpodManagedAnnotation = "runpod.io/managed"
-	RunpodOffloadAnnotation = "runpod.io/offload"
+	RunpodManagedAnnotation   = "runpod.io/managed"
+	RunpodOffloadAnnotation   = "runpod.io/offload"
 	RunpodOffloadedAnnotation = "runpod.io/offloaded"
-	RunpodPodIDAnnotation = "runpod.io/pod-id"
-	RunpodCostAnnotation = "runpod.io/cost-per-hr"
-	RunpodManagedLabel = "runpod.io/managed"
+	RunpodPodIDAnnotation     = "runpod.io/pod-id"
+	RunpodCostAnnotation      = "runpod.io/cost-per-hr"
+	RunpodManagedLabel        = "runpod.io/managed"
 
 	// Annotation for GPU memory requirements
 	GpuMemoryAnnotation = "runpod.io/required-gpu-memory"
@@ -46,11 +45,11 @@ type RunPodEnv struct {
 
 // GPUType represents the GPU type from RunPod API
 type GPUType struct {
-	ID           string  `json:"id"`
-	DisplayName  string  `json:"displayName"`
-	MemoryInGb   int     `json:"memoryInGb"`
-	SecureCloud  bool    `json:"secureCloud"`
-	SecurePrice  float64 `json:"securePrice"`
+	ID          string  `json:"id"`
+	DisplayName string  `json:"displayName"`
+	MemoryInGb  int     `json:"memoryInGb"`
+	SecureCloud bool    `json:"secureCloud"`
+	SecurePrice float64 `json:"securePrice"`
 }
 
 // RunPodResponse represents the response from RunPod API
@@ -85,7 +84,7 @@ type JobController struct {
 	maxPrice         float64
 	deletedJobs      map[string]string // Maps job name to runpod ID for cleanup
 	deletedJobsMutex sync.Mutex
-	runpodAvailable  bool              // Tracks if RunPod API is available
+	runpodAvailable  bool // Tracks if RunPod API is available
 	healthServer     *HealthServer
 }
 
@@ -121,7 +120,7 @@ func NewJobController(clientset *kubernetes.Clientset, logger logr.Logger, cfg c
 // Start begins the controller's reconciliation loop
 func (c *JobController) Start() error {
 	reconcileTicker := time.NewTicker(c.config.ReconcileInterval)
-	cleanupTicker := time.NewTicker(5 * time.Minute) // Check for cleanup every 5 minutes
+	cleanupTicker := time.NewTicker(5 * time.Minute)     // Check for cleanup every 5 minutes
 	healthCheckTicker := time.NewTicker(1 * time.Minute) // Check RunPod API health every minute
 	defer reconcileTicker.Stop()
 	defer cleanupTicker.Stop()
@@ -324,9 +323,9 @@ func (c *JobController) getPossibleGPUs(minMemoryInGb int) (string, error) {
 	var filteredGPUs []GPUType
 	for _, gpu := range response.Data.GPUTypes {
 		if gpu.SecureCloud &&
-		   gpu.SecurePrice > 0 &&
-		   gpu.SecurePrice < c.maxPrice &&
-		   gpu.MemoryInGb >= minMemoryInGb {
+			gpu.SecurePrice > 0 &&
+			gpu.SecurePrice < c.maxPrice &&
+			gpu.MemoryInGb >= minMemoryInGb {
 			filteredGPUs = append(filteredGPUs, gpu)
 		}
 	}
@@ -392,8 +391,8 @@ func (c *JobController) extractEnvVars(job batchv1.Job) ([]RunPodEnv, error) {
 			}
 
 			// Check if this secret should be included as environment variables
-			if value, exists := volume.Secret.Items; exists && len(value) > 0 {
-				for _, item := range value {
+			if items := volume.Secret.Items; len(items) > 0 {
+				for _, item := range items {
 					if secretValue, ok := secret.Data[item.Key]; ok {
 						// Add it as an environment variable
 						envVars = append(envVars, RunPodEnv{
@@ -420,9 +419,6 @@ func formatEnvVarsForGraphQL(envVars []RunPodEnv) string {
 
 // offloadJobToRunPod sends the job to RunPod and creates a corresponding Pod representation
 func (c *JobController) offloadJobToRunPod(job batchv1.Job) error {
-	// Extract job ID for naming
-	jobID := job.Name
-
 	// Determine minimum GPU memory required
 	minMemoryInGb := 16 // Default minimum memory
 	if memStr, exists := job.Annotations[GpuMemoryAnnotation]; exists {

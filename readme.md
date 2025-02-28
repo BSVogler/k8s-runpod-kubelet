@@ -29,7 +29,7 @@ The controller periodically scans all Jobs with GPU requests and offloads them t
 ### Building
 
 ```bash
-go build -o runpod-controller ./cmd/controller
+go build -o runpod-controller ./cmd/runpod_controller
 ```
 
 ### Virtual Node Setup
@@ -154,7 +154,7 @@ kubectl get job my-job -o jsonpath='{.metadata.annotations}'
 For local development, you can run:
 
 ```bash
-go run ./cmd/controller --kubeconfig=$HOME/.kube/config
+go run ./cmd/runpod_controller --kubeconfig=$HOME/.kube/config
 ```
 
 ### Running Tests

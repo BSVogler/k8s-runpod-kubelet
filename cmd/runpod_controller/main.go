@@ -10,12 +10,11 @@ import (
 	"github.com/bsvogler/k8s-runpod-controller/pkg/config"
 	"github.com/bsvogler/k8s-runpod-controller/pkg/runpod_controller"
 
+	"github.com/go-logr/zapr"
+	"go.uber.org/zap"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"github.com/go-logr/logr"
-	"github.com/go-logr/zapr"
-	"go.uber.org/zap"
 )
 
 func main() {
@@ -41,17 +40,17 @@ func main() {
 	logger := zapr.NewLogger(zapLog)
 
 	// Create Kubernetes client
-	var config *rest.Config
+	var k8sConfig *rest.Config
 	if kubeconfig == "" {
 		// Use in-cluster config
-		config, err = rest.InClusterConfig()
+		k8sConfig, err = rest.InClusterConfig()
 		if err != nil {
 			logger.Error(err, "Failed to create in-cluster config")
 			os.Exit(1)
 		}
 	} else {
 		// Use kubeconfig file
-		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+		k8sConfig, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
 		if err != nil {
 			logger.Error(err, "Failed to create config from kubeconfig file", "kubeconfig", kubeconfig)
 			os.Exit(1)
@@ -59,7 +58,7 @@ func main() {
 	}
 
 	// Create clientset
-	clientset, err := kubernetes.NewForConfig(config)
+	clientset, err := kubernetes.NewForConfig(k8sConfig)
 	if err != nil {
 		logger.Error(err, "Failed to create Kubernetes client")
 		os.Exit(1)
@@ -67,19 +66,19 @@ func main() {
 
 	// Create controller config
 	controllerConfig := config.Config{
-		ReconcileInterval:    time.Duration(reconcileInterval) * time.Second,
-		PendingJobThreshold:  pendingJobThreshold,
-		MaxGPUPrice:          maxGPUPrice,
-		HealthServerAddress:  healthServerAddress,
+		ReconcileInterval:   time.Duration(reconcileInterval) * time.Second,
+		PendingJobThreshold: pendingJobThreshold,
+		MaxGPUPrice:         maxGPUPrice,
+		HealthServerAddress: healthServerAddress,
 	}
 
 	// Create and start controller
-	controller := controller.NewJobController(clientset, logger, controllerConfig)
+	jobController := controller.NewJobController(clientset, logger, controllerConfig)
 
 	// Start controller in a goroutine
 	errChan := make(chan error, 1)
 	go func() {
-		errChan <- controller.Start()
+		errChan <- jobController.Start()
 	}()
 
 	// Set up signal handling
