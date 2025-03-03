@@ -47,7 +47,7 @@ This creates a non-schedulable virtual node that serves as a placeholder for Run
 Create a secret with your RunPod API key:
 
 ```bash
-kubectl create secret generic runpod-controller-secrets \
+kubectl create secret generic runpod-controller-secrets -n kube-system \
   --from-literal=RUNPOD_KEY=your_runpod_api_key
 ```
 
