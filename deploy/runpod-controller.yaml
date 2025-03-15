@@ -36,12 +36,28 @@ kind: ClusterRole
 metadata:
   name: runpod-controller
 rules:
-- apiGroups: ["batch"]
-  resources: ["jobs"]
-  verbs: ["get", "list", "watch", "update", "patch"]
-- apiGroups: [""]
-  resources: ["secrets"]
-  verbs: ["get", "list"]
+  # List and watch jobs across all namespaces
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch"]
+  # Get node information
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  # For job modification and pod creation/deletion in any namespace
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["update", "patch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Read secrets only in the kube-system namespace (for RunPod API key)
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
