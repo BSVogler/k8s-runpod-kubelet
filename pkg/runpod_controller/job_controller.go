@@ -174,10 +174,8 @@ func (c *JobController) Start() error {
 
 // reconcile checks for jobs that need to be offloaded to RunPod
 func (c *JobController) reconcile() error {
-	// List all jobs with GPU resources
-	jobs, err := c.clientset.BatchV1().Jobs("").List(context.Background(), metav1.ListOptions{
-		LabelSelector: "nvidia.com/gpu",
-	})
+	// List all jobs with the runpod.io/managed annotation
+	jobs, err := c.clientset.BatchV1().Jobs("").List(context.Background(), metav1.ListOptions{})
 	if err != nil {
 		return err
 	}
@@ -186,12 +184,17 @@ func (c *JobController) reconcile() error {
 	activeJobs := make(map[string]bool)
 
 	for _, job := range jobs.Items {
+		// Skip jobs that don't have the runpod.io/managed annotation
+		if !isRunPodJob(job) {
+			continue
+		}
+
 		// Track all active job names
 		jobKey := fmt.Sprintf("%s/%s", job.Namespace, job.Name)
 		activeJobs[jobKey] = true
 
 		// Check if job needs labeling
-		if isRunPodJob(job) && !hasRunPodLabel(job) {
+		if !hasRunPodLabel(job) {
 			if err := c.labelAsRunPodJob(&job); err != nil {
 				c.logger.Error(err, "failed to label RunPod job", "job", job.Name)
 				continue
@@ -201,16 +204,12 @@ func (c *JobController) reconcile() error {
 		// Check if job should be offloaded to RunPod
 		if isPending(job) {
 			pendingCount++
-			if shouldOffloadToRunPod(job) {
+			if shouldOffloadToRunPod(job, pendingCount, c.config) {
 				if err := c.offloadJobToRunPod(job); err != nil {
 					c.logger.Error(err, "failed to offload job to RunPod", "job", job.Name)
 				}
 			}
 		}
-	}
-
-	if pendingCount > c.config.PendingJobThreshold {
-		c.logger.Info("too many pending jobs, considering offloading to RunPod", "count", pendingCount)
 	}
 
 	// Check for deleted jobs and update the tracking map
@@ -240,7 +239,7 @@ func hasRunPodLabel(job batchv1.Job) bool {
 }
 
 // shouldOffloadToRunPod determines if a job should be offloaded to RunPod
-func shouldOffloadToRunPod(job batchv1.Job) bool {
+func shouldOffloadToRunPod(job batchv1.Job, pendingCounter int, cfg config.Config) bool {
 	// Already offloaded
 	if _, hasOffloaded := job.Annotations[RunpodOffloadedAnnotation]; hasOffloaded {
 		return false
@@ -256,7 +255,7 @@ func shouldOffloadToRunPod(job batchv1.Job) bool {
 	creationTime := job.CreationTimestamp.Time
 	pendingTime := time.Since(creationTime)
 
-	return pendingTime > 5*time.Minute
+	return pendingTime > time.Duration(cfg.MaxPendingTime)*time.Second || pendingCounter > cfg.PendingJobThreshold
 }
 
 // labelAsRunPodJob adds the RunPod managed label to a job

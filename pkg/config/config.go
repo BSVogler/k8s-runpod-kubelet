@@ -12,6 +12,9 @@ type Config struct {
 	// PendingJobThreshold is the number of pending jobs that triggers automatic offloading
 	PendingJobThreshold int
 
+	// MaxPendingTime that a job is allowed to stay in pending state before it is offloaded
+	MaxPendingTime int
+	
 	// MaxGPUPrice is the maximum price per hour we're willing to pay for GPU instances
 	MaxGPUPrice float64
 
@@ -22,9 +25,10 @@ type Config struct {
 // DefaultConfig returns a default configuration
 func DefaultConfig() Config {
 	return Config{
-		ReconcileInterval:    30 * time.Second,
-		PendingJobThreshold:  5,
-		MaxGPUPrice:          0.5,
-		HealthServerAddress:  ":8080",
+		ReconcileInterval:   30 * time.Second,
+		PendingJobThreshold: 1,
+		MaxPendingTime:      0,
+		MaxGPUPrice:         0.5,
+		HealthServerAddress: ":8080",
 	}
 }

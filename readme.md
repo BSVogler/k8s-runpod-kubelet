@@ -1,14 +1,17 @@
 # Kubernetes RunPod Controller
 
-This controller watches Kubernetes Jobs with GPU requests and offloads them to RunPod when resources are constrained or when explicitly requested. It maintains proper Kubernetes representations of RunPod instances and handles cleanup automatically.
+This controller watches annotated Kubernetes Jobs wand offloads them to RunPod when resources are constrained or when explicitly requested. It maintains proper Kubernetes representations of RunPod instances and handles cleanup automatically.
+The idea is that you have some local node that can process but you want to offload as a fallback scenario.
 
 ## Overview
 
-The controller periodically scans all Jobs with GPU requests and offloads them to RunPod in the following scenarios:
+The controller periodically scans all Jobs and offloads them to RunPod in the following scenarios:
 
-1. When Jobs are annotated with `runpod.io/offload: "true"`
-2. When Jobs have been pending for more than 5 minutes
-3. When the number of pending jobs exceeds a configurable threshold
+1. Jobs that can be offloaded must be annotated with `runpod.io/managed: "true"`.
+2. And when Jobs have been pending for more than [configurable seconds](#configuration) (default 0)
+3. or when the number of pending jobs exceeds a [configurable threshold](#configuration) (default 1)
+
+you can also force it by setting annotation `runpod.io/offload: "true"` to the Job.
 
 ## Key Features
 
@@ -63,7 +66,8 @@ The controller can be configured with the following flags:
 
 - `--kubeconfig`: Path to kubeconfig file (only for running outside the cluster)
 - `--reconcile-interval`: How often to check for jobs (in seconds, default: 30)
-- `--pending-job-threshold`: Number of pending jobs that triggers automatic offloading (default: 5)
+- `--pending-job-threshold`: Number of pending jobs that triggers automatic offloading (default: 1)
+- `--max-pending-time`: Maximum time that a job is allowed to stay in pending state before it is offloaded (default: 0)
 - `--max-gpu-price`: Maximum price per hour for GPU instances (default: 0.5)
 - `--health-server-address`: Address for the health check server (default: :8080)
 

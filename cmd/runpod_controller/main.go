@@ -22,12 +22,14 @@ func main() {
 	var kubeconfig string
 	var reconcileInterval int
 	var pendingJobThreshold int
+	var maxPendingTime int
 	var maxGPUPrice float64
 	var healthServerAddress string
 
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig file")
 	flag.IntVar(&reconcileInterval, "reconcile-interval", 30, "Reconcile interval in seconds")
 	flag.IntVar(&pendingJobThreshold, "pending-job-threshold", 5, "Number of pending jobs that triggers automatic offloading")
+	flag.IntVar(&maxPendingTime, "max-pending-time", 5, "Number of pending jobs that triggers automatic offloading")
 	flag.Float64Var(&maxGPUPrice, "max-gpu-price", 0.5, "Maximum price per hour for GPU instances")
 	flag.StringVar(&healthServerAddress, "health-server-address", ":8080", "Address for the health check server to listen on")
 	flag.Parse()
@@ -68,6 +70,7 @@ func main() {
 	controllerConfig := config.Config{
 		ReconcileInterval:   time.Duration(reconcileInterval) * time.Second,
 		PendingJobThreshold: pendingJobThreshold,
+		MaxPendingTime:      maxPendingTime,
 		MaxGPUPrice:         maxGPUPrice,
 		HealthServerAddress: healthServerAddress,
 	}
