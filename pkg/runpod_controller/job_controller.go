@@ -10,6 +10,7 @@ import (
 	"io"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"net/http"
@@ -416,6 +417,66 @@ func formatEnvVarsForGraphQL(envVars []RunPodEnv) string {
 	return strings.Join(envVarsStr, ",\n")
 }
 
+// updateJobWithRetry updates a job with retry logic to handle concurrent modifications
+func (c *JobController) updateJobWithRetry(job *batchv1.Job) error {
+	// Maximum number of retries
+	maxRetries := 5
+	retryCount := 0
+
+	for retryCount < maxRetries {
+		// Get the latest version of the job
+		latestJob, err := c.clientset.BatchV1().Jobs(job.Namespace).Get(
+			context.Background(),
+			job.Name,
+			metav1.GetOptions{},
+		)
+		if err != nil {
+			return fmt.Errorf("failed to get latest job version: %w", err)
+		}
+
+		// Apply our annotations to the latest job version
+		if latestJob.Annotations == nil {
+			latestJob.Annotations = make(map[string]string)
+		}
+		// Copy over the annotations we want to set
+		for k, v := range job.Annotations {
+			if strings.HasPrefix(k, "runpod.io/") {
+				latestJob.Annotations[k] = v
+			}
+		}
+
+		// Update the job with the latest version
+		_, err = c.clientset.BatchV1().Jobs(latestJob.Namespace).Update(
+			context.Background(),
+			latestJob,
+			metav1.UpdateOptions{},
+		)
+		if err == nil {
+			// Update successful
+			return nil
+		}
+
+		// Check if it's a conflict error
+		if !k8serrors.IsConflict(err) {
+			// If it's not a conflict error, return immediately
+			return err
+		}
+
+		// Increment retry count
+		retryCount++
+
+		// Wait a short time before retrying
+		time.Sleep(100 * time.Millisecond)
+
+		c.logger.Info("Retrying job update after conflict",
+			"job", job.Name,
+			"namespace", job.Namespace,
+			"retry", retryCount)
+	}
+
+	return fmt.Errorf("failed to update job after %d retries: %s/%s", maxRetries, job.Namespace, job.Name)
+}
+
 // offloadJobToRunPod sends the job to RunPod and creates a corresponding Pod representation
 func (c *JobController) offloadJobToRunPod(job batchv1.Job) error {
 	// Determine minimum GPU memory required
@@ -642,13 +703,8 @@ func (c *JobController) offloadJobToRunPod(job batchv1.Job) error {
 	}
 
 	// Update the job in Kubernetes with annotations
-	_, err = c.clientset.BatchV1().Jobs(job.Namespace).Update(
-		context.Background(),
-		&job,
-		metav1.UpdateOptions{},
-	)
-	if err != nil {
-		return err
+	if err := c.updateJobWithRetry(&job); err != nil {
+		return fmt.Errorf("failed to update job annotations: %w", err)
 	}
 
 	c.logger.Info("Successfully offloaded job to RunPod",
