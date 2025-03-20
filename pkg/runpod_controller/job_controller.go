@@ -139,10 +139,30 @@ func (c *JobController) cleanupTerminatingPods() error {
 		// Check if pod is terminating (has a deletion timestamp but still exists)
 		if pod.DeletionTimestamp != nil {
 			terminatingCount++
+			deletionTime := pod.DeletionTimestamp.Time
+			terminatingDuration := time.Since(deletionTime)
+
 			c.logger.Info("Found terminating pod",
 				"pod", pod.Name,
 				"namespace", pod.Namespace,
-				"deletionTimestamp", pod.DeletionTimestamp)
+				"deletionTimestamp", pod.DeletionTimestamp,
+				"terminatingFor", terminatingDuration.String())
+
+			// If pod has been terminating for more than 15 minutes, force delete it regardless of RunPod status
+			forceDeletionThreshold := 15 * time.Minute
+			if terminatingDuration > forceDeletionThreshold {
+				c.logger.Info("Pod has been terminating for too long, force deleting",
+					"pod", pod.Name,
+					"namespace", pod.Namespace,
+					"terminatingFor", terminatingDuration.String())
+
+				if err := c.forceDeletePod(pod.Namespace, pod.Name); err != nil {
+					c.logger.Error(err, "Failed to force delete long-terminating pod",
+						"pod", pod.Name,
+						"namespace", pod.Namespace)
+				}
+				continue
+			}
 
 			// Get RunPod ID from pod annotations
 			runpodID, exists := pod.Annotations[RunpodPodIDAnnotation]
@@ -166,6 +186,21 @@ func (c *JobController) cleanupTerminatingPods() error {
 				c.logger.Error(err, "Failed to check RunPod instance status",
 					"runpodID", runpodID,
 					"pod", pod.Name)
+
+				// If we get a GraphQL validation error or any other API error,
+				// assume the pod doesn't exist on RunPod anymore and force delete it
+				if strings.Contains(err.Error(), "GRAPHQL_VALIDATION_FAILED") ||
+					strings.Contains(err.Error(), "Something went wrong") {
+					c.logger.Info("RunPod API returned error, assuming instance no longer exists. Force deleting K8s pod",
+						"runpodID", runpodID,
+						"pod", pod.Name)
+
+					if err := c.forceDeletePod(pod.Namespace, pod.Name); err != nil {
+						c.logger.Error(err, "Failed to force delete pod after RunPod API error",
+							"pod", pod.Name,
+							"namespace", pod.Namespace)
+					}
+				}
 				continue
 			}
 
@@ -209,20 +244,28 @@ func (c *JobController) cleanupTerminatingPods() error {
 func (c *JobController) checkRunPodInstanceStatus(podID string) (string, error) {
 	url := fmt.Sprintf("https://api.runpod.io/graphql?api_key=%s", c.runpodKey)
 
-	query := fmt.Sprintf(`
-		query {
-			pod(input: {
-				podId: "%s"
-			}) {
+	// Using the format from the RunPod documentation
+	query := `
+		query pod($input: PodFilter) {
+			pod(input: $input) {
 				id
 				desiredStatus
 				currentStatus
 			}
 		}
-	`, podID)
+	`
 
-	reqBody, err := json.Marshal(map[string]string{
-		"query": query,
+	// Create variables for the GraphQL query
+	variables := map[string]interface{}{
+		"input": map[string]string{
+			"podId": podID,
+		},
+	}
+
+	// Create the request body with both query and variables
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"query":     query,
+		"variables": variables,
 	})
 	if err != nil {
 		return "", err
@@ -234,6 +277,10 @@ func (c *JobController) checkRunPodInstanceStatus(podID string) (string, error) 
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req = req.WithContext(ctx)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -271,6 +318,11 @@ func (c *JobController) checkRunPodInstanceStatus(podID string) (string, error) 
 			return "NOT_FOUND", nil
 		}
 		return "", fmt.Errorf("RunPod API error: %s", response.Errors[0].Message)
+	}
+
+	// Check if pod data is missing
+	if response.Data.Pod.ID == "" {
+		return "NOT_FOUND", nil
 	}
 
 	// Return current status if available, otherwise desired status
