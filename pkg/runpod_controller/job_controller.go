@@ -118,13 +118,200 @@ func NewJobController(clientset *kubernetes.Clientset, logger logr.Logger, cfg c
 	return controller
 }
 
+// cleanupTerminatingPods checks for pods in Terminating state on the RunPod virtual node
+// and ensures they are properly terminated both in K8s and on RunPod
+func (c *JobController) cleanupTerminatingPods() error {
+	c.logger.Info("Checking for terminating pods on RunPod virtual node")
+
+	// Check for any pods that might be terminating but stuck
+	allPods, err := c.clientset.CoreV1().Pods("").List(
+		context.Background(),
+		metav1.ListOptions{
+			LabelSelector: "runpod.io/managed=true",
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("failed to list all RunPod managed pods: %w", err)
+	}
+
+	terminatingCount := 0
+	for _, pod := range allPods.Items {
+		// Check if pod is terminating (has a deletion timestamp but still exists)
+		if pod.DeletionTimestamp != nil {
+			terminatingCount++
+			c.logger.Info("Found terminating pod",
+				"pod", pod.Name,
+				"namespace", pod.Namespace,
+				"deletionTimestamp", pod.DeletionTimestamp)
+
+			// Get RunPod ID from pod annotations
+			runpodID, exists := pod.Annotations[RunpodPodIDAnnotation]
+			if !exists {
+				c.logger.Info("Terminating pod missing RunPod ID annotation, will force delete",
+					"pod", pod.Name,
+					"namespace", pod.Namespace)
+
+				// Force delete the pod as it has no RunPod ID
+				if err := c.forceDeletePod(pod.Namespace, pod.Name); err != nil {
+					c.logger.Error(err, "Failed to force delete pod without RunPod ID",
+						"pod", pod.Name,
+						"namespace", pod.Namespace)
+				}
+				continue
+			}
+
+			// Check if the RunPod instance is still running
+			podStatus, err := c.checkRunPodInstanceStatus(runpodID)
+			if err != nil {
+				c.logger.Error(err, "Failed to check RunPod instance status",
+					"runpodID", runpodID,
+					"pod", pod.Name)
+				continue
+			}
+
+			// If RunPod instance is still active, terminate it
+			if podStatus == "RUNNING" || podStatus == "STARTING" {
+				c.logger.Info("RunPod instance is still active, terminating it",
+					"runpodID", runpodID,
+					"pod", pod.Name,
+					"status", podStatus)
+
+				if err := c.terminateRunPodInstance(runpodID); err != nil {
+					c.logger.Error(err, "Failed to terminate RunPod instance",
+						"runpodID", runpodID,
+						"pod", pod.Name)
+					continue
+				}
+
+				// Wait briefly for termination to be processed
+				time.Sleep(2 * time.Second)
+			} else if podStatus == "TERMINATED" || podStatus == "TERMINATING" || podStatus == "NOT_FOUND" {
+				// If pod is already terminated or not found, just force delete it from K8s
+				c.logger.Info("RunPod instance is already terminated or not found, cleaning up K8s pod",
+					"runpodID", runpodID,
+					"pod", pod.Name,
+					"status", podStatus)
+
+				if err := c.forceDeletePod(pod.Namespace, pod.Name); err != nil {
+					c.logger.Error(err, "Failed to force delete pod",
+						"pod", pod.Name,
+						"namespace", pod.Namespace)
+				}
+			}
+		}
+	}
+
+	c.logger.Info("Terminating pod cleanup completed", "processed", terminatingCount)
+	return nil
+}
+
+// checkRunPodInstanceStatus checks the status of a RunPod instance
+func (c *JobController) checkRunPodInstanceStatus(podID string) (string, error) {
+	url := fmt.Sprintf("https://api.runpod.io/graphql?api_key=%s", c.runpodKey)
+
+	query := fmt.Sprintf(`
+		query {
+			pod(input: {
+				podId: "%s"
+			}) {
+				id
+				desiredStatus
+				currentStatus
+			}
+		}
+	`, podID)
+
+	reqBody, err := json.Marshal(map[string]string{
+		"query": query,
+	})
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(reqBody))
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("RunPod API returned error: %d %s", resp.StatusCode, string(body))
+	}
+
+	// Parse response to get pod status
+	var response struct {
+		Data struct {
+			Pod struct {
+				ID            string `json:"id"`
+				DesiredStatus string `json:"desiredStatus"`
+				CurrentStatus string `json:"currentStatus"`
+			} `json:"pod"`
+		} `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return "", err
+	}
+
+	// Check for API errors
+	if len(response.Errors) > 0 {
+		// If pod not found error, return a special status
+		if strings.Contains(strings.ToLower(response.Errors[0].Message), "not found") {
+			return "NOT_FOUND", nil
+		}
+		return "", fmt.Errorf("RunPod API error: %s", response.Errors[0].Message)
+	}
+
+	// Return current status if available, otherwise desired status
+	if response.Data.Pod.CurrentStatus != "" {
+		return response.Data.Pod.CurrentStatus, nil
+	}
+	return response.Data.Pod.DesiredStatus, nil
+}
+
+// forceDeletePod forcefully removes a pod from the Kubernetes API
+func (c *JobController) forceDeletePod(namespace, name string) error {
+	// Create zero grace period for immediate deletion
+	gracePeriod := int64(0)
+	deleteOptions := metav1.DeleteOptions{
+		GracePeriodSeconds: &gracePeriod,
+		PropagationPolicy:  &[]metav1.DeletionPropagation{metav1.DeletePropagationBackground}[0],
+	}
+
+	err := c.clientset.CoreV1().Pods(namespace).Delete(
+		context.Background(),
+		name,
+		deleteOptions,
+	)
+
+	if err != nil && !k8serrors.IsNotFound(err) {
+		return err
+	}
+
+	c.logger.Info("Successfully force deleted pod", "pod", name, "namespace", namespace)
+	return nil
+}
+
 // Start begins the controller's reconciliation loop
 func (c *JobController) Start() error {
 	reconcileTicker := time.NewTicker(c.config.ReconcileInterval)
-	cleanupTicker := time.NewTicker(5 * time.Minute)     // Check for cleanup every 5 minutes
-	healthCheckTicker := time.NewTicker(1 * time.Minute) // Check RunPod API health every minute
+	cleanupTicker := time.NewTicker(5 * time.Minute)        // Check for cleanup every 5 minutes
+	terminatingPodTicker := time.NewTicker(1 * time.Minute) // Check for terminating pods every minute
+	healthCheckTicker := time.NewTicker(1 * time.Minute)    // Check RunPod API health every minute
 	defer reconcileTicker.Stop()
 	defer cleanupTicker.Stop()
+	defer terminatingPodTicker.Stop()
 	defer healthCheckTicker.Stop()
 
 	// Start health server
@@ -145,6 +332,10 @@ func (c *JobController) Start() error {
 			case <-cleanupTicker.C:
 				if err := c.cleanupDeletedJobs(); err != nil {
 					c.logger.Error(err, "cleanup failed")
+				}
+			case <-terminatingPodTicker.C:
+				if err := c.cleanupTerminatingPods(); err != nil {
+					c.logger.Error(err, "terminating pod cleanup failed")
 				}
 			case <-healthCheckTicker.C:
 				c.checkRunPodHealth()
