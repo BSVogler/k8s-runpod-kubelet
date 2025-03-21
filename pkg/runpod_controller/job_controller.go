@@ -32,6 +32,7 @@ const (
 	RunpodCostAnnotation      = "runpod.io/cost-per-hr"
 	RunpodManagedLabel        = "runpod.io/managed"
 	RunpodRetryAnnotation     = "runpod.io/retry-after"
+	RunpodCloudTypeAnnotation = "runpod.io/cloud-type"
 	// Annotation for GPU memory requirements
 	GpuMemoryAnnotation = "runpod.io/required-gpu-memory"
 
@@ -63,11 +64,17 @@ type RunPodEnv struct {
 
 // GPUType represents the GPU type from RunPod API
 type GPUType struct {
-	ID          string  `json:"id"`
-	DisplayName string  `json:"displayName"`
-	MemoryInGb  int     `json:"memoryInGb"`
-	SecureCloud bool    `json:"secureCloud"`
-	SecurePrice float64 `json:"securePrice"`
+	ID             string  `json:"id"`
+	DisplayName    string  `json:"displayName"`
+	MemoryInGb     int     `json:"memoryInGb"`
+	SecureCloud    bool    `json:"secureCloud"`
+	SecurePrice    float64 `json:"securePrice"`
+	CommunityCloud bool    `json:"communityCloud"`
+	CommunityPrice float64 `json:"communityPrice"`
+
+	// These fields are not from the API but are used internally
+	IsSecure bool
+	Price    float64
 }
 
 // RunPodClient handles all interactions with the RunPod API
@@ -184,18 +191,21 @@ func (c *RunPodClient) GetPodStatus(podID string) (PodStatus, error) {
 }
 
 // GetGPUTypes gets available GPU types from RunPod API
-func (c *RunPodClient) GetGPUTypes(minMemoryInGb int, maxPrice float64) (string, error) {
+// Update GetGPUTypes to return the selected GPU details and formatted GPU type list
+func (c *RunPodClient) GetGPUTypes(minMemoryInGb int, maxPrice float64) (*GPUType, string, error) {
 	query := `
-		query GpuTypes {
-			gpuTypes {
-				id
-				displayName
-				memoryInGb
-				secureCloud
-				securePrice
-			}
-		}
-	`
+        query GpuTypes {
+            gpuTypes {
+                id
+                displayName
+                memoryInGb
+                secureCloud
+                securePrice
+                communityCloud
+                communityPrice
+            }
+        }
+    `
 
 	var response struct {
 		Data struct {
@@ -204,34 +214,62 @@ func (c *RunPodClient) GetGPUTypes(minMemoryInGb int, maxPrice float64) (string,
 	}
 
 	if err := c.ExecuteGraphQL(query, nil, &response); err != nil {
-		return "", err
+		return nil, "", err
 	}
 
+	// Filter GPUs based on criteria - now account for both secure and community
 	var filteredGPUs []GPUType
 	for _, gpu := range response.Data.GPUTypes {
-		if gpu.SecureCloud &&
-			gpu.SecurePrice > 0 &&
-			gpu.SecurePrice < maxPrice &&
-			gpu.MemoryInGb >= minMemoryInGb {
-			filteredGPUs = append(filteredGPUs, gpu)
+		// For each GPU type, consider both secure and community pricing
+		// Create separate entries for SECURE and COMMUNITY if both are available
+
+		// Check secure cloud option
+		if gpu.SecureCloud && gpu.SecurePrice > 0 && gpu.SecurePrice < maxPrice && gpu.MemoryInGb >= minMemoryInGb {
+			secureGPU := gpu
+			secureGPU.IsSecure = true
+			secureGPU.Price = gpu.SecurePrice
+			filteredGPUs = append(filteredGPUs, secureGPU)
+		}
+
+		// Check community cloud option
+		if gpu.CommunityCloud && gpu.CommunityPrice > 0 && gpu.CommunityPrice < maxPrice && gpu.MemoryInGb >= minMemoryInGb {
+			communityGPU := gpu
+			communityGPU.IsSecure = false
+			communityGPU.Price = gpu.CommunityPrice
+			filteredGPUs = append(filteredGPUs, communityGPU)
 		}
 	}
 
 	// Sort by price ascending
 	sort.Slice(filteredGPUs, func(i, j int) bool {
-		return filteredGPUs[i].SecurePrice < filteredGPUs[j].SecurePrice
+		return filteredGPUs[i].Price < filteredGPUs[j].Price
 	})
 
 	// Take up to 5 GPUs
 	var gpuIDs []string
+	var selectedGPU *GPUType
+
 	for i, gpu := range filteredGPUs {
 		if i >= 5 {
 			break
 		}
-		gpuIDs = append(gpuIDs, fmt.Sprintf(`"%s"`, gpu.ID))
+
+		// Format the GPU ID with cloud type preference
+		gpuIDEntry := fmt.Sprintf(`"%s"`, gpu.ID)
+		gpuIDs = append(gpuIDs, gpuIDEntry)
+
+		// Store the first (cheapest) GPU for logging
+		if i == 0 {
+			gpuCopy := gpu
+			selectedGPU = &gpuCopy
+		}
 	}
 
-	return "[" + strings.Join(gpuIDs, ", ") + "]", nil
+	if len(gpuIDs) == 0 {
+		return nil, "[]", nil
+	}
+
+	return selectedGPU, "[" + strings.Join(gpuIDs, ", ") + "]", nil
 }
 
 // DeployPod deploys a pod to RunPod
@@ -691,9 +729,26 @@ func (c *JobController) PrepareRunPodParameters(job batchv1.Job) (map[string]int
 	}
 
 	// Get GPU types
-	gpuTypes, err := c.runpodClient.GetGPUTypes(minMemoryInGb, c.maxPrice)
+	selectedGPU, gpuTypes, err := c.runpodClient.GetGPUTypes(minMemoryInGb, c.maxPrice)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get GPU types: %w", err)
+	}
+
+	// Log the selected GPU if available
+	if selectedGPU != nil {
+		c.logger.Info("Selected GPU for deployment request",
+			"job", job.Name,
+			"namespace", job.Namespace,
+			"id", selectedGPU.ID,
+			"displayName", selectedGPU.DisplayName,
+			"memoryInGb", selectedGPU.MemoryInGb,
+			"price", selectedGPU.Price)
+	} else {
+		c.logger.Info("No suitable GPU types found",
+			"job", job.Name,
+			"namespace", job.Namespace,
+			"minMemoryInGb", minMemoryInGb,
+			"maxPrice", c.maxPrice)
 	}
 
 	// Extract environment variables from job
@@ -719,9 +774,32 @@ func (c *JobController) PrepareRunPodParameters(job batchv1.Job) (map[string]int
 	volumeInGb := 0
 	containerDiskInGb := 15
 
+	// Determine cloud type - default to COMMUNITY but allow override via annotation
+	cloudType := "COMMUNITY"
+	if cloudTypeVal, exists := job.Annotations[RunpodCloudTypeAnnotation]; exists {
+		// Validate and normalize the cloud type value
+		cloudTypeUpperCase := strings.ToUpper(cloudTypeVal)
+		if cloudTypeUpperCase == "SECURE" || cloudTypeUpperCase == "COMMUNITY" {
+			cloudType = cloudTypeUpperCase
+		} else {
+			c.logger.Info("Invalid cloud type specified, using default",
+				"job", job.Name,
+				"namespace", job.Namespace,
+				"specifiedValue", cloudTypeVal,
+				"defaultValue", cloudType)
+		}
+	}
+
+	c.logger.Info("Preparing RunPod deployment parameters",
+		"job", job.Name,
+		"namespace", job.Namespace,
+		"cloudType", cloudType,
+		"minMemoryInGb", minMemoryInGb,
+		"containerDiskInGb", containerDiskInGb)
+
 	// Create deployment parameters
 	params := map[string]interface{}{
-		"cloudType":         "SECURE",
+		"cloudType":         cloudType,
 		"gpuCount":          1,
 		"volumeInGb":        volumeInGb,
 		"containerDiskInGb": containerDiskInGb,
