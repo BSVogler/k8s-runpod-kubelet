@@ -446,9 +446,17 @@ func (c *JobController) reconcile() error {
 		}
 
 		// Check if job should be offloaded to RunPod
+		// Check if job should be offloaded to RunPod
 		if isPending(job) {
 			pendingCount++
-			if shouldOffloadToRunPod(job, pendingCount, c.config) {
+			// Check if the job already has pods running or scheduled on cluster nodes
+			hasNonPendingPods, err := c.hasRunningOrScheduledPods(job)
+			if err != nil {
+				c.logger.Error(err, "failed to check if job has running pods", "job", job.Name)
+				continue
+			}
+
+			if !hasNonPendingPods && shouldOffloadToRunPod(job, pendingCount, c.config) {
 				if err := c.offloadJobToRunPod(job); err != nil {
 					c.logger.Error(err, "failed to offload job to RunPod", "job", job.Name)
 				}
@@ -495,6 +503,12 @@ func shouldOffloadToRunPod(job batchv1.Job, pendingCounter int, cfg config.Confi
 		return true
 	}
 
+	// Check if job is actually in a state where it needs offloading
+	// If the job is completing or has non-pending pods, don't offload
+	if job.Status.Succeeded > 0 || job.Status.Failed > 0 || job.Status.CompletionTime != nil {
+		return false
+	}
+
 	// Check if job has been pending for too long
 	creationTime := job.CreationTimestamp.Time
 	pendingTime := time.Since(creationTime)
@@ -519,7 +533,12 @@ func (c *JobController) labelAsRunPodJob(job *batchv1.Job) error {
 
 // isPending checks if a job is in a pending state
 func isPending(job batchv1.Job) bool {
-	return job.Status.Active > 0 && job.Status.Succeeded == 0 && job.Status.Failed == 0
+	// Check if the job is still actively running but hasn't completed yet
+	// and doesn't have any succeeded or failed pods
+	return job.Status.Active > 0 &&
+		job.Status.Succeeded == 0 &&
+		job.Status.Failed == 0 &&
+		job.Status.CompletionTime == nil
 }
 
 // getPossibleGPUs gets available GPU types from RunPod API that match requirements
@@ -718,6 +737,36 @@ func (c *JobController) updateJobWithRetry(job *batchv1.Job) error {
 	}
 
 	return fmt.Errorf("failed to update job after %d retries: %s/%s", maxRetries, job.Namespace, job.Name)
+}
+
+// hasRunningOrScheduledPods checks if a job already has non-pending pods
+func (c *JobController) hasRunningOrScheduledPods(job batchv1.Job) (bool, error) {
+	// List pods associated with this job
+	pods, err := c.clientset.CoreV1().Pods(job.Namespace).List(
+		context.Background(),
+		metav1.ListOptions{
+			LabelSelector: fmt.Sprintf("job-name=%s", job.Name),
+		},
+	)
+	if err != nil {
+		return false, err
+	}
+
+	for _, pod := range pods.Items {
+		// Skip pods that are managed by RunPod
+		if _, isRunPodManaged := pod.Labels[RunpodManagedLabel]; isRunPodManaged {
+			continue
+		}
+
+		// Check if any pod is running or about to run
+		if pod.Status.Phase == corev1.PodRunning ||
+			pod.Status.Phase == corev1.PodSucceeded ||
+			pod.Spec.NodeName != "" { // Pod is assigned to a node
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 // offloadJobToRunPod sends the job to RunPod and creates a corresponding Pod representation
