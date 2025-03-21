@@ -25,16 +25,16 @@ import (
 
 const (
 	// Constants for RunPod integration
-	RunpodManagedAnnotation   = "runpod.io/managed"
-	RunpodOffloadAnnotation   = "runpod.io/offload"
-	RunpodOffloadedAnnotation = "runpod.io/offloaded"
-	RunpodPodIDAnnotation     = "runpod.io/pod-id"
-	RunpodCostAnnotation      = "runpod.io/cost-per-hr"
-	RunpodManagedLabel        = "runpod.io/managed"
-	RunpodRetryAnnotation     = "runpod.io/retry-after"
-	RunpodCloudTypeAnnotation = "runpod.io/cloud-type"
-	// Annotation for GPU memory requirements
-	GpuMemoryAnnotation = "runpod.io/required-gpu-memory"
+	RunpodManagedAnnotation               = "runpod.io/managed"
+	RunpodOffloadAnnotation               = "runpod.io/offload"
+	RunpodOffloadedAnnotation             = "runpod.io/offloaded"
+	RunpodPodIDAnnotation                 = "runpod.io/pod-id"
+	RunpodCostAnnotation                  = "runpod.io/cost-per-hr"
+	RunpodManagedLabel                    = "runpod.io/managed"
+	RunpodRetryAnnotation                 = "runpod.io/retry-after"
+	RunpodCloudTypeAnnotation             = "runpod.io/cloud-type"
+	GpuMemoryAnnotation                   = "runpod.io/required-gpu-memory"
+	RunpodContainerRegistryAuthAnnotation = "runpod.io/container-registry-auth-id"
 
 	// Default max price for GPU
 	DefaultMaxPrice = 0.5
@@ -99,6 +99,21 @@ func NewRunPodClient(apiKey string, logger logr.Logger) *RunPodClient {
 	}
 }
 
+func ExtractRegistry(imageName string) string {
+	// If the image name contains a slash and the part before the first slash contains a dot,
+	// it's a custom registry. Otherwise, it's DockerHub.
+	parts := strings.SplitN(imageName, "/", 2)
+	if len(parts) > 1 && strings.Contains(parts[0], ".") {
+		return parts[0]
+	}
+	return "index.docker.io" // Default to DockerHub
+}
+
+// GetContainerRegistryAuthFromEnv gets the container registry auth ID from environment variable
+func GetContainerRegistryAuthFromEnv() string {
+	return os.Getenv(RegistryAuthEnvVar)
+}
+
 // ExecuteGraphQL executes a GraphQL query with proper error handling
 func (c *RunPodClient) ExecuteGraphQL(query string, variables map[string]interface{}, response interface{}) error {
 	reqBody, err := json.Marshal(map[string]interface{}{
@@ -138,14 +153,14 @@ func (c *RunPodClient) ExecuteGraphQL(query string, variables map[string]interfa
 // GetPodStatus checks the status of a RunPod instance
 func (c *RunPodClient) GetPodStatus(podID string) (PodStatus, error) {
 	query := `
-		query pod($input: PodFilter) {
-			pod(input: $input) {
-				id
-				desiredStatus
-				currentStatus
-			}
-		}
-	`
+        query pod($input: PodFilter!) {
+            pod(input: $input) {
+                id
+                desiredStatus
+                currentStatus
+            }
+        }
+    `
 
 	variables := map[string]interface{}{
 		"input": map[string]string{
@@ -167,6 +182,18 @@ func (c *RunPodClient) GetPodStatus(podID string) (PodStatus, error) {
 	}
 
 	err := c.ExecuteGraphQL(query, variables, &response)
+
+	// Add retries for temporary errors
+	retryCount := 0
+	maxRetries := 3
+	for retryCount < maxRetries && err != nil && strings.Contains(err.Error(), "GRAPHQL_VALIDATION_FAILED") {
+		retryCount++
+		c.logger.Info("Retrying pod status check after validation error",
+			"podID", podID,
+			"retry", retryCount)
+		time.Sleep(time.Duration(retryCount) * 500 * time.Millisecond)
+		err = c.ExecuteGraphQL(query, variables, &response)
+	}
 
 	if err != nil {
 		return PodNotFound, err
@@ -468,10 +495,15 @@ type JobController struct {
 // NewJobController creates a new JobController instance
 func NewJobController(clientset *kubernetes.Clientset, logger logr.Logger, cfg config.Config) *JobController {
 	runpodKey := os.Getenv("RUNPOD_KEY")
+	registryAuthId := os.Getenv(RegistryAuthEnvVar)
 
 	maxPrice := DefaultMaxPrice
 	if cfg.MaxGPUPrice > 0 {
 		maxPrice = cfg.MaxGPUPrice
+	}
+
+	if registryAuthId != "" {
+		logger.Info("Container registry authentication ID is configured")
 	}
 
 	runpodClient := NewRunPodClient(runpodKey, logger)
@@ -795,6 +827,16 @@ func (c *JobController) PrepareRunPodParameters(job batchv1.Job) (map[string]int
 		}
 	}
 
+	// Extract container registry auth ID if provided
+	containerRegistryAuthId := ""
+	if authID, exists := job.Annotations[RunpodContainerRegistryAuthAnnotation]; exists && authID != "" {
+		containerRegistryAuthId = authID
+		c.logger.Info("Using container registry authentication",
+			"job", job.Name,
+			"namespace", job.Namespace,
+			"authID", containerRegistryAuthId)
+	}
+
 	// Determine minimum GPU memory required
 	minMemoryInGb := 16 // Default minimum memory
 	if memStr, exists := job.Annotations[GpuMemoryAnnotation]; exists {
@@ -851,6 +893,10 @@ func (c *JobController) PrepareRunPodParameters(job batchv1.Job) (map[string]int
 		"name":              runpodJobName,
 		"imageName":         imageName,
 		"env":               formattedEnvVars,
+	}
+
+	if containerRegistryAuthId != "" {
+		params["containerRegistryAuthId"] = containerRegistryAuthId
 	}
 
 	return params, nil
