@@ -5,14 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/bsvogler/k8s-runpod-controller/pkg/config"
-	"github.com/go-logr/logr"
 	"io"
-	batchv1 "k8s.io/api/batch/v1"
-	corev1 "k8s.io/api/core/v1"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
 	"net/http"
 	"os"
 	"sort"
@@ -20,6 +13,14 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/bsvogler/k8s-runpod-controller/pkg/config"
+	"github.com/go-logr/logr"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 )
 
 const (
@@ -36,6 +37,22 @@ const (
 
 	// Default max price for GPU
 	DefaultMaxPrice = 0.5
+
+	// API and timeout defaults
+	DefaultAPITimeout = 30 * time.Second
+	DefaultRetryCount = 5
+	DefaultRetryDelay = 100 * time.Millisecond
+)
+
+// PodStatus represents the status of a RunPod instance
+type PodStatus string
+
+const (
+	PodRunning     PodStatus = "RUNNING"
+	PodStarting    PodStatus = "STARTING"
+	PodTerminated  PodStatus = "TERMINATED"
+	PodTerminating PodStatus = "TERMINATING"
+	PodNotFound    PodStatus = "NOT_FOUND"
 )
 
 // RunPodEnv represents the environment variable structure for RunPod API
@@ -53,230 +70,42 @@ type GPUType struct {
 	SecurePrice float64 `json:"securePrice"`
 }
 
-// RunPodResponse represents the response from RunPod API
-type RunPodResponse struct {
-	Data struct {
-		GPUTypes []GPUType `json:"gpuTypes"`
-	} `json:"data"`
+// RunPodClient handles all interactions with the RunPod API
+type RunPodClient struct {
+	httpClient *http.Client
+	apiKey     string
+	baseURL    string
+	logger     logr.Logger
 }
 
-// DeploymentResponse represents the response from RunPod deployment API
-type DeploymentResponse struct {
-	Data struct {
-		PodFindAndDeployOnDemand struct {
-			ID        string  `json:"id"`
-			ImageName string  `json:"imageName"`
-			MachineID string  `json:"machineId"`
-			CostPerHr float64 `json:"costPerHr"`
-			Machine   struct {
-				PodHostID string `json:"podHostId"`
-			} `json:"machine"`
-		} `json:"podFindAndDeployOnDemand"`
-	} `json:"data"`
-	Errors []struct {
-		Message string `json:"message"`
-	} `json:"errors"`
-}
-
-// JobController manages Kubernetes jobs and offloads them to RunPod when necessary
-type JobController struct {
-	clientset        *kubernetes.Clientset
-	logger           logr.Logger
-	config           config.Config
-	httpClient       *http.Client
-	runpodKey        string
-	maxPrice         float64
-	deletedJobs      map[string]string // Maps job name to runpod ID for cleanup
-	deletedJobsMutex sync.Mutex
-	runpodAvailable  bool // Tracks if RunPod API is available
-	healthServer     *HealthServer
-}
-
-// NewJobController creates a new JobController instance
-func NewJobController(clientset *kubernetes.Clientset, logger logr.Logger, cfg config.Config) *JobController {
-	runpodKey := os.Getenv("RUNPOD_KEY")
-	if runpodKey == "" {
+// NewRunPodClient creates a new RunPod API client
+func NewRunPodClient(apiKey string, logger logr.Logger) *RunPodClient {
+	if apiKey == "" {
 		logger.Error(nil, "RUNPOD_KEY environment variable is not set")
 	}
 
-	maxPrice := DefaultMaxPrice
-	if cfg.MaxGPUPrice > 0 {
-		maxPrice = cfg.MaxGPUPrice
+	return &RunPodClient{
+		httpClient: &http.Client{Timeout: DefaultAPITimeout},
+		apiKey:     apiKey,
+		baseURL:    "https://api.runpod.io/graphql",
+		logger:     logger,
 	}
-
-	controller := &JobController{
-		clientset:       clientset,
-		logger:          logger,
-		config:          cfg,
-		httpClient:      &http.Client{Timeout: 30 * time.Second},
-		runpodKey:       runpodKey,
-		maxPrice:        maxPrice,
-		deletedJobs:     make(map[string]string),
-		runpodAvailable: true, // Initially assume RunPod is available
-	}
-
-	// Create health server
-	controller.healthServer = NewHealthServer(cfg.HealthServerAddress, controller.isReady)
-
-	return controller
 }
 
-// cleanupTerminatingPods checks for pods in Terminating state on the RunPod virtual node
-// and ensures they are properly terminated both in K8s and on RunPod
-func (c *JobController) cleanupTerminatingPods() error {
-	c.logger.Info("Checking for terminating pods on RunPod virtual node")
-
-	// Check for any pods that might be terminating but stuck
-	allPods, err := c.clientset.CoreV1().Pods("").List(
-		context.Background(),
-		metav1.ListOptions{
-			LabelSelector: "runpod.io/managed=true",
-		},
-	)
-	if err != nil {
-		return fmt.Errorf("failed to list all RunPod managed pods: %w", err)
-	}
-
-	terminatingCount := 0
-	for _, pod := range allPods.Items {
-		// Check if pod is terminating (has a deletion timestamp but still exists)
-		if pod.DeletionTimestamp != nil {
-			terminatingCount++
-			deletionTime := pod.DeletionTimestamp.Time
-			terminatingDuration := time.Since(deletionTime)
-
-			c.logger.Info("Found terminating pod",
-				"pod", pod.Name,
-				"namespace", pod.Namespace,
-				"deletionTimestamp", pod.DeletionTimestamp,
-				"terminatingFor", terminatingDuration.String())
-
-			// If pod has been terminating for more than 15 minutes, force delete it regardless of RunPod status
-			forceDeletionThreshold := 15 * time.Minute
-			if terminatingDuration > forceDeletionThreshold {
-				c.logger.Info("Pod has been terminating for too long, force deleting",
-					"pod", pod.Name,
-					"namespace", pod.Namespace,
-					"terminatingFor", terminatingDuration.String())
-
-				if err := c.forceDeletePod(pod.Namespace, pod.Name); err != nil {
-					c.logger.Error(err, "Failed to force delete long-terminating pod",
-						"pod", pod.Name,
-						"namespace", pod.Namespace)
-				}
-				continue
-			}
-
-			// Get RunPod ID from pod annotations
-			runpodID, exists := pod.Annotations[RunpodPodIDAnnotation]
-			if !exists {
-				c.logger.Info("Terminating pod missing RunPod ID annotation, will force delete",
-					"pod", pod.Name,
-					"namespace", pod.Namespace)
-
-				// Force delete the pod as it has no RunPod ID
-				if err := c.forceDeletePod(pod.Namespace, pod.Name); err != nil {
-					c.logger.Error(err, "Failed to force delete pod without RunPod ID",
-						"pod", pod.Name,
-						"namespace", pod.Namespace)
-				}
-				continue
-			}
-
-			// Check if the RunPod instance is still running
-			podStatus, err := c.checkRunPodInstanceStatus(runpodID)
-			if err != nil {
-				c.logger.Error(err, "Failed to check RunPod instance status",
-					"runpodID", runpodID,
-					"pod", pod.Name)
-
-				// If we get a GraphQL validation error or any other API error,
-				// assume the pod doesn't exist on RunPod anymore and force delete it
-				if strings.Contains(err.Error(), "GRAPHQL_VALIDATION_FAILED") ||
-					strings.Contains(err.Error(), "Something went wrong") {
-					c.logger.Info("RunPod API returned error, assuming instance no longer exists. Force deleting K8s pod",
-						"runpodID", runpodID,
-						"pod", pod.Name)
-
-					if err := c.forceDeletePod(pod.Namespace, pod.Name); err != nil {
-						c.logger.Error(err, "Failed to force delete pod after RunPod API error",
-							"pod", pod.Name,
-							"namespace", pod.Namespace)
-					}
-				}
-				continue
-			}
-
-			// If RunPod instance is still active, terminate it
-			if podStatus == "RUNNING" || podStatus == "STARTING" {
-				c.logger.Info("RunPod instance is still active, terminating it",
-					"runpodID", runpodID,
-					"pod", pod.Name,
-					"status", podStatus)
-
-				if err := c.terminateRunPodInstance(runpodID); err != nil {
-					c.logger.Error(err, "Failed to terminate RunPod instance",
-						"runpodID", runpodID,
-						"pod", pod.Name)
-					continue
-				}
-
-				// Wait briefly for termination to be processed
-				time.Sleep(2 * time.Second)
-			} else if podStatus == "TERMINATED" || podStatus == "TERMINATING" || podStatus == "NOT_FOUND" {
-				// If pod is already terminated or not found, just force delete it from K8s
-				c.logger.Info("RunPod instance is already terminated or not found, cleaning up K8s pod",
-					"runpodID", runpodID,
-					"pod", pod.Name,
-					"status", podStatus)
-
-				if err := c.forceDeletePod(pod.Namespace, pod.Name); err != nil {
-					c.logger.Error(err, "Failed to force delete pod",
-						"pod", pod.Name,
-						"namespace", pod.Namespace)
-				}
-			}
-		}
-	}
-
-	c.logger.Info("Terminating pod cleanup completed", "processed", terminatingCount)
-	return nil
-}
-
-// checkRunPodInstanceStatus checks the status of a RunPod instance
-func (c *JobController) checkRunPodInstanceStatus(podID string) (string, error) {
-	url := fmt.Sprintf("https://api.runpod.io/graphql?api_key=%s", c.runpodKey)
-
-	// Using the format from the RunPod documentation
-	query := `
-		query pod($input: PodFilter) {
-			pod(input: $input) {
-				id
-				desiredStatus
-				currentStatus
-			}
-		}
-	`
-
-	// Create variables for the GraphQL query
-	variables := map[string]interface{}{
-		"input": map[string]string{
-			"podId": podID,
-		},
-	}
-
-	// Create the request body with both query and variables
+// ExecuteGraphQL executes a GraphQL query with proper error handling
+func (c *RunPodClient) ExecuteGraphQL(query string, variables map[string]interface{}, response interface{}) error {
 	reqBody, err := json.Marshal(map[string]interface{}{
 		"query":     query,
 		"variables": variables,
 	})
 	if err != nil {
-		return "", err
+		return fmt.Errorf("failed to marshal request: %w", err)
 	}
 
+	url := fmt.Sprintf("%s?api_key=%s", c.baseURL, c.apiKey)
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(reqBody))
 	if err != nil {
-		return "", err
+		return fmt.Errorf("failed to create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -287,16 +116,36 @@ func (c *JobController) checkRunPodInstanceStatus(podID string) (string, error) 
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", err
+		return fmt.Errorf("API request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("RunPod API returned error: %d %s", resp.StatusCode, string(body))
+		return fmt.Errorf("API returned error: %d %s", resp.StatusCode, string(body))
 	}
 
-	// Parse response to get pod status
+	return json.NewDecoder(resp.Body).Decode(response)
+}
+
+// GetPodStatus checks the status of a RunPod instance
+func (c *RunPodClient) GetPodStatus(podID string) (PodStatus, error) {
+	query := `
+		query pod($input: PodFilter) {
+			pod(input: $input) {
+				id
+				desiredStatus
+				currentStatus
+			}
+		}
+	`
+
+	variables := map[string]interface{}{
+		"input": map[string]string{
+			"podId": podID,
+		},
+	}
+
 	var response struct {
 		Data struct {
 			Pod struct {
@@ -310,33 +159,312 @@ func (c *JobController) checkRunPodInstanceStatus(podID string) (string, error) 
 		} `json:"errors"`
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+	err := c.ExecuteGraphQL(query, variables, &response)
+
+	if err != nil {
+		return PodNotFound, err
+	}
+
+	if len(response.Errors) > 0 {
+		if strings.Contains(strings.ToLower(response.Errors[0].Message), "not found") {
+			return PodNotFound, nil
+		}
+		return PodNotFound, fmt.Errorf("RunPod API error: %s", response.Errors[0].Message)
+	}
+
+	if response.Data.Pod.ID == "" {
+		return PodNotFound, nil
+	}
+
+	if response.Data.Pod.CurrentStatus != "" {
+		return PodStatus(response.Data.Pod.CurrentStatus), nil
+	}
+
+	return PodStatus(response.Data.Pod.DesiredStatus), nil
+}
+
+// GetGPUTypes gets available GPU types from RunPod API
+func (c *RunPodClient) GetGPUTypes(minMemoryInGb int, maxPrice float64) (string, error) {
+	query := `
+		query GpuTypes {
+			gpuTypes {
+				id
+				displayName
+				memoryInGb
+				secureCloud
+				securePrice
+			}
+		}
+	`
+
+	var response struct {
+		Data struct {
+			GPUTypes []GPUType `json:"gpuTypes"`
+		} `json:"data"`
+	}
+
+	if err := c.ExecuteGraphQL(query, nil, &response); err != nil {
 		return "", err
+	}
+
+	var filteredGPUs []GPUType
+	for _, gpu := range response.Data.GPUTypes {
+		if gpu.SecureCloud &&
+			gpu.SecurePrice > 0 &&
+			gpu.SecurePrice < maxPrice &&
+			gpu.MemoryInGb >= minMemoryInGb {
+			filteredGPUs = append(filteredGPUs, gpu)
+		}
+	}
+
+	// Sort by price ascending
+	sort.Slice(filteredGPUs, func(i, j int) bool {
+		return filteredGPUs[i].SecurePrice < filteredGPUs[j].SecurePrice
+	})
+
+	// Take up to 5 GPUs
+	var gpuIDs []string
+	for i, gpu := range filteredGPUs {
+		if i >= 5 {
+			break
+		}
+		gpuIDs = append(gpuIDs, fmt.Sprintf(`"%s"`, gpu.ID))
+	}
+
+	return "[" + strings.Join(gpuIDs, ", ") + "]", nil
+}
+
+// DeployPod deploys a pod to RunPod
+func (c *RunPodClient) DeployPod(params map[string]interface{}) (string, float64, error) {
+	query := `
+		mutation podFindAndDeployOnDemand($input: PodFindAndDeployOnDemandInput!) {
+			podFindAndDeployOnDemand(input: $input) {
+				id
+				imageName
+				machineId
+				costPerHr
+				machine {
+					podHostId
+				}
+			}
+		}
+	`
+
+	variables := map[string]interface{}{
+		"input": params,
+	}
+
+	var response struct {
+		Data struct {
+			PodFindAndDeployOnDemand struct {
+				ID        string  `json:"id"`
+				ImageName string  `json:"imageName"`
+				MachineID string  `json:"machineId"`
+				CostPerHr float64 `json:"costPerHr"`
+				Machine   struct {
+					PodHostID string `json:"podHostId"`
+				} `json:"machine"`
+			} `json:"podFindAndDeployOnDemand"`
+		} `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+
+	if err := c.ExecuteGraphQL(query, variables, &response); err != nil {
+		return "", 0, err
 	}
 
 	// Check for API errors
 	if len(response.Errors) > 0 {
-		// If pod not found error, return a special status
-		if strings.Contains(strings.ToLower(response.Errors[0].Message), "not found") {
-			return "NOT_FOUND", nil
-		}
-		return "", fmt.Errorf("RunPod API error: %s", response.Errors[0].Message)
+		return "", 0, fmt.Errorf("RunPod API error: %s", response.Errors[0].Message)
 	}
 
-	// Check if pod data is missing
-	if response.Data.Pod.ID == "" {
-		return "NOT_FOUND", nil
+	// Validate response
+	if response.Data.PodFindAndDeployOnDemand.ID == "" || response.Data.PodFindAndDeployOnDemand.CostPerHr <= 0 {
+		return "", 0, fmt.Errorf("RunPod deployment failed: empty pod ID or zero cost")
 	}
 
-	// Return current status if available, otherwise desired status
-	if response.Data.Pod.CurrentStatus != "" {
-		return response.Data.Pod.CurrentStatus, nil
-	}
-	return response.Data.Pod.DesiredStatus, nil
+	return response.Data.PodFindAndDeployOnDemand.ID, response.Data.PodFindAndDeployOnDemand.CostPerHr, nil
 }
 
-// forceDeletePod forcefully removes a pod from the Kubernetes API
-func (c *JobController) forceDeletePod(namespace, name string) error {
+// TerminatePod terminates a RunPod instance by ID
+func (c *RunPodClient) TerminatePod(podID string) error {
+	query := `
+		mutation podTerminate($input: PodTerminateInput!) {
+			podTerminate(input: $input) {
+				id
+				desiredStatus
+			}
+		}
+	`
+
+	variables := map[string]interface{}{
+		"input": map[string]string{
+			"podId": podID,
+		},
+	}
+
+	var response struct {
+		Data struct {
+			PodTerminate struct {
+				ID            string `json:"id"`
+				DesiredStatus string `json:"desiredStatus"`
+			} `json:"podTerminate"`
+		} `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+
+	if err := c.ExecuteGraphQL(query, variables, &response); err != nil {
+		return err
+	}
+
+	// Check for API errors
+	if len(response.Errors) > 0 {
+		return fmt.Errorf("RunPod API error: %s", response.Errors[0].Message)
+	}
+
+	// Check termination status
+	if response.Data.PodTerminate.DesiredStatus != "TERMINATED" {
+		return fmt.Errorf("failed to terminate RunPod instance, status: %s",
+			response.Data.PodTerminate.DesiredStatus)
+	}
+
+	return nil
+}
+
+// CheckAPIHealth checks if the RunPod API is healthy
+func (c *RunPodClient) CheckAPIHealth() bool {
+	// Skip check if no API key
+	if c.apiKey == "" {
+		return false
+	}
+
+	query := `
+		query {
+			myself {
+				id
+			}
+		}
+	`
+
+	var response struct {
+		Data struct {
+			Myself struct {
+				ID string `json:"id"`
+			} `json:"myself"`
+		} `json:"data"`
+	}
+
+	err := c.ExecuteGraphQL(query, nil, &response)
+	return err == nil && response.Data.Myself.ID != ""
+}
+
+// JobController manages Kubernetes jobs and offloads them to RunPod when necessary
+type JobController struct {
+	clientset        *kubernetes.Clientset
+	logger           logr.Logger
+	config           config.Config
+	runpodClient     *RunPodClient
+	maxPrice         float64
+	deletedJobs      map[string]string // Maps job name to runpod ID for cleanup
+	deletedJobsMutex sync.Mutex
+	runpodAvailable  bool // Tracks if RunPod API is available
+	healthServer     *HealthServer
+}
+
+// NewJobController creates a new JobController instance
+func NewJobController(clientset *kubernetes.Clientset, logger logr.Logger, cfg config.Config) *JobController {
+	runpodKey := os.Getenv("RUNPOD_KEY")
+
+	maxPrice := DefaultMaxPrice
+	if cfg.MaxGPUPrice > 0 {
+		maxPrice = cfg.MaxGPUPrice
+	}
+
+	runpodClient := NewRunPodClient(runpodKey, logger)
+
+	controller := &JobController{
+		clientset:       clientset,
+		logger:          logger,
+		config:          cfg,
+		runpodClient:    runpodClient,
+		maxPrice:        maxPrice,
+		deletedJobs:     make(map[string]string),
+		runpodAvailable: true, // Initially assume RunPod is available
+	}
+
+	// Create health server
+	controller.healthServer = NewHealthServer(cfg.HealthServerAddress, controller.isReady)
+
+	return controller
+}
+
+// UpdateJobWithRetry updates a job with retry logic to handle concurrent modifications
+func (c *JobController) UpdateJobWithRetry(job *batchv1.Job) error {
+	retryCount := 0
+	maxRetries := DefaultRetryCount
+
+	for retryCount < maxRetries {
+		// Get the latest version of the job
+		latestJob, err := c.clientset.BatchV1().Jobs(job.Namespace).Get(
+			context.Background(),
+			job.Name,
+			metav1.GetOptions{},
+		)
+		if err != nil {
+			return fmt.Errorf("failed to get latest job version: %w", err)
+		}
+
+		// Apply our annotations to the latest job version
+		if latestJob.Annotations == nil {
+			latestJob.Annotations = make(map[string]string)
+		}
+
+		// Copy over the annotations we want to set
+		for k, v := range job.Annotations {
+			if strings.HasPrefix(k, "runpod.io/") {
+				latestJob.Annotations[k] = v
+			}
+		}
+
+		// Update the job with the latest version
+		_, err = c.clientset.BatchV1().Jobs(latestJob.Namespace).Update(
+			context.Background(),
+			latestJob,
+			metav1.UpdateOptions{},
+		)
+
+		if err == nil {
+			// Update successful
+			return nil
+		}
+
+		// Check if it's a conflict error
+		if !k8serrors.IsConflict(err) {
+			// If it's not a conflict error, return immediately
+			return err
+		}
+
+		// Increment retry count
+		retryCount++
+
+		// Wait a short time before retrying
+		time.Sleep(DefaultRetryDelay)
+
+		c.logger.Info("Retrying job update after conflict",
+			"job", job.Name,
+			"namespace", job.Namespace,
+			"retry", retryCount)
+	}
+
+	return fmt.Errorf("failed to update job after %d retries: %s/%s", maxRetries, job.Namespace, job.Name)
+}
+
+// ForceDeletePod forcefully removes a pod from the Kubernetes API
+func (c *JobController) ForceDeletePod(namespace, name string) error {
 	// Create zero grace period for immediate deletion
 	gracePeriod := int64(0)
 	deleteOptions := metav1.DeleteOptions{
@@ -358,143 +486,30 @@ func (c *JobController) forceDeletePod(namespace, name string) error {
 	return nil
 }
 
-// Start begins the controller's reconciliation loop
-func (c *JobController) Start() error {
-	reconcileTicker := time.NewTicker(c.config.ReconcileInterval)
-	cleanupTicker := time.NewTicker(5 * time.Minute)        // Check for cleanup every 5 minutes
-	terminatingPodTicker := time.NewTicker(1 * time.Minute) // Check for terminating pods every minute
-	healthCheckTicker := time.NewTicker(1 * time.Minute)    // Check RunPod API health every minute
-	defer reconcileTicker.Stop()
-	defer cleanupTicker.Stop()
-	defer terminatingPodTicker.Stop()
-	defer healthCheckTicker.Stop()
-
-	// Start health server
-	c.healthServer.Start()
-
-	// Set up channels for graceful shutdown
-	stopCh := make(chan struct{})
-	doneCh := make(chan struct{})
-
-	go func() {
-		defer close(doneCh)
-		for {
-			select {
-			case <-reconcileTicker.C:
-				if err := c.reconcile(); err != nil {
-					c.logger.Error(err, "reconciliation failed")
-				}
-			case <-cleanupTicker.C:
-				if err := c.cleanupDeletedJobs(); err != nil {
-					c.logger.Error(err, "cleanup failed")
-				}
-			case <-terminatingPodTicker.C:
-				if err := c.cleanupTerminatingPods(); err != nil {
-					c.logger.Error(err, "terminating pod cleanup failed")
-				}
-			case <-healthCheckTicker.C:
-				c.checkRunPodHealth()
-			case <-stopCh:
-				return
-			}
-		}
-	}()
-
-	<-stopCh
-	c.logger.Info("Stopping controller")
-
-	// Stop health server
-	if err := c.healthServer.Stop(); err != nil {
-		c.logger.Error(err, "failed to stop health server")
-	}
-
-	// Wait for cleanup to finish
-	select {
-	case <-doneCh:
-		c.logger.Info("Controller stopped gracefully")
-	case <-time.After(30 * time.Second):
-		c.logger.Info("Controller stop timed out")
-	}
-
-	return nil
-}
-
-// reconcile checks for jobs that need to be offloaded to RunPod
-func (c *JobController) reconcile() error {
-	// List all jobs with the runpod.io/managed annotation
-	jobs, err := c.clientset.BatchV1().Jobs("").List(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		return err
-	}
-
-	pendingCount := 0
-	activeJobs := make(map[string]bool)
-
-	for _, job := range jobs.Items {
-		// Skip jobs that don't have the runpod.io/managed annotation
-		if !isRunPodJob(job) {
-			continue
-		}
-
-		// Track all active job names
-		jobKey := fmt.Sprintf("%s/%s", job.Namespace, job.Name)
-		activeJobs[jobKey] = true
-
-		// Check if job needs labeling
-		if !hasRunPodLabel(job) {
-			if err := c.labelAsRunPodJob(&job); err != nil {
-				c.logger.Error(err, "failed to label RunPod job", "job", job.Name)
-				continue
-			}
-		}
-
-		// Check if job should be offloaded to RunPod
-		// Check if job should be offloaded to RunPod
-		if isPending(job) {
-			pendingCount++
-			// Check if the job already has pods running or scheduled on cluster nodes
-			hasNonPendingPods, err := c.hasRunningOrScheduledPods(job)
-			if err != nil {
-				c.logger.Error(err, "failed to check if job has running pods", "job", job.Name)
-				continue
-			}
-
-			if !hasNonPendingPods && shouldOffloadToRunPod(job, pendingCount, c.config) {
-				if err := c.offloadJobToRunPod(job); err != nil {
-					c.logger.Error(err, "failed to offload job to RunPod", "job", job.Name)
-				}
-			}
-		}
-	}
-
-	// Check for deleted jobs and update the tracking map
-	c.deletedJobsMutex.Lock()
-	for jobKey := range c.deletedJobs {
-		if !activeJobs[jobKey] {
-			// Job is no longer in the API server but still in our map
-			// Keep it in the map for cleanup to handle
-			c.logger.Info("Job marked for cleanup", "job", jobKey)
-		}
-	}
-	c.deletedJobsMutex.Unlock()
-
-	return nil
-}
-
-// isRunPodJob checks if a job should be managed by RunPod
-func isRunPodJob(job batchv1.Job) bool {
+// IsRunPodJob checks if a job should be managed by RunPod
+func IsRunPodJob(job batchv1.Job) bool {
 	_, hasRunPodAnnotation := job.Annotations[RunpodManagedAnnotation]
 	return hasRunPodAnnotation
 }
 
-// hasRunPodLabel checks if a job has the RunPod managed label
-func hasRunPodLabel(job batchv1.Job) bool {
+// HasRunPodLabel checks if a job has the RunPod managed label
+func HasRunPodLabel(job batchv1.Job) bool {
 	_, hasLabel := job.Labels[RunpodManagedLabel]
 	return hasLabel
 }
 
-// shouldOffloadToRunPod determines if a job should be offloaded to RunPod
-func shouldOffloadToRunPod(job batchv1.Job, pendingCounter int, cfg config.Config) bool {
+// IsPending checks if a job is in a pending state
+func IsPending(job batchv1.Job) bool {
+	// Check if the job is still actively running but hasn't completed yet
+	// and doesn't have any succeeded or failed pods
+	return job.Status.Active > 0 &&
+		job.Status.Succeeded == 0 &&
+		job.Status.Failed == 0 &&
+		job.Status.CompletionTime == nil
+}
+
+// ShouldOffloadToRunPod determines if a job should be offloaded to RunPod
+func ShouldOffloadToRunPod(job batchv1.Job, pendingCounter int, cfg config.Config) bool {
 	// Already offloaded
 	if _, hasOffloaded := job.Annotations[RunpodOffloadedAnnotation]; hasOffloaded {
 		return false
@@ -519,8 +534,8 @@ func shouldOffloadToRunPod(job batchv1.Job, pendingCounter int, cfg config.Confi
 	return pendingTime > time.Duration(cfg.MaxPendingTime)*time.Second || pendingCounter > cfg.PendingJobThreshold
 }
 
-// labelAsRunPodJob adds the RunPod managed label to a job
-func (c *JobController) labelAsRunPodJob(job *batchv1.Job) error {
+// LabelAsRunPodJob adds the RunPod managed label to a job
+func (c *JobController) LabelAsRunPodJob(job *batchv1.Job) error {
 	if job.Labels == nil {
 		job.Labels = make(map[string]string)
 	}
@@ -534,92 +549,38 @@ func (c *JobController) labelAsRunPodJob(job *batchv1.Job) error {
 	return err
 }
 
-// isPending checks if a job is in a pending state
-func isPending(job batchv1.Job) bool {
-	// Check if the job is still actively running but hasn't completed yet
-	// and doesn't have any succeeded or failed pods
-	return job.Status.Active > 0 &&
-		job.Status.Succeeded == 0 &&
-		job.Status.Failed == 0 &&
-		job.Status.CompletionTime == nil
+// HasRunningOrScheduledPods checks if a job already has non-pending pods
+func (c *JobController) HasRunningOrScheduledPods(job batchv1.Job) (bool, error) {
+	// List pods associated with this job
+	pods, err := c.clientset.CoreV1().Pods(job.Namespace).List(
+		context.Background(),
+		metav1.ListOptions{
+			LabelSelector: fmt.Sprintf("job-name=%s", job.Name),
+		},
+	)
+	if err != nil {
+		return false, err
+	}
+
+	for _, pod := range pods.Items {
+		// Skip pods that are managed by RunPod
+		if _, isRunPodManaged := pod.Labels[RunpodManagedLabel]; isRunPodManaged {
+			continue
+		}
+
+		// Check if any pod is running or about to run
+		if pod.Status.Phase == corev1.PodRunning ||
+			pod.Status.Phase == corev1.PodSucceeded ||
+			pod.Spec.NodeName != "" { // Pod is assigned to a node
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
-// getPossibleGPUs gets available GPU types from RunPod API that match requirements
-func (c *JobController) getPossibleGPUs(minMemoryInGb int) (string, error) {
-	url := fmt.Sprintf("https://api.runpod.io/graphql?api_key=%s", c.runpodKey)
-
-	query := `
-		query GpuTypes {
-			gpuTypes {
-				id
-				displayName
-				memoryInGb
-				secureCloud
-				securePrice
-			}
-		}
-	`
-
-	reqBody, err := json.Marshal(map[string]string{
-		"query": query,
-	})
-	if err != nil {
-		return "", err
-	}
-
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(reqBody))
-	if err != nil {
-		return "", err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	var response RunPodResponse
-	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-		return "", err
-	}
-
-	var filteredGPUs []GPUType
-	for _, gpu := range response.Data.GPUTypes {
-		if gpu.SecureCloud &&
-			gpu.SecurePrice > 0 &&
-			gpu.SecurePrice < c.maxPrice &&
-			gpu.MemoryInGb >= minMemoryInGb {
-			filteredGPUs = append(filteredGPUs, gpu)
-		}
-	}
-
-	// Sort by price ascending
-	sort.Slice(filteredGPUs, func(i, j int) bool {
-		return filteredGPUs[i].SecurePrice < filteredGPUs[j].SecurePrice
-	})
-
-	// Take up to 5 GPUs
-	var gpuIDs []string
-	for i, gpu := range filteredGPUs {
-		if i >= 5 {
-			break
-		}
-		gpuIDs = append(gpuIDs, gpu.ID)
-	}
-
-	// Format as GraphQL array
-	var gpuIDsStr []string
-	for _, id := range gpuIDs {
-		gpuIDsStr = append(gpuIDsStr, fmt.Sprintf(`"%s"`, id))
-	}
-
-	return "[" + strings.Join(gpuIDsStr, ", ") + "]", nil
-}
-
-// extractEnvVars extracts environment variables from the Kubernetes job
-func (c *JobController) extractEnvVars(job batchv1.Job) ([]RunPodEnv, error) {
+// ExtractEnvVars extracts environment variables from the Kubernetes job
+func (c *JobController) ExtractEnvVars(job batchv1.Job) ([]RunPodEnv, error) {
 	var envVars []RunPodEnv
 
 	// Extract all environment variables from the job containers
@@ -673,106 +634,20 @@ func (c *JobController) extractEnvVars(job batchv1.Job) ([]RunPodEnv, error) {
 	return envVars, nil
 }
 
-// formatEnvVarsForGraphQL formats environment variables for GraphQL query
-func formatEnvVarsForGraphQL(envVars []RunPodEnv) string {
-	var envVarsStr []string
+// FormatEnvVarsForGraphQL formats environment variables for GraphQL query
+func FormatEnvVarsForGraphQL(envVars []RunPodEnv) []map[string]string {
+	formattedEnvVars := make([]map[string]string, 0, len(envVars))
 	for _, env := range envVars {
-		envVarsStr = append(envVarsStr, fmt.Sprintf(`{key: "%s", value: "%s"}`, env.Key, env.Value))
+		formattedEnvVars = append(formattedEnvVars, map[string]string{
+			"key":   env.Key,
+			"value": env.Value,
+		})
 	}
-	return strings.Join(envVarsStr, ",\n")
+	return formattedEnvVars
 }
 
-// updateJobWithRetry updates a job with retry logic to handle concurrent modifications
-func (c *JobController) updateJobWithRetry(job *batchv1.Job) error {
-	// Maximum number of retries
-	maxRetries := 5
-	retryCount := 0
-
-	for retryCount < maxRetries {
-		// Get the latest version of the job
-		latestJob, err := c.clientset.BatchV1().Jobs(job.Namespace).Get(
-			context.Background(),
-			job.Name,
-			metav1.GetOptions{},
-		)
-		if err != nil {
-			return fmt.Errorf("failed to get latest job version: %w", err)
-		}
-
-		// Apply our annotations to the latest job version
-		if latestJob.Annotations == nil {
-			latestJob.Annotations = make(map[string]string)
-		}
-		// Copy over the annotations we want to set
-		for k, v := range job.Annotations {
-			if strings.HasPrefix(k, "runpod.io/") {
-				latestJob.Annotations[k] = v
-			}
-		}
-
-		// Update the job with the latest version
-		_, err = c.clientset.BatchV1().Jobs(latestJob.Namespace).Update(
-			context.Background(),
-			latestJob,
-			metav1.UpdateOptions{},
-		)
-		if err == nil {
-			// Update successful
-			return nil
-		}
-
-		// Check if it's a conflict error
-		if !k8serrors.IsConflict(err) {
-			// If it's not a conflict error, return immediately
-			return err
-		}
-
-		// Increment retry count
-		retryCount++
-
-		// Wait a short time before retrying
-		time.Sleep(100 * time.Millisecond)
-
-		c.logger.Info("Retrying job update after conflict",
-			"job", job.Name,
-			"namespace", job.Namespace,
-			"retry", retryCount)
-	}
-
-	return fmt.Errorf("failed to update job after %d retries: %s/%s", maxRetries, job.Namespace, job.Name)
-}
-
-// hasRunningOrScheduledPods checks if a job already has non-pending pods
-func (c *JobController) hasRunningOrScheduledPods(job batchv1.Job) (bool, error) {
-	// List pods associated with this job
-	pods, err := c.clientset.CoreV1().Pods(job.Namespace).List(
-		context.Background(),
-		metav1.ListOptions{
-			LabelSelector: fmt.Sprintf("job-name=%s", job.Name),
-		},
-	)
-	if err != nil {
-		return false, err
-	}
-
-	for _, pod := range pods.Items {
-		// Skip pods that are managed by RunPod
-		if _, isRunPodManaged := pod.Labels[RunpodManagedLabel]; isRunPodManaged {
-			continue
-		}
-
-		// Check if any pod is running or about to run
-		if pod.Status.Phase == corev1.PodRunning ||
-			pod.Status.Phase == corev1.PodSucceeded ||
-			pod.Spec.NodeName != "" { // Pod is assigned to a node
-			return true, nil
-		}
-	}
-
-	return false, nil
-}
-
-func (c *JobController) prepareRunPodParameters(job batchv1.Job) (int, string, []RunPodEnv, string, error) {
+// PrepareRunPodParameters prepares parameters for RunPod deployment
+func (c *JobController) PrepareRunPodParameters(job batchv1.Job) (map[string]interface{}, error) {
 	// Determine minimum GPU memory required
 	minMemoryInGb := 16 // Default minimum memory
 	if memStr, exists := job.Annotations[GpuMemoryAnnotation]; exists {
@@ -782,192 +657,53 @@ func (c *JobController) prepareRunPodParameters(job batchv1.Job) (int, string, [
 	}
 
 	// Get GPU types
-	gpuTypes, err := c.getPossibleGPUs(minMemoryInGb)
+	gpuTypes, err := c.runpodClient.GetGPUTypes(minMemoryInGb, c.maxPrice)
 	if err != nil {
-		return 0, "", nil, "", fmt.Errorf("failed to get GPU types: %w", err)
+		return nil, fmt.Errorf("failed to get GPU types: %w", err)
 	}
 
 	// Extract environment variables from job
-	envVars, err := c.extractEnvVars(job)
+	envVars, err := c.ExtractEnvVars(job)
 	if err != nil {
-		return 0, "", nil, "", fmt.Errorf("failed to extract environment variables: %w", err)
+		return nil, fmt.Errorf("failed to extract environment variables: %w", err)
 	}
+
+	formattedEnvVars := FormatEnvVarsForGraphQL(envVars)
 
 	// Determine image name from job
 	var imageName string
 	if len(job.Spec.Template.Spec.Containers) > 0 {
 		imageName = job.Spec.Template.Spec.Containers[0].Image
 	} else {
-		return 0, "", nil, "", fmt.Errorf("job has no containers")
+		return nil, fmt.Errorf("job has no containers")
 	}
 
-	return minMemoryInGb, gpuTypes, envVars, imageName, nil
-}
-
-func (c *JobController) deployToRunPod(job batchv1.Job, minMemoryInGb int, gpuTypes string,
-	envVars []RunPodEnv, imageName string) (string, float64, error) {
-	// Format environment variables for GraphQL
-	formattedEnvVars := formatEnvVarsForGraphQL(envVars)
+	// Add namespace to the job name to ensure uniqueness
+	runpodJobName := fmt.Sprintf("%s-%s", job.Namespace, job.Name)
 
 	// Default values
 	volumeInGb := 0
 	containerDiskInGb := 15
 
-	// Add namespace to the job name to ensure uniqueness
-	runpodJobName := fmt.Sprintf("%s-%s", job.Namespace, job.Name)
-
-	// Prepare RunPod GraphQL query
-	query := fmt.Sprintf(`
-        mutation {
-            podFindAndDeployOnDemand(
-                input: {
-                    cloudType: SECURE,
-                    gpuCount: 1,
-                    volumeInGb: %d,
-                    containerDiskInGb: %d,
-                    minVcpuCount: 2,
-                    minMemoryInGb: %d,
-                    gpuTypeIdList: %s,
-                    name: "%s",
-                    imageName: "%s",
-                    env: [%s]
-                }
-            ) {
-                id
-                imageName
-                machineId
-                costPerHr
-                machine {
-                    podHostId
-                }
-            }
-        }
-    `, volumeInGb, containerDiskInGb, minMemoryInGb, gpuTypes, runpodJobName, imageName, formattedEnvVars)
-
-	// Execute API call
-	response, err := c.executeRunPodGraphQL(query)
-	if err != nil {
-		return "", 0, err
+	// Create deployment parameters
+	params := map[string]interface{}{
+		"cloudType":         "SECURE",
+		"gpuCount":          1,
+		"volumeInGb":        volumeInGb,
+		"containerDiskInGb": containerDiskInGb,
+		"minVcpuCount":      2,
+		"minMemoryInGb":     minMemoryInGb,
+		"gpuTypeIdList":     gpuTypes,
+		"name":              runpodJobName,
+		"imageName":         imageName,
+		"env":               formattedEnvVars,
 	}
 
-	// Validate response
-	runpodID := response.Data.PodFindAndDeployOnDemand.ID
-	costPerHr := response.Data.PodFindAndDeployOnDemand.CostPerHr
-
-	if runpodID == "" || costPerHr <= 0 {
-		errorMsg := "RunPod deployment failed: empty pod ID or zero cost"
-		if len(response.Errors) > 0 {
-			errorMsg = fmt.Sprintf("RunPod API error: %s", response.Errors[0].Message)
-		}
-
-		c.logger.Error(nil, errorMsg,
-			"job", job.Name,
-			"namespace", job.Namespace)
-
-		return "", 0, fmt.Errorf(errorMsg)
-	}
-
-	// Add to tracking map for potential cleanup
-	jobKey := fmt.Sprintf("%s/%s", job.Namespace, job.Name)
-	c.deletedJobsMutex.Lock()
-	c.deletedJobs[jobKey] = runpodID
-	c.deletedJobsMutex.Unlock()
-
-	return runpodID, costPerHr, nil
+	return params, nil
 }
 
-func (c *JobController) executeRunPodGraphQL(query string) (*DeploymentResponse, error) {
-	url := fmt.Sprintf("https://api.runpod.io/graphql?api_key=%s", c.runpodKey)
-
-	reqBody, err := json.Marshal(map[string]string{
-		"query": query,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(reqBody))
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("RunPod API returned error: %d %s", resp.StatusCode, string(body))
-	}
-
-	var response DeploymentResponse
-	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-		return nil, fmt.Errorf("failed to decode RunPod API response: %w", err)
-	}
-
-	// Check for API errors
-	if response.Errors != nil && len(response.Errors) > 0 {
-		return &response, fmt.Errorf("RunPod API error: %s", response.Errors[0].Message)
-	}
-
-	return &response, nil
-}
-
-func (c *JobController) updateJobStatus(job batchv1.Job) error {
-	jobCopy := job.DeepCopy()
-
-	// Mark Job as "active" by creating a "Running" pod
-	if jobCopy.Status.Active == 0 {
-		jobCopy.Status.Active = 1
-		jobCopy.Status.StartTime = &metav1.Time{Time: time.Now()}
-
-		// Update job status in Kubernetes
-		_, err := c.clientset.BatchV1().Jobs(jobCopy.Namespace).UpdateStatus(
-			context.Background(),
-			jobCopy,
-			metav1.UpdateOptions{},
-		)
-		if err != nil {
-			c.logger.Error(err, "Failed to update job status",
-				"job", jobCopy.Name, "namespace", jobCopy.Namespace)
-			return fmt.Errorf("failed to update job status: %w", err)
-		}
-	}
-
-	return nil
-}
-
-func (c *JobController) updateJobAnnotations(job batchv1.Job, runpodID string, costPerHr float64) error {
-	jobCopy := job.DeepCopy()
-
-	if jobCopy.Annotations == nil {
-		jobCopy.Annotations = make(map[string]string)
-	}
-
-	jobCopy.Annotations[RunpodPodIDAnnotation] = runpodID
-	jobCopy.Annotations[RunpodOffloadedAnnotation] = "true"
-	jobCopy.Annotations[RunpodCostAnnotation] = fmt.Sprintf("%f", costPerHr)
-
-	return c.updateJobWithRetry(jobCopy)
-}
-
-func (c *JobController) createK8sResourcesForRunPod(job batchv1.Job, runpodID string, costPerHr float64) error {
-	if err := c.updateJobAnnotations(job, runpodID, costPerHr); err != nil {
-		return err
-	}
-
-	if err := c.createVirtualPod(job, runpodID, costPerHr); err != nil {
-		return err
-	}
-
-	return c.updateJobStatus(job)
-}
-
-func (c *JobController) createVirtualPod(job batchv1.Job, runpodID string, costPerHr float64) error {
+// CreateVirtualPod creates a virtual Pod representation of a RunPod instance
+func (c *JobController) CreateVirtualPod(job batchv1.Job, runpodID string, costPerHr float64) error {
 	// Create a Pod representation of the RunPod instance
 	podName := fmt.Sprintf("%s-runpod", job.Name)
 
@@ -1063,26 +799,82 @@ func (c *JobController) createVirtualPod(job batchv1.Job, runpodID string, costP
 	return nil
 }
 
-// offloadJobToRunPod sends the job to RunPod and creates a corresponding Pod representation
-func (c *JobController) offloadJobToRunPod(job batchv1.Job) error {
+// UpdateJobAnnotations updates a job's annotations with RunPod information
+func (c *JobController) UpdateJobAnnotations(job batchv1.Job, runpodID string, costPerHr float64) error {
+	jobCopy := job.DeepCopy()
+
+	if jobCopy.Annotations == nil {
+		jobCopy.Annotations = make(map[string]string)
+	}
+
+	jobCopy.Annotations[RunpodPodIDAnnotation] = runpodID
+	jobCopy.Annotations[RunpodOffloadedAnnotation] = "true"
+	jobCopy.Annotations[RunpodCostAnnotation] = fmt.Sprintf("%f", costPerHr)
+
+	return c.UpdateJobWithRetry(jobCopy)
+}
+
+// UpdateJobStatus updates a job's status to mark it as active
+func (c *JobController) UpdateJobStatus(job batchv1.Job) error {
+	jobCopy := job.DeepCopy()
+
+	// Mark Job as "active" by creating a "Running" pod
+	if jobCopy.Status.Active == 0 {
+		jobCopy.Status.Active = 1
+		jobCopy.Status.StartTime = &metav1.Time{Time: time.Now()}
+
+		// Update job status in Kubernetes
+		_, err := c.clientset.BatchV1().Jobs(jobCopy.Namespace).UpdateStatus(
+			context.Background(),
+			jobCopy,
+			metav1.UpdateOptions{},
+		)
+		if err != nil {
+			c.logger.Error(err, "Failed to update job status",
+				"job", jobCopy.Name, "namespace", jobCopy.Namespace)
+			return fmt.Errorf("failed to update job status: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// OffloadJobToRunPod sends a job to RunPod and creates a K8s representation
+func (c *JobController) OffloadJobToRunPod(job batchv1.Job) error {
 	// Step 1: Prepare parameters for RunPod deployment
-	minMemoryInGb, gpuTypes, envVars, imageName, err := c.prepareRunPodParameters(job)
+	params, err := c.PrepareRunPodParameters(job)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to prepare RunPod parameters: %w", err)
 	}
 
 	// Step 2: Deploy to RunPod
-	runpodID, costPerHr, err := c.deployToRunPod(job, minMemoryInGb, gpuTypes, envVars, imageName)
+	runpodID, costPerHr, err := c.runpodClient.DeployPod(params)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to deploy to RunPod: %w", err)
 	}
 
-	// Step 3: Create K8s resources
-	err = c.createK8sResourcesForRunPod(job, runpodID, costPerHr)
-	if err != nil {
+	// Step 3: Track the job for potential cleanup
+	jobKey := fmt.Sprintf("%s/%s", job.Namespace, job.Name)
+	c.deletedJobsMutex.Lock()
+	c.deletedJobs[jobKey] = runpodID
+	c.deletedJobsMutex.Unlock()
+
+	// Step 4: Create K8s resources
+	if err := c.UpdateJobAnnotations(job, runpodID, costPerHr); err != nil {
 		// Clean up RunPod instance on failure
-		c.terminateRunPodInstance(runpodID)
-		return err
+		c.runpodClient.TerminatePod(runpodID)
+		return fmt.Errorf("failed to update job annotations: %w", err)
+	}
+
+	if err := c.CreateVirtualPod(job, runpodID, costPerHr); err != nil {
+		// Clean up RunPod instance on failure
+		c.runpodClient.TerminatePod(runpodID)
+		return fmt.Errorf("failed to create virtual pod: %w", err)
+	}
+
+	if err := c.UpdateJobStatus(job); err != nil {
+		// Note: We don't clean up here as the pod and job annotations are already created
+		return fmt.Errorf("failed to update job status: %w", err)
 	}
 
 	c.logger.Info("Successfully offloaded job to RunPod",
@@ -1094,9 +886,180 @@ func (c *JobController) offloadJobToRunPod(job batchv1.Job) error {
 	return nil
 }
 
-// cleanupDeletedJobs checks for jobs that have been deleted from Kubernetes
+// CleanupPod handles termination of a RunPod instance and K8s resources
+func (c *JobController) CleanupPod(namespace, jobName, runpodID string) error {
+	// First terminate the RunPod instance
+	if err := c.runpodClient.TerminatePod(runpodID); err != nil {
+		c.logger.Error(err, "Failed to terminate RunPod instance",
+			"runpodID", runpodID,
+			"job", jobName)
+		// Continue with cleanup even if termination fails
+	}
+
+	// Then clean up the K8s pod
+	podName := fmt.Sprintf("%s-runpod", jobName)
+	err := c.clientset.CoreV1().Pods(namespace).Delete(
+		context.Background(),
+		podName,
+		metav1.DeleteOptions{},
+	)
+
+	if err != nil && !k8serrors.IsNotFound(err) {
+		c.logger.Error(err, "Failed to delete virtual pod",
+			"pod", podName,
+			"namespace", namespace)
+		return err
+	}
+
+	c.logger.Info("Cleanup completed", "job", jobName, "runpodID", runpodID)
+	return nil
+}
+
+// CheckRunPodHealth checks if the RunPod API is healthy
+func (c *JobController) CheckRunPodHealth() {
+	wasAvailable := c.runpodAvailable
+	c.runpodAvailable = c.runpodClient.CheckAPIHealth()
+
+	// Log changes in availability
+	if wasAvailable && !c.runpodAvailable {
+		c.logger.Info("RunPod API is now unavailable")
+	} else if !wasAvailable && c.runpodAvailable {
+		c.logger.Info("RunPod API is now available")
+	}
+}
+
+// CleanupTerminatingPods checks for pods in Terminating state on the RunPod virtual node
+// and ensures they are properly terminated both in K8s and on RunPod
+func (c *JobController) CleanupTerminatingPods() error {
+	c.logger.Info("Checking for terminating pods on RunPod virtual node")
+
+	// Check for any pods that might be terminating but stuck
+	allPods, err := c.clientset.CoreV1().Pods("").List(
+		context.Background(),
+		metav1.ListOptions{
+			LabelSelector: "runpod.io/managed=true",
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("failed to list all RunPod managed pods: %w", err)
+	}
+
+	terminatingCount := 0
+	for _, pod := range allPods.Items {
+		// Check if pod is terminating (has a deletion timestamp but still exists)
+		if pod.DeletionTimestamp != nil {
+			terminatingCount++
+			c.handleTerminatingPod(pod)
+		}
+	}
+
+	c.logger.Info("Terminating pod cleanup completed", "processed", terminatingCount)
+	return nil
+}
+
+// HandleTerminatingPod processes a single terminating pod
+func (c *JobController) handleTerminatingPod(pod corev1.Pod) {
+	deletionTime := pod.DeletionTimestamp.Time
+	terminatingDuration := time.Since(deletionTime)
+
+	c.logger.Info("Found terminating pod",
+		"pod", pod.Name,
+		"namespace", pod.Namespace,
+		"deletionTimestamp", pod.DeletionTimestamp,
+		"terminatingFor", terminatingDuration.String())
+
+	// If pod has been terminating for more than 15 minutes, force delete it
+	forceDeletionThreshold := 15 * time.Minute
+	if terminatingDuration > forceDeletionThreshold {
+		c.logger.Info("Pod has been terminating for too long, force deleting",
+			"pod", pod.Name,
+			"namespace", pod.Namespace,
+			"terminatingFor", terminatingDuration.String())
+
+		if err := c.ForceDeletePod(pod.Namespace, pod.Name); err != nil {
+			c.logger.Error(err, "Failed to force delete long-terminating pod",
+				"pod", pod.Name,
+				"namespace", pod.Namespace)
+		}
+		return
+	}
+
+	// Get RunPod ID from pod annotations
+	runpodID, exists := pod.Annotations[RunpodPodIDAnnotation]
+	if !exists {
+		c.logger.Info("Terminating pod missing RunPod ID annotation, will force delete",
+			"pod", pod.Name,
+			"namespace", pod.Namespace)
+
+		// Force delete the pod as it has no RunPod ID
+		if err := c.ForceDeletePod(pod.Namespace, pod.Name); err != nil {
+			c.logger.Error(err, "Failed to force delete pod without RunPod ID",
+				"pod", pod.Name,
+				"namespace", pod.Namespace)
+		}
+		return
+	}
+
+	// Check if the RunPod instance is still running
+	podStatus, err := c.runpodClient.GetPodStatus(runpodID)
+	if err != nil {
+		c.logger.Error(err, "Failed to check RunPod instance status",
+			"runpodID", runpodID,
+			"pod", pod.Name)
+
+		// If we get a GraphQL validation error or any other API error,
+		// assume the pod doesn't exist on RunPod anymore and force delete it
+		if strings.Contains(err.Error(), "GRAPHQL_VALIDATION_FAILED") ||
+			strings.Contains(err.Error(), "Something went wrong") {
+			c.logger.Info("RunPod API returned error, assuming instance no longer exists. Force deleting K8s pod",
+				"runpodID", runpodID,
+				"pod", pod.Name)
+
+			if err := c.ForceDeletePod(pod.Namespace, pod.Name); err != nil {
+				c.logger.Error(err, "Failed to force delete pod after RunPod API error",
+					"pod", pod.Name,
+					"namespace", pod.Namespace)
+			}
+		}
+		return
+	}
+
+	// Handle based on RunPod instance status
+	switch podStatus {
+	case PodRunning, PodStarting:
+		c.logger.Info("RunPod instance is still active, terminating it",
+			"runpodID", runpodID,
+			"pod", pod.Name,
+			"status", podStatus)
+
+		if err := c.runpodClient.TerminatePod(runpodID); err != nil {
+			c.logger.Error(err, "Failed to terminate RunPod instance",
+				"runpodID", runpodID,
+				"pod", pod.Name)
+			return
+		}
+
+		// Wait briefly for termination to be processed
+		time.Sleep(2 * time.Second)
+
+	case PodTerminated, PodTerminating, PodNotFound:
+		// If pod is already terminated or not found, just force delete it from K8s
+		c.logger.Info("RunPod instance is already terminated or not found, cleaning up K8s pod",
+			"runpodID", runpodID,
+			"pod", pod.Name,
+			"status", podStatus)
+
+		if err := c.ForceDeletePod(pod.Namespace, pod.Name); err != nil {
+			c.logger.Error(err, "Failed to force delete pod",
+				"pod", pod.Name,
+				"namespace", pod.Namespace)
+		}
+	}
+}
+
+// CleanupDeletedJobs checks for jobs that have been deleted from Kubernetes
 // and terminates the corresponding RunPod instances
-func (c *JobController) cleanupDeletedJobs() error {
+func (c *JobController) CleanupDeletedJobs() error {
 	c.logger.Info("Starting RunPod cleanup")
 
 	c.deletedJobsMutex.Lock()
@@ -1129,33 +1092,26 @@ func (c *JobController) cleanupDeletedJobs() error {
 			// Job no longer exists in K8s, terminate the RunPod instance
 			c.logger.Info("Terminating RunPod for deleted job", "job", jobKey, "runpodID", runpodID)
 
-			// Call RunPod API to terminate the pod
-			if err := c.terminateRunPodInstance(runpodID); err != nil {
-				c.logger.Error(err, "Failed to terminate RunPod instance", "runpodID", runpodID)
+			// Extract namespace and job name
+			parts := strings.Split(jobKey, "/")
+			if len(parts) != 2 {
+				c.logger.Error(nil, "Invalid job key format", "jobKey", jobKey)
+				continue
+			}
+
+			namespace := parts[0]
+			jobName := parts[1]
+
+			// Clean up the resources
+			if err := c.CleanupPod(namespace, jobName, runpodID); err != nil {
+				c.logger.Error(err, "Failed to cleanup pod resources",
+					"job", jobKey,
+					"runpodID", runpodID)
 				continue
 			}
 
 			// Mark for removal from tracking map
 			jobsToRemove = append(jobsToRemove, jobKey)
-
-			// Clean up virtual pod if it still exists
-			parts := strings.Split(jobKey, "/")
-			if len(parts) == 2 {
-				namespace := parts[0]
-				jobName := parts[1]
-				podName := fmt.Sprintf("%s-runpod", jobName)
-
-				err := c.clientset.CoreV1().Pods(namespace).Delete(
-					context.Background(),
-					podName,
-					metav1.DeleteOptions{},
-				)
-				if err != nil {
-					c.logger.Info("Virtual pod already deleted or not found", "pod", podName)
-				} else {
-					c.logger.Info("Deleted virtual pod", "pod", podName)
-				}
-			}
 		}
 	}
 
@@ -1169,142 +1125,134 @@ func (c *JobController) cleanupDeletedJobs() error {
 	return nil
 }
 
-// terminateRunPodInstance terminates a RunPod instance by ID
-func (c *JobController) terminateRunPodInstance(podID string) error {
-	url := fmt.Sprintf("https://api.runpod.io/graphql?api_key=%s", c.runpodKey)
+// Reconcile checks for jobs that need to be offloaded to RunPod
+func (c *JobController) Reconcile() error {
+	// List all jobs with the runpod.io/managed annotation
+	jobs, err := c.clientset.BatchV1().Jobs("").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
 
-	query := fmt.Sprintf(`
-		mutation {
-			podTerminate(input: {
-				podId: "%s"
-			}) {
-				id
-				desiredStatus
+	pendingCount := 0
+	activeJobs := make(map[string]bool)
+
+	for _, job := range jobs.Items {
+		// Skip jobs that don't have the runpod.io/managed annotation
+		if !IsRunPodJob(job) {
+			continue
+		}
+
+		// Track all active job names
+		jobKey := fmt.Sprintf("%s/%s", job.Namespace, job.Name)
+		activeJobs[jobKey] = true
+
+		// Check if job needs labeling
+		if !HasRunPodLabel(job) {
+			if err := c.LabelAsRunPodJob(&job); err != nil {
+				c.logger.Error(err, "failed to label RunPod job", "job", job.Name)
+				continue
 			}
 		}
-	`, podID)
 
-	reqBody, err := json.Marshal(map[string]string{
-		"query": query,
-	})
-	if err != nil {
-		return err
+		// Check if job should be offloaded to RunPod
+		if IsPending(job) {
+			pendingCount++
+			// Check if the job already has pods running or scheduled on cluster nodes
+			hasNonPendingPods, err := c.HasRunningOrScheduledPods(job)
+			if err != nil {
+				c.logger.Error(err, "failed to check if job has running pods", "job", job.Name)
+				continue
+			}
+
+			if !hasNonPendingPods && ShouldOffloadToRunPod(job, pendingCount, c.config) {
+				if err := c.OffloadJobToRunPod(job); err != nil {
+					c.logger.Error(err, "failed to offload job to RunPod", "job", job.Name)
+				}
+			}
+		}
 	}
 
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(reqBody))
-	if err != nil {
-		return err
+	// Update tracking map for deleted jobs
+	c.deletedJobsMutex.Lock()
+	for jobKey := range c.deletedJobs {
+		if !activeJobs[jobKey] {
+			// Job is no longer in the API server but still in our map
+			// Keep it in the map for cleanup to handle
+			c.logger.Info("Job marked for cleanup", "job", jobKey)
+		}
+	}
+	c.deletedJobsMutex.Unlock()
+
+	return nil
+}
+
+// Start begins the controller's reconciliation loop
+func (c *JobController) Start() error {
+	reconcileTicker := time.NewTicker(c.config.ReconcileInterval)
+	cleanupTicker := time.NewTicker(5 * time.Minute)        // Check for cleanup every 5 minutes
+	terminatingPodTicker := time.NewTicker(1 * time.Minute) // Check for terminating pods every minute
+	healthCheckTicker := time.NewTicker(1 * time.Minute)    // Check RunPod API health every minute
+	defer reconcileTicker.Stop()
+	defer cleanupTicker.Stop()
+	defer terminatingPodTicker.Stop()
+	defer healthCheckTicker.Stop()
+
+	// Start health server
+	c.healthServer.Start()
+
+	// Set up channels for graceful shutdown
+	stopCh := make(chan struct{})
+	doneCh := make(chan struct{})
+
+	go func() {
+		defer close(doneCh)
+		for {
+			select {
+			case <-reconcileTicker.C:
+				if err := c.Reconcile(); err != nil {
+					c.logger.Error(err, "reconciliation failed")
+				}
+			case <-cleanupTicker.C:
+				if err := c.CleanupDeletedJobs(); err != nil {
+					c.logger.Error(err, "cleanup failed")
+				}
+			case <-terminatingPodTicker.C:
+				if err := c.CleanupTerminatingPods(); err != nil {
+					c.logger.Error(err, "terminating pod cleanup failed")
+				}
+			case <-healthCheckTicker.C:
+				c.CheckRunPodHealth()
+			case <-stopCh:
+				return
+			}
+		}
+	}()
+
+	<-stopCh
+	c.logger.Info("Stopping controller")
+
+	// Stop health server
+	if err := c.healthServer.Stop(); err != nil {
+		c.logger.Error(err, "failed to stop health server")
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("RunPod API returned error: %d %s", resp.StatusCode, string(body))
-	}
-
-	// Parse response to confirm termination
-	var response struct {
-		Data struct {
-			PodTerminate struct {
-				ID            string `json:"id"`
-				DesiredStatus string `json:"desiredStatus"`
-			} `json:"podTerminate"`
-		} `json:"data"`
-		Errors []struct {
-			Message string `json:"message"`
-		} `json:"errors"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-		return err
-	}
-
-	// Check for API errors
-	if len(response.Errors) > 0 {
-		return fmt.Errorf("RunPod API error: %s", response.Errors[0].Message)
-	}
-
-	// Check termination status
-	if response.Data.PodTerminate.DesiredStatus != "TERMINATED" {
-		return fmt.Errorf("failed to terminate RunPod instance, status: %s",
-			response.Data.PodTerminate.DesiredStatus)
+	// Wait for cleanup to finish
+	select {
+	case <-doneCh:
+		c.logger.Info("Controller stopped gracefully")
+	case <-time.After(30 * time.Second):
+		c.logger.Info("Controller stop timed out")
 	}
 
 	return nil
 }
 
+// isReady checks if the controller is ready to serve requests
+func (c *JobController) isReady() bool {
+	return c.runpodAvailable && c.runpodClient.apiKey != ""
+}
+
 // Helper function to create boolean pointer
 func boolPtr(b bool) *bool {
 	return &b
-}
-
-// isReady checks if the controller is ready to serve requests
-func (c *JobController) isReady() bool {
-	return c.runpodAvailable && c.runpodKey != ""
-}
-
-// checkRunPodHealth checks if the RunPod API is healthy
-func (c *JobController) checkRunPodHealth() {
-	// Skip check if no API key
-	if c.runpodKey == "" {
-		c.runpodAvailable = false
-		return
-	}
-
-	url := fmt.Sprintf("https://api.runpod.io/graphql?api_key=%s", c.runpodKey)
-	query := `
-		query {
-			myself {
-				id
-			}
-		}
-	`
-
-	reqBody, err := json.Marshal(map[string]string{
-		"query": query,
-	})
-	if err != nil {
-		c.logger.Error(err, "failed to marshal RunPod health check query")
-		c.runpodAvailable = false
-		return
-	}
-
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(reqBody))
-	if err != nil {
-		c.logger.Error(err, "failed to create RunPod health check request")
-		c.runpodAvailable = false
-		return
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	req = req.WithContext(ctx)
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		c.logger.Error(err, "RunPod API health check failed")
-		c.runpodAvailable = false
-		return
-	}
-	defer resp.Body.Close()
-
-	// Update health status based on response
-	wasAvailable := c.runpodAvailable
-	c.runpodAvailable = resp.StatusCode >= 200 && resp.StatusCode < 300
-
-	// Log changes in availability
-	if wasAvailable && !c.runpodAvailable {
-		c.logger.Info("RunPod API is now unavailable", "statusCode", resp.StatusCode)
-	} else if !wasAvailable && c.runpodAvailable {
-		c.logger.Info("RunPod API is now available")
-	}
 }
