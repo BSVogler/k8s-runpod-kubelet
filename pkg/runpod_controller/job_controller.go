@@ -192,7 +192,7 @@ func (c *RunPodClient) GetPodStatus(podID string) (PodStatus, error) {
 
 // GetGPUTypes gets available GPU types from RunPod API
 // Update GetGPUTypes to return the selected GPU details and formatted GPU type list
-func (c *RunPodClient) GetGPUTypes(minMemoryInGb int, maxPrice float64, cloudType string) (string, error) {
+func (c *RunPodClient) GetGPUTypes(minMemoryInGb int, maxPrice float64, cloudType string) ([]string, error) {
 	query := `
         query GpuTypes {
             gpuTypes {
@@ -285,7 +285,7 @@ func (c *RunPodClient) GetGPUTypes(minMemoryInGb int, maxPrice float64, cloudTyp
 		if i >= 5 {
 			break
 		}
-		gpuIDs = append(gpuIDs, fmt.Sprintf(`"%s"`, gpu.ID))
+		gpuIDs = append(gpuIDs, gpu.ID) // No formatting with quotes here
 	}
 
 	if len(gpuIDs) == 0 {
@@ -293,10 +293,10 @@ func (c *RunPodClient) GetGPUTypes(minMemoryInGb int, maxPrice float64, cloudTyp
 			"cloudType", cloudType,
 			"minMemoryInGb", minMemoryInGb,
 			"maxPrice", maxPrice)
-		return "[]", nil
+		return []string{}, nil
 	}
 
-	return "[" + strings.Join(gpuIDs, ", ") + "]", nil
+	return gpuIDs, nil
 }
 
 // DeployPod deploys a pod to RunPod
@@ -778,7 +778,6 @@ func FormatEnvVarsForGraphQL(envVars []RunPodEnv) []map[string]string {
 }
 
 // PrepareRunPodParameters prepares parameters for RunPod deployment
-// PrepareRunPodParameters prepares parameters for RunPod deployment
 func (c *JobController) PrepareRunPodParameters(job batchv1.Job) (map[string]interface{}, error) {
 	// Determine cloud type - default to COMMUNITY but allow override via annotation
 	cloudType := "COMMUNITY"
@@ -848,7 +847,7 @@ func (c *JobController) PrepareRunPodParameters(job batchv1.Job) (map[string]int
 		"containerDiskInGb": containerDiskInGb,
 		"minVcpuCount":      2,
 		"minMemoryInGb":     minMemoryInGb,
-		"gpuTypeIdList":     gpuTypes,
+		"gpuTypeIdList":     gpuTypes, // Use the array directly, don't stringify it
 		"name":              runpodJobName,
 		"imageName":         imageName,
 		"env":               formattedEnvVars,
