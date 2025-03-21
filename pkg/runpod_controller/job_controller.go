@@ -214,7 +214,7 @@ func (c *RunPodClient) GetGPUTypes(minMemoryInGb int, maxPrice float64, cloudTyp
 	}
 
 	if err := c.ExecuteGraphQL(query, nil, &response); err != nil {
-		return "", err
+		return []string{}, err
 	}
 
 	// Filter GPUs based on criteria AND cloud type
