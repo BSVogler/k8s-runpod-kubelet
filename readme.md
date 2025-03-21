@@ -1,17 +1,23 @@
-# Kubernetes RunPod Controller
+# Kubernetes RunPod Controller for
 
-This controller watches annotated Kubernetes Jobs wand offloads them to RunPod when resources are constrained or when explicitly requested. It maintains proper Kubernetes representations of RunPod instances and handles cleanup automatically.
-The idea is that you have some local node that can process but you want to offload as a fallback scenario.
+This controller implements cloud bursting for GPU workloads, automatically offloading annotated Kubernetes Jobs to RunPod when cluster resources are constrained or when explicitly requested. It maintains proper Kubernetes representations of RunPod instances and handles their complete lifecycle management.
 
 ## Overview
 
-The controller periodically scans all Jobs and offloads them to RunPod in the following scenarios:
+The controller enables cost-efficient hybrid scaling between your local GPU resources and RunPod's GPU cloud. Since on-premises hardware costs are fixed regardless of utilization, the controller prioritizes using your local resources before bursting to usage-billed cloud GPUs, optimizing for both performance and cost.
 
-1. Jobs that can be offloaded must be annotated with `runpod.io/managed: "true"`.
-2. And when Jobs have been pending for more than [configurable seconds](#configuration) (default 0)
-3. or when the number of pending jobs exceeds a [configurable threshold](#configuration) (default 1)
+### How It Works
+Install the controller, add your runpod token and annotate your jobs to offload dynamically.
 
-you can also force it by setting annotation `runpod.io/offload: "true"` to the Job.
+1. **Resource Annotation**: Jobs that can be burst to RunPod must be annotated with `runpod.io/managed: "true"`.
+
+2. **Automatic Bursting**: The controller will automatically offload jobs to RunPod when either:
+   - Jobs have been pending for more than [configurable seconds](#configuration) (default 0)
+   - The number of pending jobs exceeds a [configurable threshold](#configuration) (default 1)
+
+3. **Explicit Bursting**: You can force immediate offloading by setting the annotation `runpod.io/offload: "true"` on any managed Job.
+
+This approach ensures you maximize the value of your fixed-cost on-premises GPU infrastructure while seamlessly expanding to pay-per-use cloud resources only when necessary, providing the best balance between cost efficiency and computational capacity.
 
 ## Key Features
 
