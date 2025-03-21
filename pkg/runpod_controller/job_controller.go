@@ -562,13 +562,50 @@ func HasRunPodLabel(job batchv1.Job) bool {
 }
 
 // IsPending checks if a job is in a pending state
-func IsPending(job batchv1.Job) bool {
+func IsPending(job batchv1.Job, clientset *kubernetes.Clientset) (bool, error) {
 	// Check if the job is still actively running but hasn't completed yet
-	// and doesn't have any succeeded or failed pods
-	return job.Status.Active > 0 &&
-		job.Status.Succeeded == 0 &&
-		job.Status.Failed == 0 &&
-		job.Status.CompletionTime == nil
+	if job.Status.Active > 0 && job.Status.Succeeded == 0 &&
+		job.Status.Failed < *job.Spec.BackoffLimit && job.Status.CompletionTime == nil {
+
+		// Check if the active pod is actually pending
+		pods, err := clientset.CoreV1().Pods(job.Namespace).List(
+			context.Background(),
+			metav1.ListOptions{
+				LabelSelector: fmt.Sprintf("job-name=%s", job.Name),
+			},
+		)
+
+		if err != nil {
+			return false, fmt.Errorf("failed to list pods for job: %w", err)
+		}
+
+		// Count actual pending pods
+		pendingPods := 0
+		for _, pod := range pods.Items {
+			if pod.Status.Phase == corev1.PodPending {
+				// Check if the pod is unschedulable
+				for _, condition := range pod.Status.Conditions {
+					if condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionFalse {
+						if condition.Reason == "Unschedulable" {
+							// This is an unschedulable pod - means the job is truly pending
+							return true, nil
+						}
+					}
+				}
+				pendingPods++
+			}
+		}
+
+		// If all active pods are pending, the job is truly pending
+		if pendingPods == int(job.Status.Active) {
+			return true, nil
+		}
+
+		// Otherwise, the job has at least one non-pending pod
+		return false, nil
+	}
+
+	return false, nil
 }
 
 // ShouldOffloadToRunPod determines if a job should be offloaded to RunPod
@@ -578,24 +615,14 @@ func ShouldOffloadToRunPod(job batchv1.Job, pendingCounter int, cfg config.Confi
 		return false
 	}
 
-	// Check if we're waiting for a retry
-	if retryTimeStr, hasRetry := job.Annotations[RunpodRetryAnnotation]; hasRetry {
-		retryTime, err := time.Parse(time.RFC3339, retryTimeStr)
-		if err == nil && time.Now().Before(retryTime) {
-			// Not yet time to retry
-			return false
-		}
-	}
-
 	// Check for explicit offload annotation
 	value, exists := job.Annotations[RunpodOffloadAnnotation]
 	if exists && value == "true" {
 		return true
 	}
 
-	// Check if job is actually in a state where it needs offloading
-	// If the job is completing or has non-pending pods, don't offload
-	if job.Status.Succeeded > 0 || job.Status.Failed > 0 || job.Status.CompletionTime != nil {
+	// Check if job is completing or already completed
+	if job.Status.Succeeded > 0 || job.Status.CompletionTime != nil {
 		return false
 	}
 
@@ -603,7 +630,12 @@ func ShouldOffloadToRunPod(job batchv1.Job, pendingCounter int, cfg config.Confi
 	creationTime := job.CreationTimestamp.Time
 	pendingTime := time.Since(creationTime)
 
-	return pendingTime > time.Duration(cfg.MaxPendingTime)*time.Second || pendingCounter > cfg.PendingJobThreshold
+	// Time-based decision
+	timeBasedOffload := pendingTime > time.Duration(cfg.MaxPendingTime)*time.Second
+	// Count-based decision
+	countBasedOffload := pendingCounter > cfg.PendingJobThreshold
+
+	return timeBasedOffload || countBasedOffload
 }
 
 // LabelAsRunPodJob adds the RunPod managed label to a job
@@ -1323,7 +1355,16 @@ func (c *JobController) getJobState(job batchv1.Job) string {
 		return "OFFLOADING_INCOMPLETE" // Incomplete offload
 	}
 
-	if IsPending(job) {
+	// Use the new IsPending function that requires clientset
+	isPending, err := IsPending(job, c.clientset)
+	if err != nil {
+		c.logger.Error(err, "Failed to check if job is pending",
+			"job", job.Name, "namespace", job.Namespace)
+		// Default to a safe state if we can't determine pending status
+		return "UNKNOWN"
+	}
+
+	if isPending {
 		return "PENDING"
 	}
 
@@ -1355,21 +1396,6 @@ func (c *JobController) normalizeJobAnnotations(job batchv1.Job) error {
 	// Initialize annotations if they don't exist
 	if jobCopy.Annotations == nil {
 		jobCopy.Annotations = make(map[string]string)
-	}
-
-	// Check for legacy/alternate GPU memory annotation names
-	alternativeKeys := []string{"requires-gpu-memory", "gpu-memory", "gpu.memory"}
-	for _, key := range alternativeKeys {
-		if val, exists := jobCopy.Annotations[key]; exists && val != "" {
-			jobCopy.Annotations[GpuMemoryAnnotation] = val
-			c.logger.Info("Normalized GPU memory annotation",
-				"job", job.Name,
-				"namespace", job.Namespace,
-				"from", key,
-				"to", GpuMemoryAnnotation,
-				"value", val)
-			changed = true
-		}
 	}
 
 	// Validate that a job that's marked as offloaded has a valid pod ID
@@ -1499,33 +1525,40 @@ func (c *JobController) Reconcile() error {
 		}
 
 		// Process pending jobs for potential offloading
-		if IsPending(job) {
+		isPending, err := IsPending(job, c.clientset)
+		if err != nil {
+			c.logger.Error(err, "Failed to check if job is pending",
+				"job", job.Name, "namespace", job.Namespace)
+			continue
+		}
+
+		if isPending {
 			pendingCount++
 
-			// Check if there's a retry annotation that we should clear
-			if retryTimeStr, hasRetry := job.Annotations[RunpodRetryAnnotation]; hasRetry {
-				retryTime, err := time.Parse(time.RFC3339, retryTimeStr)
-				if err != nil || time.Now().After(retryTime) {
-					// Time to retry - clear the annotation
-					jobCopy := job.DeepCopy()
-					delete(jobCopy.Annotations, RunpodRetryAnnotation)
+			// Check if the job already has pods running or scheduled on cluster nodes
+			hasNonPendingPods, err := c.HasRunningOrScheduledPods(job)
+			if err != nil {
+				c.logger.Error(err, "Failed to check if job has running pods", "job", job.Name)
+				continue
+			}
 
-					if err := c.UpdateJobWithRetry(jobCopy); err != nil {
-						c.logger.Error(err, "Failed to clear retry annotation",
-							"job", job.Name, "namespace", job.Namespace)
-						continue
-					}
+			c.logger.Info("Pending job details",
+				"job", job.Name,
+				"namespace", job.Namespace,
+				"hasNonPendingPods", hasNonPendingPods,
+				"activeCount", job.Status.Active,
+				"succeededCount", job.Status.Succeeded,
+				"failedCount", job.Status.Failed)
 
-					c.logger.Info("Cleared retry annotation, will attempt offload again",
-						"job", job.Name, "namespace", job.Namespace)
-				} else {
-					// Not yet time to retry
-					waitTime := time.Until(retryTime).Round(time.Second)
-					c.logger.Info("Job waiting for retry",
+			if !hasNonPendingPods && ShouldOffloadToRunPod(job, pendingCount, c.config) {
+				c.logger.Info("Attempting to offload job to RunPod",
+					"job", job.Name,
+					"namespace", job.Namespace)
+
+				if err := c.OffloadJobToRunPod(job); err != nil {
+					c.logger.Error(err, "Failed to offload job to RunPod",
 						"job", job.Name,
-						"namespace", job.Namespace,
-						"retryIn", waitTime.String())
-					continue
+						"namespace", job.Namespace)
 				}
 			}
 		}
