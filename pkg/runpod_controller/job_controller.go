@@ -1126,6 +1126,131 @@ func (c *JobController) CleanupDeletedJobs() error {
 }
 
 // Reconcile checks for jobs that need to be offloaded to RunPod
+// getJobState determines the current state of a job
+func (c *JobController) getJobState(job batchv1.Job) string {
+	if job.Status.Succeeded > 0 || job.Status.CompletionTime != nil {
+		return "COMPLETED"
+	}
+
+	if job.Spec.BackoffLimit != nil && job.Status.Failed >= *job.Spec.BackoffLimit {
+		return "FAILED"
+	}
+
+	if _, offloaded := job.Annotations[RunpodOffloadedAnnotation]; offloaded {
+		if podID := job.Annotations[RunpodPodIDAnnotation]; podID != "" {
+			return "OFFLOADED"
+		}
+		return "OFFLOADING_INCOMPLETE" // Incomplete offload
+	}
+
+	if IsPending(job) {
+		return "PENDING"
+	}
+
+	return "NEW"
+}
+
+// resetJobOffloadState resets a job's offload state when it's inconsistent
+func (c *JobController) resetJobOffloadState(job batchv1.Job) error {
+	c.logger.Info("Resetting inconsistent job offload state",
+		"job", job.Name,
+		"namespace", job.Namespace)
+
+	jobCopy := job.DeepCopy()
+	if jobCopy.Annotations == nil {
+		jobCopy.Annotations = make(map[string]string)
+	}
+
+	delete(jobCopy.Annotations, RunpodOffloadedAnnotation)
+	delete(jobCopy.Annotations, RunpodPodIDAnnotation)
+
+	return c.UpdateJobWithRetry(jobCopy)
+}
+
+// normalizeJobAnnotations converts and standardizes job annotations
+func (c *JobController) normalizeJobAnnotations(job batchv1.Job) error {
+	jobCopy := job.DeepCopy()
+	changed := false
+
+	// Initialize annotations if they don't exist
+	if jobCopy.Annotations == nil {
+		jobCopy.Annotations = make(map[string]string)
+	}
+
+	// Check for legacy/alternate GPU memory annotation names
+	alternativeKeys := []string{"requires-gpu-memory", "gpu-memory", "gpu.memory"}
+	for _, key := range alternativeKeys {
+		if val, exists := jobCopy.Annotations[key]; exists && val != "" {
+			jobCopy.Annotations[GpuMemoryAnnotation] = val
+			c.logger.Info("Normalized GPU memory annotation",
+				"job", job.Name,
+				"namespace", job.Namespace,
+				"from", key,
+				"to", GpuMemoryAnnotation,
+				"value", val)
+			changed = true
+		}
+	}
+
+	// Validate that a job that's marked as offloaded has a valid pod ID
+	if jobCopy.Annotations[RunpodOffloadedAnnotation] == "true" {
+		podID := jobCopy.Annotations[RunpodPodIDAnnotation]
+		if podID == "" || len(podID) < 5 {
+			delete(jobCopy.Annotations, RunpodOffloadedAnnotation)
+			delete(jobCopy.Annotations, RunpodPodIDAnnotation)
+			c.logger.Info("Removed invalid offload state",
+				"job", job.Name,
+				"namespace", job.Namespace,
+				"podID", podID)
+			changed = true
+		}
+	}
+
+	if changed {
+		return c.UpdateJobWithRetry(jobCopy)
+	}
+	return nil
+}
+
+// verifyRunPodInstance checks if a RunPod instance still exists and is valid
+func (c *JobController) verifyRunPodInstance(job batchv1.Job) error {
+	podID := job.Annotations[RunpodPodIDAnnotation]
+	if podID == "" {
+		return nil // Nothing to verify
+	}
+
+	status, err := c.runpodClient.GetPodStatus(podID)
+	if err != nil {
+		c.logger.Info("Error checking RunPod instance status",
+			"job", job.Name,
+			"namespace", job.Namespace,
+			"podID", podID,
+			"error", err)
+
+		// Only reset if we're sure the pod doesn't exist
+		if strings.Contains(err.Error(), "not found") {
+			return c.resetJobOffloadState(job)
+		}
+		return err
+	}
+
+	if status == PodNotFound {
+		c.logger.Info("RunPod instance not found, resetting job state",
+			"job", job.Name,
+			"namespace", job.Namespace,
+			"podID", podID)
+		return c.resetJobOffloadState(job)
+	}
+
+	c.logger.Info("Verified RunPod instance",
+		"job", job.Name,
+		"namespace", job.Namespace,
+		"podID", podID,
+		"status", status)
+	return nil
+}
+
+// Reconcile checks for jobs that need to be offloaded to RunPod
 func (c *JobController) Reconcile() error {
 	// List all jobs with the runpod.io/managed annotation
 	jobs, err := c.clientset.BatchV1().Jobs("").List(context.Background(), metav1.ListOptions{})
@@ -1146,27 +1271,68 @@ func (c *JobController) Reconcile() error {
 		jobKey := fmt.Sprintf("%s/%s", job.Namespace, job.Name)
 		activeJobs[jobKey] = true
 
+		// First, normalize annotations to ensure consistent format
+		if err := c.normalizeJobAnnotations(job); err != nil {
+			c.logger.Error(err, "Failed to normalize job annotations",
+				"job", job.Name,
+				"namespace", job.Namespace)
+			continue
+		}
+
 		// Check if job needs labeling
 		if !HasRunPodLabel(job) {
 			if err := c.LabelAsRunPodJob(&job); err != nil {
-				c.logger.Error(err, "failed to label RunPod job", "job", job.Name)
+				c.logger.Error(err, "Failed to label RunPod job", "job", job.Name)
 				continue
 			}
 		}
 
-		// Check if job should be offloaded to RunPod
+		// Determine job state and handle accordingly
+		jobState := c.getJobState(job)
+		c.logger.Info("Processing job",
+			"job", job.Name,
+			"namespace", job.Namespace,
+			"state", jobState)
+
+		switch jobState {
+		case "OFFLOADING_INCOMPLETE":
+			// Job is in an inconsistent state, reset it
+			if err := c.resetJobOffloadState(job); err != nil {
+				c.logger.Error(err, "Failed to reset job in inconsistent state",
+					"job", job.Name,
+					"namespace", job.Namespace)
+			}
+			continue
+
+		case "OFFLOADED":
+			// Verify that the RunPod instance still exists
+			if err := c.verifyRunPodInstance(job); err != nil {
+				c.logger.Error(err, "Failed to verify RunPod instance",
+					"job", job.Name,
+					"namespace", job.Namespace)
+			}
+			continue
+
+		case "COMPLETED", "FAILED":
+			// No action needed for completed or failed jobs
+			continue
+		}
+
+		// Process pending jobs for potential offloading
 		if IsPending(job) {
 			pendingCount++
 			// Check if the job already has pods running or scheduled on cluster nodes
 			hasNonPendingPods, err := c.HasRunningOrScheduledPods(job)
 			if err != nil {
-				c.logger.Error(err, "failed to check if job has running pods", "job", job.Name)
+				c.logger.Error(err, "Failed to check if job has running pods", "job", job.Name)
 				continue
 			}
 
 			if !hasNonPendingPods && ShouldOffloadToRunPod(job, pendingCount, c.config) {
 				if err := c.OffloadJobToRunPod(job); err != nil {
-					c.logger.Error(err, "failed to offload job to RunPod", "job", job.Name)
+					c.logger.Error(err, "Failed to offload job to RunPod",
+						"job", job.Name,
+						"namespace", job.Namespace)
 				}
 			}
 		}
