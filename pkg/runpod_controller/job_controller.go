@@ -109,11 +109,6 @@ func ExtractRegistry(imageName string) string {
 	return "index.docker.io" // Default to DockerHub
 }
 
-// GetContainerRegistryAuthFromEnv gets the container registry auth ID from environment variable
-func GetContainerRegistryAuthFromEnv() string {
-	return os.Getenv(RegistryAuthEnvVar)
-}
-
 // ExecuteGraphQL executes a GraphQL query with proper error handling
 func (c *RunPodClient) ExecuteGraphQL(query string, variables map[string]interface{}, response interface{}) error {
 	reqBody, err := json.Marshal(map[string]interface{}{
@@ -495,15 +490,10 @@ type JobController struct {
 // NewJobController creates a new JobController instance
 func NewJobController(clientset *kubernetes.Clientset, logger logr.Logger, cfg config.Config) *JobController {
 	runpodKey := os.Getenv("RUNPOD_KEY")
-	registryAuthId := os.Getenv(RegistryAuthEnvVar)
 
 	maxPrice := DefaultMaxPrice
 	if cfg.MaxGPUPrice > 0 {
 		maxPrice = cfg.MaxGPUPrice
-	}
-
-	if registryAuthId != "" {
-		logger.Info("Container registry authentication ID is configured")
 	}
 
 	runpodClient := NewRunPodClient(runpodKey, logger)
