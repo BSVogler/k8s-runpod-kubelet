@@ -31,7 +31,7 @@ const (
 	RunpodPodIDAnnotation     = "runpod.io/pod-id"
 	RunpodCostAnnotation      = "runpod.io/cost-per-hr"
 	RunpodManagedLabel        = "runpod.io/managed"
-
+	RunpodRetryAnnotation     = "runpod.io/retry-after"
 	// Annotation for GPU memory requirements
 	GpuMemoryAnnotation = "runpod.io/required-gpu-memory"
 
@@ -237,18 +237,18 @@ func (c *RunPodClient) GetGPUTypes(minMemoryInGb int, maxPrice float64) (string,
 // DeployPod deploys a pod to RunPod
 func (c *RunPodClient) DeployPod(params map[string]interface{}) (string, float64, error) {
 	query := `
-		mutation podFindAndDeployOnDemand($input: PodFindAndDeployOnDemandInput!) {
-			podFindAndDeployOnDemand(input: $input) {
-				id
-				imageName
-				machineId
-				costPerHr
-				machine {
-					podHostId
-				}
-			}
-		}
-	`
+        mutation podFindAndDeployOnDemand($input: PodFindAndDeployOnDemandInput!) {
+            podFindAndDeployOnDemand(input: $input) {
+                id
+                imageName
+                machineId
+                costPerHr
+                machine {
+                    podHostId
+                }
+            }
+        }
+    `
 
 	variables := map[string]interface{}{
 		"input": params,
@@ -267,16 +267,41 @@ func (c *RunPodClient) DeployPod(params map[string]interface{}) (string, float64
 			} `json:"podFindAndDeployOnDemand"`
 		} `json:"data"`
 		Errors []struct {
-			Message string `json:"message"`
+			Message    string                 `json:"message"`
+			Path       []string               `json:"path"`
+			Extensions map[string]interface{} `json:"extensions"`
 		} `json:"errors"`
 	}
 
 	if err := c.ExecuteGraphQL(query, variables, &response); err != nil {
+		c.logger.Error(err, "API request failed when deploying pod",
+			"gpuTypeIdList", params["gpuTypeIdList"],
+			"minMemoryInGb", params["minMemoryInGb"],
+			"containerDiskInGb", params["containerDiskInGb"],
+			"imageName", params["imageName"])
 		return "", 0, err
 	}
 
 	// Check for API errors
 	if len(response.Errors) > 0 {
+		errorDetails := map[string]interface{}{
+			"message": response.Errors[0].Message,
+		}
+
+		if len(response.Errors[0].Path) > 0 {
+			errorDetails["path"] = strings.Join(response.Errors[0].Path, ".")
+		}
+
+		for k, v := range response.Errors[0].Extensions {
+			errorDetails[k] = v
+		}
+
+		errorDetailsJSON, _ := json.Marshal(errorDetails)
+		c.logger.Error(nil, "RunPod API returned error",
+			"errorDetails", string(errorDetailsJSON),
+			"gpuTypeIdList", params["gpuTypeIdList"],
+			"minMemoryInGb", params["minMemoryInGb"])
+
 		return "", 0, fmt.Errorf("RunPod API error: %s", response.Errors[0].Message)
 	}
 
@@ -513,6 +538,15 @@ func ShouldOffloadToRunPod(job batchv1.Job, pendingCounter int, cfg config.Confi
 	// Already offloaded
 	if _, hasOffloaded := job.Annotations[RunpodOffloadedAnnotation]; hasOffloaded {
 		return false
+	}
+
+	// Check if we're waiting for a retry
+	if retryTimeStr, hasRetry := job.Annotations[RunpodRetryAnnotation]; hasRetry {
+		retryTime, err := time.Parse(time.RFC3339, retryTimeStr)
+		if err == nil && time.Now().Before(retryTime) {
+			// Not yet time to retry
+			return false
+		}
 	}
 
 	// Check for explicit offload annotation
@@ -839,6 +873,42 @@ func (c *JobController) UpdateJobStatus(job batchv1.Job) error {
 	return nil
 }
 
+// sanitizeParameters creates a copy of parameters with sensitive data removed
+func sanitizeParameters(params map[string]interface{}) map[string]interface{} {
+	result := make(map[string]interface{})
+	for key, value := range params {
+		if key == "env" {
+			// For environment variables, keep keys but hide values that might be sensitive
+			if envVars, ok := value.([]map[string]string); ok {
+				sanitizedEnvVars := make([]map[string]string, 0, len(envVars))
+				for _, env := range envVars {
+					sanitizedEnv := map[string]string{"key": env["key"]}
+
+					// Keep the value for non-sensitive env vars, mask for sensitive ones
+					keyLower := strings.ToLower(env["key"])
+					if strings.Contains(keyLower, "key") ||
+						strings.Contains(keyLower, "token") ||
+						strings.Contains(keyLower, "secret") ||
+						strings.Contains(keyLower, "password") ||
+						strings.Contains(keyLower, "credential") {
+						sanitizedEnv["value"] = "****"
+					} else {
+						sanitizedEnv["value"] = env["value"]
+					}
+
+					sanitizedEnvVars = append(sanitizedEnvVars, sanitizedEnv)
+				}
+				result[key] = sanitizedEnvVars
+			} else {
+				result[key] = value
+			}
+		} else {
+			result[key] = value
+		}
+	}
+	return result
+}
+
 // OffloadJobToRunPod sends a job to RunPod and creates a K8s representation
 func (c *JobController) OffloadJobToRunPod(job batchv1.Job) error {
 	// Step 1: Prepare parameters for RunPod deployment
@@ -847,11 +917,43 @@ func (c *JobController) OffloadJobToRunPod(job batchv1.Job) error {
 		return fmt.Errorf("failed to prepare RunPod parameters: %w", err)
 	}
 
+	// Log the request parameters (sanitized for any secrets)
+	paramsJSON, _ := json.MarshalIndent(sanitizeParameters(params), "", "  ")
+	c.logger.Info("Requesting RunPod deployment",
+		"job", job.Name,
+		"namespace", job.Namespace,
+		"parameters", string(paramsJSON))
+
 	// Step 2: Deploy to RunPod
 	runpodID, costPerHr, err := c.runpodClient.DeployPod(params)
 	if err != nil {
+		// Check if this is a "no instances available" error that we should retry
+		if strings.Contains(err.Error(), "no instances currently available") {
+			// Mark this job for retry by adding a specific annotation
+			jobCopy := job.DeepCopy()
+			if jobCopy.Annotations == nil {
+				jobCopy.Annotations = make(map[string]string)
+			}
+			jobCopy.Annotations[RunpodRetryAnnotation] = time.Now().Add(5 * time.Minute).Format(time.RFC3339)
+
+			updateErr := c.UpdateJobWithRetry(jobCopy)
+			if updateErr != nil {
+				c.logger.Error(updateErr, "Failed to mark job for retry",
+					"job", job.Name, "namespace", job.Namespace)
+			} else {
+				c.logger.Info("Marked job for retry due to no available instances",
+					"job", job.Name, "namespace", job.Namespace,
+					"retryAfter", jobCopy.Annotations[RunpodRetryAnnotation])
+			}
+		}
 		return fmt.Errorf("failed to deploy to RunPod: %w", err)
 	}
+
+	c.logger.Info("Successfully deployed to RunPod",
+		"job", job.Name,
+		"namespace", job.Namespace,
+		"runpodID", runpodID,
+		"costPerHour", costPerHr)
 
 	// Step 3: Track the job for potential cleanup
 	jobKey := fmt.Sprintf("%s/%s", job.Namespace, job.Name)
@@ -1321,18 +1423,31 @@ func (c *JobController) Reconcile() error {
 		// Process pending jobs for potential offloading
 		if IsPending(job) {
 			pendingCount++
-			// Check if the job already has pods running or scheduled on cluster nodes
-			hasNonPendingPods, err := c.HasRunningOrScheduledPods(job)
-			if err != nil {
-				c.logger.Error(err, "Failed to check if job has running pods", "job", job.Name)
-				continue
-			}
 
-			if !hasNonPendingPods && ShouldOffloadToRunPod(job, pendingCount, c.config) {
-				if err := c.OffloadJobToRunPod(job); err != nil {
-					c.logger.Error(err, "Failed to offload job to RunPod",
+			// Check if there's a retry annotation that we should clear
+			if retryTimeStr, hasRetry := job.Annotations[RunpodRetryAnnotation]; hasRetry {
+				retryTime, err := time.Parse(time.RFC3339, retryTimeStr)
+				if err != nil || time.Now().After(retryTime) {
+					// Time to retry - clear the annotation
+					jobCopy := job.DeepCopy()
+					delete(jobCopy.Annotations, RunpodRetryAnnotation)
+
+					if err := c.UpdateJobWithRetry(jobCopy); err != nil {
+						c.logger.Error(err, "Failed to clear retry annotation",
+							"job", job.Name, "namespace", job.Namespace)
+						continue
+					}
+
+					c.logger.Info("Cleared retry annotation, will attempt offload again",
+						"job", job.Name, "namespace", job.Namespace)
+				} else {
+					// Not yet time to retry
+					waitTime := time.Until(retryTime).Round(time.Second)
+					c.logger.Info("Job waiting for retry",
 						"job", job.Name,
-						"namespace", job.Namespace)
+						"namespace", job.Namespace,
+						"retryIn", waitTime.String())
+					continue
 				}
 			}
 		}
