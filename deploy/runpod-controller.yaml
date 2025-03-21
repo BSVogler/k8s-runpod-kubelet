@@ -103,7 +103,7 @@ spec:
           args:
             - "--reconcile-interval=30"
             - "--pending-job-threshold=1"
-            - "--pending-job-threshold=1"
+            - "--max-pending-time=0"
             - "--max-gpu-price=0.5"
             - "--health-server-address=:8080"
           ports:
