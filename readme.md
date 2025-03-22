@@ -79,11 +79,21 @@ The controller can be configured with the following flags:
 
 ## Job Annotations
 
+By trial and error I found using a template is the only way to make the API use the preconfigured authentication credentials for custom container registries.
+I also found that `COMMUNITY` GPU types are never available via the api.
+
 To use the controller, annotate your GPU Jobs with these annotations:
 
 - `runpod.io/managed: "true"`: Indicates that this job can be managed by the controller
-- `runpod.io/offload: "true"`: Explicitly request offloading to RunPod
 - `runpod.io/required-gpu-memory: "16"`: Specify minimum GPU memory required (in GB)
+- `runpod.io/templateId`: specify a template at runpod and use this id.
+
+Optional:
+- `runpod.io/offload: "true"`: Explicitly request offloading to RunPod
+- `runpod.io/cloud-type`: Specify cloud type, either "SECURE" or "COMMUNITY" (default is "SECURE")
+- `runpod.io/container-registry-auth-id`: Specify container registry authentication ID
+
+
 
 Example:
 
@@ -96,6 +106,7 @@ metadata:
     runpod.io/managed: "true"
     runpod.io/offload: "true"
     runpod.io/required-gpu-memory: "16"
+    runpod.io/templateId: "yourid"
 spec:
   template:
     spec:

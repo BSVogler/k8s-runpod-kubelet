@@ -33,6 +33,7 @@ const (
 	RunpodManagedLabel                    = "runpod.io/managed"
 	RunpodRetryAnnotation                 = "runpod.io/retry-after"
 	RunpodCloudTypeAnnotation             = "runpod.io/cloud-type"
+	RunpodTemplateIdAnnotation            = "runpod.io/template-id"
 	GpuMemoryAnnotation                   = "runpod.io/required-gpu-memory"
 	RunpodContainerRegistryAuthAnnotation = "runpod.io/container-registry-auth-id"
 
@@ -802,7 +803,7 @@ func FormatEnvVarsForGraphQL(envVars []RunPodEnv) []map[string]string {
 // PrepareRunPodParameters prepares parameters for RunPod deployment
 func (c *JobController) PrepareRunPodParameters(job batchv1.Job) (map[string]interface{}, error) {
 	// Determine cloud type - default to COMMUNITY but allow override via annotation
-	cloudType := "COMMUNITY"
+	cloudType := "SECURE"
 	if cloudTypeVal, exists := job.Annotations[RunpodCloudTypeAnnotation]; exists {
 		// Validate and normalize the cloud type value
 		cloudTypeUpperCase := strings.ToUpper(cloudTypeVal)
@@ -825,6 +826,16 @@ func (c *JobController) PrepareRunPodParameters(job batchv1.Job) (map[string]int
 			"job", job.Name,
 			"namespace", job.Namespace,
 			"authID", containerRegistryAuthId)
+	}
+
+	// Extract template ID if provided
+	templateId := ""
+	if tplID, exists := job.Annotations[RunpodTemplateIdAnnotation]; exists && tplID != "" {
+		templateId = tplID
+		c.logger.Info("Using RunPod template",
+			"job", job.Name,
+			"namespace", job.Namespace,
+			"templateId", templateId)
 	}
 
 	// Determine minimum GPU memory required
@@ -869,7 +880,8 @@ func (c *JobController) PrepareRunPodParameters(job batchv1.Job) (map[string]int
 		"namespace", job.Namespace,
 		"cloudType", cloudType,
 		"minMemoryInGb", minMemoryInGb,
-		"containerDiskInGb", containerDiskInGb)
+		"containerDiskInGb", containerDiskInGb,
+		"templateId", templateId)
 
 	// Create deployment parameters - use the same cloudType as used for filtering
 	params := map[string]interface{}{
@@ -883,6 +895,11 @@ func (c *JobController) PrepareRunPodParameters(job batchv1.Job) (map[string]int
 		"name":              runpodJobName,
 		"imageName":         imageName,
 		"env":               formattedEnvVars,
+	}
+
+	// Add templateId to params if it exists
+	if templateId != "" {
+		params["templateId"] = templateId
 	}
 
 	if containerRegistryAuthId != "" {
