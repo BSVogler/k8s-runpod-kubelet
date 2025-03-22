@@ -1,5 +1,5 @@
-# Kubernetes RunPod Controller for
-
+![Logo](social.png)
+# Kubernetes RunPod Controller
 This controller implements cloud bursting for GPU workloads, automatically offloading annotated Kubernetes Jobs to RunPod when cluster resources are constrained or when explicitly requested. It maintains proper Kubernetes representations of RunPod instances and handles their complete lifecycle management.
 
 ## Overview
@@ -31,7 +31,7 @@ This approach ensures you maximize the value of your fixed-cost on-premises GPU 
 
 ### Prerequisites
 
-- Kubernetes cluster with access to create/update Jobs and Pods
+- Kubernetes cluster with enough permission to create resources
 - RunPod API key
 - Go 1.19+
 
@@ -176,10 +176,4 @@ For local development, you can run:
 
 ```bash
 go run ./cmd/runpod_controller --kubeconfig=$HOME/.kube/config
-```
-
-### Running Tests
-
-```bash
-go test ./...
 ```
