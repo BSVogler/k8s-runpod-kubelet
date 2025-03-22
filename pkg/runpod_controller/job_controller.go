@@ -1318,8 +1318,6 @@ func (c *JobController) handleTerminatingPod(pod corev1.Pod) {
 // CleanupDeletedJobs checks for jobs that have been deleted from Kubernetes
 // and terminates the corresponding RunPod instances
 func (c *JobController) CleanupDeletedJobs() error {
-	c.logger.Info("Starting RunPod cleanup")
-
 	c.deletedJobsMutex.Lock()
 	defer c.deletedJobsMutex.Unlock()
 
