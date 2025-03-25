@@ -865,14 +865,6 @@ func (c *JobController) PrepareRunPodParameters(job batchv1.Job) (map[string]int
 	volumeInGb := 0
 	containerDiskInGb := 15
 
-	c.logger.Info("Preparing RunPod deployment parameters",
-		"job", job.Name,
-		"namespace", job.Namespace,
-		"cloudType", cloudType,
-		"minMemoryInGb", minMemoryInGb,
-		"containerDiskInGb", containerDiskInGb,
-		"templateId", templateId)
-
 	// Create deployment parameters - use the same cloudType as used for filtering
 	params := map[string]interface{}{
 		"cloudType":         cloudType,
@@ -1036,42 +1028,6 @@ func (c *JobController) UpdateJobStatus(job batchv1.Job) error {
 	return nil
 }
 
-// sanitizeParameters creates a copy of parameters with sensitive data removed
-func sanitizeParameters(params map[string]interface{}) map[string]interface{} {
-	result := make(map[string]interface{})
-	for key, value := range params {
-		if key == "env" {
-			// For environment variables, keep keys but hide values that might be sensitive
-			if envVars, ok := value.([]map[string]string); ok {
-				sanitizedEnvVars := make([]map[string]string, 0, len(envVars))
-				for _, env := range envVars {
-					sanitizedEnv := map[string]string{"key": env["key"]}
-
-					// Keep the value for non-sensitive env vars, mask for sensitive ones
-					keyLower := strings.ToLower(env["key"])
-					if strings.Contains(keyLower, "key") ||
-						strings.Contains(keyLower, "token") ||
-						strings.Contains(keyLower, "secret") ||
-						strings.Contains(keyLower, "password") ||
-						strings.Contains(keyLower, "credential") {
-						sanitizedEnv["value"] = "****"
-					} else {
-						sanitizedEnv["value"] = env["value"]
-					}
-
-					sanitizedEnvVars = append(sanitizedEnvVars, sanitizedEnv)
-				}
-				result[key] = sanitizedEnvVars
-			} else {
-				result[key] = value
-			}
-		} else {
-			result[key] = value
-		}
-	}
-	return result
-}
-
 // OffloadJobToRunPod sends a job to RunPod and creates a K8s representation
 func (c *JobController) OffloadJobToRunPod(job batchv1.Job) error {
 	// Step 1: Prepare parameters for RunPod deployment
@@ -1079,9 +1035,16 @@ func (c *JobController) OffloadJobToRunPod(job batchv1.Job) error {
 	if err != nil {
 		return fmt.Errorf("failed to prepare RunPod parameters: %w", err)
 	}
-
-	// Log the request parameters (sanitized for any secrets)
-	paramsJSON, _ := json.MarshalIndent(sanitizeParameters(params), "", "  ")
+	//log params minus the env vars for security
+	log_params := make(map[string]interface{})
+	for key, value := range params {
+		// Skip the "env" key
+		if key != "env" {
+			log_params[key] = value
+		}
+	}
+	// Log the request parameters (envs dropped for any secrets and not needed for debugging of the controller)
+	paramsJSON, _ := json.MarshalIndent(log_params, "", "  ")
 	c.logger.Info("Requesting RunPod deployment",
 		"job", job.Name,
 		"namespace", job.Namespace,
