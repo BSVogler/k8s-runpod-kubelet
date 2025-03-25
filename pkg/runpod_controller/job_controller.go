@@ -111,13 +111,13 @@ func (c *RunPodClient) ExecuteGraphQL(query string, variables map[string]interfa
 		return fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	url := fmt.Sprintf("%s?api_key=%s", c.baseURL, c.apiKey)
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(reqBody))
+	req, err := http.NewRequest("POST", c.baseGraphqlURL, bytes.NewBuffer(reqBody))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.apiKey))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
