@@ -1488,10 +1488,6 @@ func (c *JobController) Reconcile() error {
 
 		// Determine job state and handle accordingly
 		jobState := c.getJobState(job)
-		c.logger.Info("Processing job",
-			"job", job.Name,
-			"namespace", job.Namespace,
-			"state", jobState)
 
 		switch jobState {
 		case "OFFLOADING_INCOMPLETE":

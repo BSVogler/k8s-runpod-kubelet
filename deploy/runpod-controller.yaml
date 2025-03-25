@@ -123,12 +123,9 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 5
             timeoutSeconds: 3
-          env:
-            - name: RUNPOD_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: runpod-controller-secrets
-                  key: RUNPOD_KEY
+          envFrom:
+            - secretRef:
+                name: runpod-controller-secrets
           resources:
             requests:
               cpu: 100m
