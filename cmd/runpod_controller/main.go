@@ -29,7 +29,7 @@ func main() {
 			log.Fatalf("sentry.Init: %s", err)
 		}
 		// Configure `slog` to use Sentry as a handler
-		logger := slog.New(sentryslog.Option{Level: slog.LevelDebug}.NewSentryHandler())
+		logger = slog.New(sentryslog.Option{Level: slog.LevelDebug}.NewSentryHandler())
 		logger = logger.With("release", "v1.0.1")
 	} else { // Use a default logger (stdout) when Sentry is not initialized
 		logger = slog.New(slog.NewTextHandler(os.Stdout, nil))
