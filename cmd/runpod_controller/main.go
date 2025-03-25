@@ -23,13 +23,14 @@ func main() {
 	var logger *slog.Logger
 	if sentryUrl != "" {
 		err := sentry.Init(sentry.ClientOptions{
-			Dsn: sentryUrl,
+			Dsn:           sentryUrl,
+			EnableTracing: false,
 		})
 		if err != nil {
 			log.Fatalf("sentry.Init: %s", err)
 		}
 		// Configure `slog` to use Sentry as a handler
-		logger = slog.New(sentryslog.Option{Level: slog.LevelDebug}.NewSentryHandler())
+		logger = slog.New(sentryslog.Option{Level: slog.LevelInfo}.NewSentryHandler())
 		logger = logger.With("release", "v1.0.1")
 		defer sentry.Flush(2 * time.Second) //send errors after a crash
 	} else { // Use a default logger (stdout) when Sentry is not initialized

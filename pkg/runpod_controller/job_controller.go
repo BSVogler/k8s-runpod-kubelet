@@ -265,7 +265,7 @@ func (c *RunPodClient) GetGPUTypes(minRAMPerGPU int, maxPrice float64, cloudType
 				MemoryInGb:  gpu.MemoryInGb,
 				Price:       price,
 			})
-			c.logger.Info("Found eligible "+cloudType+" GPU type",
+			c.logger.Debug("Found eligible "+cloudType+" GPU type",
 				"id", gpu.ID,
 				"displayName", gpu.DisplayName,
 				"price", price)
@@ -791,10 +791,6 @@ func (c *JobController) PrepareRunPodParameters(job batchv1.Job) (map[string]int
 	containerRegistryAuthId := ""
 	if authID, exists := job.Annotations[RunpodContainerRegistryAuthAnnotation]; exists && authID != "" {
 		containerRegistryAuthId = authID
-		c.logger.Info("Using container registry authentication",
-			"job", job.Name,
-			"namespace", job.Namespace,
-			"authID", containerRegistryAuthId)
 	}
 
 	// Extract template ID if provided
