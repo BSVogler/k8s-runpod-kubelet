@@ -31,6 +31,7 @@ func main() {
 		// Configure `slog` to use Sentry as a handler
 		logger = slog.New(sentryslog.Option{Level: slog.LevelDebug}.NewSentryHandler())
 		logger = logger.With("release", "v1.0.1")
+		defer sentry.Flush(2 * time.Second) //send errors after a crash
 	} else { // Use a default logger (stdout) when Sentry is not initialized
 		logger = slog.New(slog.NewTextHandler(os.Stdout, nil))
 	}
