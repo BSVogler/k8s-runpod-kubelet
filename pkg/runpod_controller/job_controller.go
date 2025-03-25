@@ -240,51 +240,34 @@ func (c *RunPodClient) GetGPUTypes(minMemoryInGb int, maxPrice float64, cloudTyp
 	}
 
 	for _, gpu := range response.Data.GPUTypes {
-		// Filter based on the requested cloud type
-		// For SECURE cloud - only include GPUs available in SECURE cloud
-		// For COMMUNITY cloud - include GPUs that match requirements
+		var price float64
+		var cloudCheck bool
+
 		if cloudType == "SECURE" {
-			if gpu.SecureCloud &&
-				gpu.SecurePrice > 0 &&
-				gpu.SecurePrice < maxPrice &&
-				gpu.MemoryInGb >= minMemoryInGb {
-				filteredGPUs = append(filteredGPUs, struct {
-					ID          string
-					DisplayName string
-					MemoryInGb  int
-					Price       float64
-				}{
-					ID:          gpu.ID,
-					DisplayName: gpu.DisplayName,
-					MemoryInGb:  gpu.MemoryInGb,
-					Price:       gpu.SecurePrice,
-				})
-				c.logger.Info("Found eligible SECURE GPU type",
-					"id", gpu.ID,
-					"displayName", gpu.DisplayName,
-					"price", gpu.SecurePrice)
-			}
+			price = gpu.SecurePrice
+			cloudCheck = gpu.SecureCloud
 		} else if cloudType == "COMMUNITY" {
-			if gpu.CommunityCloud &&
-				gpu.CommunityPrice > 0 &&
-				gpu.CommunityPrice < maxPrice &&
-				gpu.MemoryInGb >= minMemoryInGb {
-				filteredGPUs = append(filteredGPUs, struct {
-					ID          string
-					DisplayName string
-					MemoryInGb  int
-					Price       float64
-				}{
-					ID:          gpu.ID,
-					DisplayName: gpu.DisplayName,
-					MemoryInGb:  gpu.MemoryInGb,
-					Price:       gpu.CommunityPrice,
-				})
-				c.logger.Info("Found eligible COMMUNITY GPU type",
-					"id", gpu.ID,
-					"displayName", gpu.DisplayName,
-					"price", gpu.CommunityPrice)
-			}
+			price = gpu.CommunityPrice
+			cloudCheck = gpu.CommunityCloud
+		}
+
+		// If the cloud condition is met and the GPU meets the price and memory requirements
+		if cloudCheck && price > 0 && price < maxPrice && gpu.MemoryInGb >= minRAMPerGPU {
+			filteredGPUs = append(filteredGPUs, struct {
+				ID          string
+				DisplayName string
+				MemoryInGb  int
+				Price       float64
+			}{
+				ID:          gpu.ID,
+				DisplayName: gpu.DisplayName,
+				MemoryInGb:  gpu.MemoryInGb,
+				Price:       price,
+			})
+			c.logger.Info("Found eligible "+cloudType+" GPU type",
+				"id", gpu.ID,
+				"displayName", gpu.DisplayName,
+				"price", price)
 		}
 	}
 
