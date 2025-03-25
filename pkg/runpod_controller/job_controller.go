@@ -33,7 +33,7 @@ const (
 	RunpodManagedLabel                    = "runpod.io/managed"
 	RunpodRetryAnnotation                 = "runpod.io/retry-after"
 	RunpodCloudTypeAnnotation             = "runpod.io/cloud-type"
-	RunpodTemplateIdAnnotation            = "runpod.io/template-id"
+	RunpodTemplateIdAnnotation            = "runpod.io/templateId"
 	GpuMemoryAnnotation                   = "runpod.io/required-gpu-memory"
 	RunpodContainerRegistryAuthAnnotation = "runpod.io/container-registry-auth-id"
 
