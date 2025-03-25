@@ -2,22 +2,44 @@ package main
 
 import (
 	"flag"
+	"fmt"
+	"github.com/bsvogler/k8s-runpod-controller/pkg/config"
+	"github.com/bsvogler/k8s-runpod-controller/pkg/runpod_controller"
+	"github.com/getsentry/sentry-go"
+	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	"github.com/bsvogler/k8s-runpod-controller/pkg/config"
-	"github.com/bsvogler/k8s-runpod-controller/pkg/runpod_controller"
-
-	"github.com/go-logr/zapr"
-	"go.uber.org/zap"
+	sentryslog "github.com/getsentry/sentry-go/slog"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
 func main() {
+	sentryUrl := os.Getenv("SENTRY_URL")
+	var logger *slog.Logger
+	if sentryUrl != "" {
+		err := sentry.Init(sentry.ClientOptions{
+			Dsn: sentryUrl,
+		})
+		if err != nil {
+			log.Fatalf("sentry.Init: %s", err)
+		}
+		// Configure `slog` to use Sentry as a handler
+		logger := slog.New(sentryslog.Option{Level: slog.LevelDebug}.NewSentryHandler())
+		logger = logger.With("release", "v1.0.0")
+		// Log messages with various attributes
+		logger.
+			With("environment", "dev").
+			With("error", fmt.Errorf("an error")).
+			Error("a message")
+	} else { // Use a default logger (stdout) when Sentry is not initialized
+		logger = slog.New(slog.NewTextHandler(os.Stdout, nil))
+	}
 	// Parse command line flags
 	var kubeconfig string
 	var reconcileInterval int
@@ -34,27 +56,21 @@ func main() {
 	flag.StringVar(&healthServerAddress, "health-server-address", ":8080", "Address for the health check server to listen on")
 	flag.Parse()
 
-	// Create logger
-	zapLog, err := zap.NewProduction()
-	if err != nil {
-		panic(err)
-	}
-	logger := zapr.NewLogger(zapLog)
-
 	// Create Kubernetes client
 	var k8sConfig *rest.Config
+	var err error
 	if kubeconfig == "" {
 		// Use in-cluster config
 		k8sConfig, err = rest.InClusterConfig()
 		if err != nil {
-			logger.Error(err, "Failed to create in-cluster config")
+			logger.Error("Failed to create in-cluster config", "err", err)
 			os.Exit(1)
 		}
 	} else {
 		// Use kubeconfig file
 		k8sConfig, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
 		if err != nil {
-			logger.Error(err, "Failed to create config from kubeconfig file", "kubeconfig", kubeconfig)
+			logger.Error("Failed to create config from kubeconfig file", "kubeconfig", kubeconfig, "err", err)
 			os.Exit(1)
 		}
 	}
@@ -62,7 +78,7 @@ func main() {
 	// Create clientset
 	clientset, err := kubernetes.NewForConfig(k8sConfig)
 	if err != nil {
-		logger.Error(err, "Failed to create Kubernetes client")
+		logger.Error("Failed to create Kubernetes client", "err", err)
 		os.Exit(1)
 	}
 
@@ -91,7 +107,7 @@ func main() {
 	// Wait for either an error or a signal
 	select {
 	case err := <-errChan:
-		logger.Error(err, "Controller error")
+		logger.Error("Controller error", "err", err)
 		os.Exit(1)
 	case sig := <-sigChan:
 		logger.Info("Received signal, shutting down", "signal", sig)
