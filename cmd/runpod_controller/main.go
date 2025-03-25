@@ -2,7 +2,6 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"github.com/bsvogler/k8s-runpod-controller/pkg/config"
 	"github.com/bsvogler/k8s-runpod-controller/pkg/runpod_controller"
 	"github.com/getsentry/sentry-go"
@@ -31,12 +30,7 @@ func main() {
 		}
 		// Configure `slog` to use Sentry as a handler
 		logger := slog.New(sentryslog.Option{Level: slog.LevelDebug}.NewSentryHandler())
-		logger = logger.With("release", "v1.0.0")
-		// Log messages with various attributes
-		logger.
-			With("environment", "dev").
-			With("error", fmt.Errorf("an error")).
-			Error("a message")
+		logger = logger.With("release", "v1.0.1")
 	} else { // Use a default logger (stdout) when Sentry is not initialized
 		logger = slog.New(slog.NewTextHandler(os.Stdout, nil))
 	}
