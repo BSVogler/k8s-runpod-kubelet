@@ -206,7 +206,8 @@ func (c *RunPodClient) GetPodStatus(podID string) (PodStatus, error) {
 
 // GetGPUTypes gets available GPU types from RunPod API
 // Update GetGPUTypes to return the selected GPU details and formatted GPU type list
-func (c *RunPodClient) GetGPUTypes(minMemoryInGb int, maxPrice float64, cloudType string) ([]string, error) {
+func (c *RunPodClient) GetGPUTypes(minRAMPerGPU int, maxPrice float64, cloudType string) ([]string, error) {
+	//https://graphql-spec.runpod.io/#query-gpuTypes
 	query := `
         query GpuTypes {
             gpuTypes {
@@ -288,7 +289,7 @@ func (c *RunPodClient) GetGPUTypes(minMemoryInGb int, maxPrice float64, cloudTyp
 	if len(gpuIDs) == 0 {
 		c.logger.Info("No eligible GPU types found",
 			"cloudType", cloudType,
-			"minMemoryInGb", minMemoryInGb,
+			"minRAMPerGPU", minRAMPerGPU,
 			"maxPrice", maxPrice)
 		return []string{}, nil
 	}
@@ -298,13 +299,14 @@ func (c *RunPodClient) GetGPUTypes(minMemoryInGb int, maxPrice float64, cloudTyp
 
 // DeployPod deploys a pod to RunPod
 func (c *RunPodClient) DeployPod(params map[string]interface{}) (string, float64, error) {
+	//https://graphql-spec.runpod.io/#definition-PodFindAndDeployOnDemandInput
 	query := `
         mutation podFindAndDeployOnDemand($input: PodFindAndDeployOnDemandInput!) {
             podFindAndDeployOnDemand(input: $input) {
                 id
-                imageName
-                machineId
                 costPerHr
+                machineId
+                imageName
                 machine {
                     podHostId
                 }
@@ -320,9 +322,9 @@ func (c *RunPodClient) DeployPod(params map[string]interface{}) (string, float64
 		Data struct {
 			PodFindAndDeployOnDemand struct {
 				ID        string  `json:"id"`
-				ImageName string  `json:"imageName"`
-				MachineID string  `json:"machineId"`
 				CostPerHr float64 `json:"costPerHr"`
+				MachineID string  `json:"machineId"`
+				ImageName string  `json:"imageName"`
 				Machine   struct {
 					PodHostID string `json:"podHostId"`
 				} `json:"machine"`
@@ -336,11 +338,7 @@ func (c *RunPodClient) DeployPod(params map[string]interface{}) (string, float64
 	}
 
 	if err := c.ExecuteGraphQL(query, variables, &response); err != nil {
-		c.logger.Error("API request failed when deploying pod",
-			"gpuTypeIdList", params["gpuTypeIdList"],
-			"minMemoryInGb", params["minMemoryInGb"],
-			"containerDiskInGb", params["containerDiskInGb"],
-			"imageName", params["imageName"], "err", err)
+		c.logger.Error("API request failed when deploying pod", "err", err)
 		return "", 0, err
 	}
 
@@ -360,9 +358,7 @@ func (c *RunPodClient) DeployPod(params map[string]interface{}) (string, float64
 
 		errorDetailsJSON, _ := json.Marshal(errorDetails)
 		c.logger.Error("RunPod API returned error",
-			"errorDetails", string(errorDetailsJSON),
-			"gpuTypeIdList", params["gpuTypeIdList"],
-			"minMemoryInGb", params["minMemoryInGb"])
+			"errorDetails", string(errorDetailsJSON))
 
 		return "", 0, fmt.Errorf("RunPod API error: %s", response.Errors[0].Message)
 	}
@@ -783,7 +779,7 @@ func (c *JobController) PrepareRunPodParameters(job batchv1.Job) (map[string]int
 		if cloudTypeUpperCase == "SECURE" || cloudTypeUpperCase == "COMMUNITY" {
 			cloudType = cloudTypeUpperCase
 		} else {
-			c.logger.Info("Invalid cloud type specified, using default",
+			c.logger.Warn("Invalid cloud type specified, using default",
 				"job", job.Name,
 				"namespace", job.Namespace,
 				"specifiedValue", cloudTypeVal,
@@ -805,22 +801,18 @@ func (c *JobController) PrepareRunPodParameters(job batchv1.Job) (map[string]int
 	templateId := ""
 	if tplID, exists := job.Annotations[RunpodTemplateIdAnnotation]; exists && tplID != "" {
 		templateId = tplID
-		c.logger.Info("Using RunPod template",
-			"job", job.Name,
-			"namespace", job.Namespace,
-			"templateId", templateId)
 	}
 
 	// Determine minimum GPU memory required
-	minMemoryInGb := 16 // Default minimum memory
+	minRAMPerGPU := 16 // Default minimum memory
 	if memStr, exists := job.Annotations[GpuMemoryAnnotation]; exists {
 		if mem, err := strconv.Atoi(memStr); err == nil {
-			minMemoryInGb = mem
+			minRAMPerGPU = mem
 		}
 	}
 
 	// Get GPU types - pass the cloud type to filter correctly
-	gpuTypes, err := c.runpodClient.GetGPUTypes(minMemoryInGb, c.maxPrice, cloudType)
+	gpuTypes, err := c.runpodClient.GetGPUTypes(minRAMPerGPU, c.maxPrice, cloudType)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get GPU types: %w", err)
 	}
@@ -848,17 +840,16 @@ func (c *JobController) PrepareRunPodParameters(job batchv1.Job) (map[string]int
 	volumeInGb := 0
 	containerDiskInGb := 15
 
-	// Create deployment parameters - use the same cloudType as used for filtering
+	// Create deployment parameters - use the same cloudType as used for filtering https://graphql-spec.runpod.io/#definition-PodFindAndDeployOnDemandInput
 	params := map[string]interface{}{
 		"cloudType":         cloudType,
-		"gpuCount":          1,
 		"volumeInGb":        volumeInGb,
 		"containerDiskInGb": containerDiskInGb,
-		"minVcpuCount":      2,
-		"minMemoryInGb":     minMemoryInGb,
+		"minRAMPerGPU":      minRAMPerGPU,
 		"gpuTypeIdList":     gpuTypes, // Use the array directly, don't stringify it
 		"name":              runpodJobName,
 		"imageName":         imageName,
+		"templateId":        templateId,
 		"env":               formattedEnvVars,
 	}
 
@@ -1011,6 +1002,20 @@ func (c *JobController) UpdateJobStatus(job batchv1.Job) error {
 	return nil
 }
 
+func sanitizeParameters(params map[string]interface{}) string {
+	//log params minus the env vars for security
+	logParams := make(map[string]interface{})
+	for key, value := range params {
+		// Skip the "env" key
+		if key != "env" {
+			logParams[key] = value
+		}
+	}
+	// Log the request parameters (envs dropped for any secrets and not needed for debugging of the controller)
+	paramsJSON, _ := json.MarshalIndent(logParams, "", "  ")
+	return string(paramsJSON)
+}
+
 // OffloadJobToRunPod sends a job to RunPod and creates a K8s representation
 func (c *JobController) OffloadJobToRunPod(job batchv1.Job) error {
 	// Step 1: Prepare parameters for RunPod deployment
@@ -1018,20 +1023,11 @@ func (c *JobController) OffloadJobToRunPod(job batchv1.Job) error {
 	if err != nil {
 		return fmt.Errorf("failed to prepare RunPod parameters: %w", err)
 	}
-	//log params minus the env vars for security
-	log_params := make(map[string]interface{})
-	for key, value := range params {
-		// Skip the "env" key
-		if key != "env" {
-			log_params[key] = value
-		}
-	}
-	// Log the request parameters (envs dropped for any secrets and not needed for debugging of the controller)
-	paramsJSON, _ := json.MarshalIndent(log_params, "", "  ")
+
 	c.logger.Info("Requesting RunPod deployment",
 		"job", job.Name,
 		"namespace", job.Namespace,
-		"parameters", string(paramsJSON))
+		"parameters", sanitizeParameters(params))
 
 	// Step 2: Deploy to RunPod
 	runpodID, costPerHr, err := c.runpodClient.DeployPod(params)
