@@ -80,10 +80,11 @@ type GPUType struct {
 
 // RunPodClient handles all interactions with the RunPod API
 type RunPodClient struct {
-	httpClient *http.Client
-	apiKey     string
-	baseURL    string
-	logger     *slog.Logger
+	httpClient     *http.Client
+	apiKey         string
+	baseGraphqlURL string
+	baseRESTURL    string
+	logger         *slog.Logger
 }
 
 // NewRunPodClient creates a new RunPod API client
@@ -94,10 +95,11 @@ func NewRunPodClient(logger *slog.Logger) *RunPodClient {
 	}
 
 	return &RunPodClient{
-		httpClient: &http.Client{Timeout: DefaultAPITimeout},
-		apiKey:     apiKey,
-		baseURL:    "https://api.runpod.io/graphql",
-		logger:     logger,
+		httpClient:     &http.Client{Timeout: DefaultAPITimeout},
+		apiKey:         apiKey,
+		baseGraphqlURL: "https://api.runpod.io/graphql",
+		baseRESTURL:    "https://rest.runpod.io/v1/",
+		logger:         logger,
 	}
 }
 
@@ -295,6 +297,74 @@ func (c *RunPodClient) GetGPUTypes(minRAMPerGPU int, maxPrice float64, cloudType
 	}
 
 	return gpuIDs, nil
+}
+
+func (c *RunPodClient) DeployPodREST(params map[string]interface{}) (string, float64, error) {
+	reqBody, err := json.Marshal(params)
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	url := fmt.Sprintf("%s/pods", c.baseRESTURL)
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(reqBody))
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.apiKey))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		c.logger.Error("REST API request failed when deploying pod", "err", err)
+		return "", 0, fmt.Errorf("API request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		c.logger.Error("RunPod REST API returned error",
+			"statusCode", resp.StatusCode,
+			"response", string(body))
+		return "", 0, fmt.Errorf("API returned error: %d %s", resp.StatusCode, string(body))
+	}
+
+	var response struct {
+		ID        string  `json:"id"`
+		CostPerHr float64 `json:"costPerHr"`
+		MachineID string  `json:"machineId"`
+		Name      string  `json:"name"`
+		Machine   struct {
+			DataCenterID string `json:"dataCenterId"`
+			GpuTypeID    string `json:"gpuTypeId"`
+			Location     string `json:"location"`
+			SecureCloud  bool   `json:"secureCloud"`
+		} `json:"machine"`
+		DesiredStatus string `json:"desiredStatus"`
+		ImageName     string `json:"imageName"`
+	}
+
+	if err := json.Unmarshal(body, &response); err != nil {
+		return "", 0, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if response.ID == "" {
+		return "", 0, fmt.Errorf("pod deployment failed: %s", string(body))
+	}
+
+	c.logger.Info("Pod deployed successfully",
+		"podId", response.ID,
+		"costPerHr", response.CostPerHr,
+		"machineId", response.MachineID,
+		"gpuType", response.Machine.GpuTypeID,
+		"location", response.Machine.Location,
+		"dataCenter", response.Machine.DataCenterID)
+
+	return response.ID, response.CostPerHr, nil
 }
 
 // DeployPod deploys a pod to RunPod
@@ -1026,7 +1096,7 @@ func (c *JobController) OffloadJobToRunPod(job batchv1.Job) error {
 		"parameters", sanitizeParameters(params))
 
 	// Step 2: Deploy to RunPod
-	runpodID, costPerHr, err := c.runpodClient.DeployPod(params)
+	runpodID, costPerHr, err := c.runpodClient.DeployPodREST(params)
 	if err != nil {
 		// Check if this is a "no instances available" error that we should retry
 		if strings.Contains(err.Error(), "no instances currently available") {
