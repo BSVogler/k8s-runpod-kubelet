@@ -839,8 +839,16 @@ func FormatEnvVarsForGraphQL(envVars []RunPodEnv) []map[string]string {
 	return formattedEnvVars
 }
 
+func FormatEnvVarsForREST(envVars []RunPodEnv) map[string]string {
+	envMap := make(map[string]string)
+	for _, env := range envVars {
+		envMap[env.Key] = env.Value
+	}
+	return envMap
+}
+
 // PrepareRunPodParameters prepares parameters for RunPod deployment
-func (c *JobController) PrepareRunPodParameters(job batchv1.Job) (map[string]interface{}, error) {
+func (c *JobController) PrepareRunPodParameters(job batchv1.Job, graphql bool) (map[string]interface{}, error) {
 	// Determine cloud type - default to COMMUNITY but allow override via annotation
 	cloudType := "SECURE"
 	if cloudTypeVal, exists := job.Annotations[RunpodCloudTypeAnnotation]; exists {
@@ -889,8 +897,12 @@ func (c *JobController) PrepareRunPodParameters(job batchv1.Job) (map[string]int
 		return nil, fmt.Errorf("failed to extract environment variables: %w", err)
 	}
 
-	formattedEnvVars := FormatEnvVarsForGraphQL(envVars)
-
+	var formattedEnvVars interface{}
+	if graphql {
+		formattedEnvVars = FormatEnvVarsForGraphQL(envVars)
+	} else {
+		formattedEnvVars = FormatEnvVarsForREST(envVars)
+	}
 	// Determine image name from job
 	var imageName string
 	if len(job.Spec.Template.Spec.Containers) > 0 {
@@ -1085,7 +1097,7 @@ func sanitizeParameters(params map[string]interface{}) string {
 // OffloadJobToRunPod sends a job to RunPod and creates a K8s representation
 func (c *JobController) OffloadJobToRunPod(job batchv1.Job) error {
 	// Step 1: Prepare parameters for RunPod deployment
-	params, err := c.PrepareRunPodParameters(job)
+	params, err := c.PrepareRunPodParameters(job, false)
 	if err != nil {
 		return fmt.Errorf("failed to prepare RunPod parameters: %w", err)
 	}
