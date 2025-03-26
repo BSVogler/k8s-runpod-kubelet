@@ -208,27 +208,16 @@ func (c *RunPodClient) GetPodStatus(podID string) (PodStatus, error) {
 }
 
 func (c *RunPodClient) GetPodStatusREST(podID string) (PodStatus, error) {
-	url := fmt.Sprintf("https://rest.runpod.io/v1/pods/%s", podID)
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return PodNotFound, fmt.Errorf("error creating request: %w", err)
-	}
-
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.apiKey))
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-
+	endpoint := fmt.Sprintf("pods/%s", podID)
+	
 	// Add retries for temporary errors
 	var resp *http.Response
 	retryCount := 0
 	maxRetries := 3
 
 	for retryCount < maxRetries {
-		resp, err = client.Do(req)
+		var err error
+		resp, err = c.makeRESTRequest("GET", endpoint, nil)
 		if err == nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound) {
 			break
 		}
@@ -392,20 +381,7 @@ func (c *RunPodClient) DeployPodREST(params map[string]interface{}) (string, flo
 		return "", 0, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/pods", c.baseRESTURL)
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(reqBody))
-	if err != nil {
-		return "", 0, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.apiKey))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	req = req.WithContext(ctx)
-
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.makeRESTRequest("POST", "pods", bytes.NewBuffer(reqBody))
 	if err != nil {
 		c.logger.Error("REST API request failed when deploying pod", "err", err)
 		return "", 0, fmt.Errorf("API request failed: %w", err)
@@ -575,6 +551,24 @@ func (c *RunPodClient) TerminatePod(podID string) error {
 	return nil
 }
 
+// makeRESTRequest is a helper function to make REST API requests to RunPod
+func (c *RunPodClient) makeRESTRequest(method, endpoint string, body io.Reader) (*http.Response, error) {
+	url := fmt.Sprintf("%s%s", c.baseRESTURL, endpoint)
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.apiKey))
+
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultAPITimeout)
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	return c.httpClient.Do(req)
+}
+
 // LoadRunning loads from the runpod api the running pods and if missing adds them to the list of virtual pods in the cluster
 func (c *JobController) LoadRunning() {
 	// Skip check if no API key
@@ -583,22 +577,7 @@ func (c *JobController) LoadRunning() {
 	}
 
 	// Make a request to the RunPod API to get all running pods
-	url := fmt.Sprintf("%spods?desiredStatus=RUNNING", c.runpodClient.baseRESTURL)
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		c.logger.Error("Failed to create request for running pods", "err", err)
-		c.runpodAvailable = false
-		return
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.runpodClient.apiKey))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	req = req.WithContext(ctx)
-
-	resp, err := c.runpodClient.httpClient.Do(req)
+	resp, err := c.runpodClient.makeRESTRequest("GET", "pods?desiredStatus=RUNNING", nil)
 	if err != nil {
 		c.logger.Error("Failed to get running pods from RunPod API", "err", err)
 		c.runpodAvailable = false
@@ -1221,9 +1200,8 @@ func (c *JobController) CleanupPendingPodsForJob(job batchv1.Job) error {
 	return nil
 }
 
-// CreateVirtualPod creates a virtual Pod representation of a RunPod instance
-func (c *JobController) CreateVirtualPod(job batchv1.Job, runpodID string, costPerHr float64) error {
-	// Create a Pod representation of the RunPod instance
+// createVirtualPodObject creates a Pod object representing a RunPod instance
+func createVirtualPodObject(job batchv1.Job, runpodID string, costPerHr float64) *corev1.Pod {
 	podName := fmt.Sprintf("%s-runpod-%s", job.Name, runpodID)
 
 	// Create labels to link Pod to Job
@@ -1262,7 +1240,7 @@ func (c *JobController) CreateVirtualPod(job batchv1.Job, runpodID string, costP
 	}
 
 	// Create Pod object
-	pod := &corev1.Pod{
+	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            podName,
 			Namespace:       job.Namespace,
@@ -1302,7 +1280,12 @@ func (c *JobController) CreateVirtualPod(job batchv1.Job, runpodID string, costP
 			},
 		},
 	}
+}
 
+// CreateVirtualPod creates a virtual Pod representation of a RunPod instance
+func (c *JobController) CreateVirtualPod(job batchv1.Job, runpodID string, costPerHr float64) error {
+	pod := createVirtualPodObject(job, runpodID, costPerHr)
+	
 	// Create the Pod
 	_, err := c.clientset.CoreV1().Pods(job.Namespace).Create(
 		context.Background(),
@@ -1311,7 +1294,7 @@ func (c *JobController) CreateVirtualPod(job batchv1.Job, runpodID string, costP
 	)
 	if err != nil {
 		c.logger.Error("Failed to create virtual pod for RunPod instance",
-			"pod", podName, "runpodID", runpodID, "err", err)
+			"pod", pod.Name, "runpodID", runpodID, "err", err)
 		return fmt.Errorf("failed to create virtual pod: %w", err)
 	}
 
