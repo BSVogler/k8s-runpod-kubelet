@@ -575,31 +575,14 @@ func (c *RunPodClient) TerminatePod(podID string) error {
 	return nil
 }
 
-// CheckAPIHealth checks if the RunPod API is healthy
-func (c *RunPodClient) CheckAPIHealth() bool {
+// LoadRunning loads from the runpod api the running pods and if missing adds them to the list of virtual pods in the cluster
+func (c *JobController) LoadRunning() {
 	// Skip check if no API key
-	if c.apiKey == "" {
-		return false
+	if c.runpodClient.apiKey == "" {
+		return
 	}
+	//https://rest.runpod.io/v1/pods?desiredStatus=RUNNING
 
-	query := `
-		query {
-			myself {
-				id
-			}
-		}
-	`
-
-	var response struct {
-		Data struct {
-			Myself struct {
-				ID string `json:"id"`
-			} `json:"myself"`
-		} `json:"data"`
-	}
-
-	err := c.ExecuteGraphQL(query, nil, &response)
-	return err == nil && response.Data.Myself.ID != ""
 }
 
 // JobController manages Kubernetes jobs and offloads them to RunPod when necessary
@@ -1339,19 +1322,6 @@ func (c *JobController) CleanupPod(namespace, jobName, runpodID string) error {
 	return nil
 }
 
-// CheckRunPodHealth checks if the RunPod API is healthy
-func (c *JobController) CheckRunPodHealth() {
-	wasAvailable := c.runpodAvailable
-	c.runpodAvailable = c.runpodClient.CheckAPIHealth()
-
-	// Log changes in availability
-	if wasAvailable && !c.runpodAvailable {
-		c.logger.Info("RunPod API is now unavailable")
-	} else if !wasAvailable && c.runpodAvailable {
-		c.logger.Info("RunPod API is now available")
-	}
-}
-
 // CleanupTerminatingPods checks for pods in Terminating state on the RunPod virtual node
 // and ensures they are properly terminated both in K8s and on RunPod
 func (c *JobController) CleanupTerminatingPods() error {
@@ -1658,7 +1628,6 @@ func (c *JobController) verifyRunPodInstance(job batchv1.Job) error {
 		return c.resetJobOffloadState(job)
 	}
 
-	c.logger.Info("Verified RunPod instance",
 	// Instance exists, but let's ensure there are no lingering pending pods
 	if err := c.CleanupPendingPodsForJob(job); err != nil {
 		c.logger.Error("Failed to clean up pending pods during verification",
@@ -1666,6 +1635,9 @@ func (c *JobController) verifyRunPodInstance(job batchv1.Job) error {
 			"namespace", job.Namespace,
 			"err", err)
 		// Continue execution even if cleanup fails
+	}
+
+	c.logger.Debug("Verified RunPod instance",
 		"job", job.Name,
 		"namespace", job.Namespace,
 		"podID", podID,
@@ -1826,7 +1798,7 @@ func (c *JobController) Start() error {
 					c.logger.Error("terminating pod cleanup failed", "err", err)
 				}
 			case <-healthCheckTicker.C:
-				c.CheckRunPodHealth()
+				c.LoadRunning()
 			case <-stopCh:
 				return
 			}
