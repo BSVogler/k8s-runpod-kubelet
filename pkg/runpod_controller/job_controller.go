@@ -626,17 +626,15 @@ func (c *JobController) LoadRunning() {
 	// API is available
 	c.runpodAvailable = true
 
-	// Parse the response
-	var response struct {
-		Pods []struct {
-			ID        string  `json:"id"`
-			Name      string  `json:"name"`
-			CostPerHr float64 `json:"costPerHr"`
-			ImageName string  `json:"imageName"`
-		} `json:"pods"`
+	// Parse the response - the API returns an array directly, not a struct with a pods field
+	var pods []struct {
+		ID        string  `json:"id"`
+		Name      string  `json:"name"`
+		CostPerHr float64 `json:"costPerHr"`
+		ImageName string  `json:"imageName"`
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&pods); err != nil {
 		c.logger.Error("Failed to decode RunPod API response", "err", err)
 		return
 	}
@@ -662,7 +660,7 @@ func (c *JobController) LoadRunning() {
 	}
 
 	// Process each running pod from RunPod API
-	for _, runpodInstance := range response.Pods {
+	for _, runpodInstance := range pods {
 		// Skip if this RunPod instance is already represented in the cluster
 		if existingRunPodIDs[runpodInstance.ID] {
 			continue
