@@ -1499,7 +1499,20 @@ func (c *JobController) CleanupTerminatingPods() error {
 	return nil
 }
 
-// HandleTerminatingPod processes a single terminating pod
+// shouldForceDeleteTerminatingPod determines if a pod should be force deleted based on its termination duration
+func shouldForceDeleteTerminatingPod(pod corev1.Pod) bool {
+	if pod.DeletionTimestamp == nil {
+		return false
+	}
+	
+	deletionTime := pod.DeletionTimestamp.Time
+	terminatingDuration := time.Since(deletionTime)
+	forceDeletionThreshold := 15 * time.Minute
+	
+	return terminatingDuration > forceDeletionThreshold
+}
+
+// handleTerminatingPod processes a single terminating pod
 func (c *JobController) handleTerminatingPod(pod corev1.Pod) {
 	deletionTime := pod.DeletionTimestamp.Time
 	terminatingDuration := time.Since(deletionTime)
@@ -1511,8 +1524,7 @@ func (c *JobController) handleTerminatingPod(pod corev1.Pod) {
 		"terminatingFor", terminatingDuration.String())
 
 	// If pod has been terminating for more than 15 minutes, force delete it
-	forceDeletionThreshold := 15 * time.Minute
-	if terminatingDuration > forceDeletionThreshold {
+	if shouldForceDeleteTerminatingPod(pod) {
 		c.logger.Info("Pod has been terminating for too long, force deleting",
 			"pod", pod.Name,
 			"namespace", pod.Namespace,
