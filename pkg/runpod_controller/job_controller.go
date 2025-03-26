@@ -639,19 +639,17 @@ func (c *JobController) LoadRunning() {
 			continue
 		}
 
-		// Extract namespace and job name from the pod name
-		// Expected format: {namespace}-{jobname}
-		nameParts := strings.Split(runpodInstance.Name, "-")
-		if len(nameParts) < 2 {
-			c.logger.Info("Skipping RunPod instance with non-standard name format",
-				"podID", runpodInstance.ID,
-				"name", runpodInstance.Name)
-			continue
-		}
-
-		// The namespace is the first part, and the job name is everything else joined with hyphens
-		namespace := nameParts[0]
-		jobName := strings.Join(nameParts[1:], "-")
+		// Use the name directly without splitting
+		// The name should be the job name, and we'll need to determine the namespace
+		// For now, use the default namespace
+		namespace := "default"
+		jobName := runpodInstance.Name
+	
+		c.logger.Info("Processing RunPod instance",
+			"podID", runpodInstance.ID,
+			"name", runpodInstance.Name,
+			"namespace", namespace,
+			"jobName", jobName)
 
 		// Check if the job exists
 		job, err := c.clientset.BatchV1().Jobs(namespace).Get(
@@ -1126,8 +1124,8 @@ func (c *JobController) PrepareRunPodParameters(job batchv1.Job, graphql bool) (
 		return nil, fmt.Errorf("job has no containers")
 	}
 
-	// Add namespace to the job name to ensure uniqueness
-	runpodJobName := fmt.Sprintf("%s-%s", job.Namespace, job.Name)
+	// Use the job name directly without namespace prefix
+	runpodJobName := job.Name
 
 	// Default values
 	volumeInGb := 0
