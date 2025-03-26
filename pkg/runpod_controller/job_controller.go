@@ -141,6 +141,7 @@ func (c *RunPodClient) ExecuteGraphQL(query string, variables map[string]interfa
 
 // GetPodStatus checks the status of a RunPod instance
 func (c *RunPodClient) GetPodStatus(podID string) (PodStatus, error) {
+	//in tests this did not work
 	query := `
         query pod($input: PodFilter!) {
             pod(input: $input) {
@@ -204,6 +205,91 @@ func (c *RunPodClient) GetPodStatus(podID string) (PodStatus, error) {
 	}
 
 	return PodStatus(response.Data.Pod.DesiredStatus), nil
+}
+
+func (c *RunPodClient) GetPodStatusREST(podID string) (PodStatus, error) {
+	url := fmt.Sprintf("https://rest.runpod.io/v1/pods/%s", podID)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return PodNotFound, fmt.Errorf("error creating request: %w", err)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.apiKey))
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	// Add retries for temporary errors
+	var resp *http.Response
+	retryCount := 0
+	maxRetries := 3
+
+	for retryCount < maxRetries {
+		resp, err = client.Do(req)
+		if err == nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound) {
+			break
+		}
+
+		if resp != nil {
+			bodyErr := resp.Body.Close()
+			if bodyErr != nil {
+				c.logger.Warn("Error closing response body", "error", bodyErr)
+			}
+		}
+
+		retryCount++
+
+		c.logger.Info("Retrying pod status check after error",
+			"podID", podID,
+			"retry", retryCount)
+		if resp != nil {
+			c.logger.Info("Response details", "statusCode", resp.StatusCode)
+		}
+		time.Sleep(time.Duration(retryCount) * 500 * time.Millisecond)
+	}
+
+	if resp == nil {
+		return PodNotFound, fmt.Errorf("no response received after %d retries", maxRetries)
+	}
+
+	defer func() {
+		bodyErr := resp.Body.Close()
+		if bodyErr != nil {
+			c.logger.Info("Error closing response body", "error", bodyErr)
+		}
+	}()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return PodNotFound, nil
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return PodNotFound, fmt.Errorf("RunPod API error with status %d and error reading body: %w",
+				resp.StatusCode, readErr)
+		}
+		return PodNotFound, fmt.Errorf("RunPod API error: status %d, body: %s",
+			resp.StatusCode, string(body))
+	}
+
+	var response struct {
+		ID            string `json:"id"`
+		DesiredStatus string `json:"desiredStatus"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return PodNotFound, fmt.Errorf("error decoding response: %w", err)
+	}
+
+	if response.ID == "" {
+		return PodNotFound, nil
+	}
+
+	return PodStatus(response.DesiredStatus), nil
 }
 
 // GetGPUTypes gets available GPU types from RunPod API
@@ -1286,7 +1372,7 @@ func (c *JobController) handleTerminatingPod(pod corev1.Pod) {
 	}
 
 	// Check if the RunPod instance is still running
-	podStatus, err := c.runpodClient.GetPodStatus(runpodID)
+	podStatus, err := c.runpodClient.GetPodStatusREST(runpodID)
 	if err != nil {
 		c.logger.Error("Failed to check RunPod instance status",
 			"runpodID", runpodID,
@@ -1496,7 +1582,7 @@ func (c *JobController) verifyRunPodInstance(job batchv1.Job) error {
 		return nil // Nothing to verify
 	}
 
-	status, err := c.runpodClient.GetPodStatus(podID)
+	status, err := c.runpodClient.GetPodStatusREST(podID)
 	if err != nil {
 		c.logger.Info("Error checking RunPod instance status",
 			"job", job.Name,
