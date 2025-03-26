@@ -566,13 +566,28 @@ func (c *RunPodClient) makeRESTRequest(method, endpoint string, body io.Reader) 
 	defer cancel()
 	req = req.WithContext(ctx)
 
-	return c.httpClient.Do(req)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute request: %w", err)
+	}
+	
+	// Check for 404 Not Found and return a standardized error
+	if resp.StatusCode == http.StatusNotFound {
+		// Read and close the body to prevent resource leaks
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, fmt.Errorf("not found: %s", string(body))
+	}
+	
+	return resp, nil
 }
 
 // LoadRunning loads from the runpod api the running pods and if missing adds them to the list of virtual pods in the cluster
 func (c *JobController) LoadRunning() {
 	// Skip check if no API key
 	if c.runpodClient.apiKey == "" {
+		c.runpodAvailable = false
+		c.logger.Warn("RunPod API key not set, skipping LoadRunning")
 		return
 	}
 
@@ -583,13 +598,27 @@ func (c *JobController) LoadRunning() {
 		c.runpodAvailable = false
 		return
 	}
-	defer resp.Body.Close()
+	
+	// Ensure we always close the response body
+	if resp != nil && resp.Body != nil {
+		defer func() {
+			if err := resp.Body.Close(); err != nil {
+				c.logger.Error("Failed to close response body", "err", err)
+			}
+		}()
+	}
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		c.logger.Error("RunPod API returned error",
-			"statusCode", resp.StatusCode,
-			"response", string(body))
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			c.logger.Error("Failed to read error response body", 
+				"statusCode", resp.StatusCode,
+				"readErr", readErr)
+		} else {
+			c.logger.Error("RunPod API returned error",
+				"statusCode", resp.StatusCode,
+				"response", string(body))
+		}
 		c.runpodAvailable = false
 		return
 	}
@@ -1568,10 +1597,12 @@ func (c *JobController) handleTerminatingPod(pod corev1.Pod) {
 			"runpodID", runpodID,
 			"pod", pod.Name, "err", err)
 
-		// If we get a GraphQL validation error or any other API error,
-		// assume the pod doesn't exist on RunPod anymore and force delete it
+		// If we get an API error, assume the pod doesn't exist on RunPod anymore and force delete it
+		// This handles both GraphQL validation errors and REST API errors
 		if strings.Contains(err.Error(), "GRAPHQL_VALIDATION_FAILED") ||
-			strings.Contains(err.Error(), "Something went wrong") {
+			strings.Contains(err.Error(), "Something went wrong") ||
+			strings.Contains(err.Error(), "not found") ||
+			strings.Contains(err.Error(), "404") {
 			c.logger.Info("RunPod API returned error, assuming instance no longer exists. Force deleting K8s pod",
 				"runpodID", runpodID,
 				"pod", pod.Name)
@@ -1621,9 +1652,15 @@ func (c *JobController) handleTerminatingPod(pod corev1.Pod) {
 // CleanupDeletedJobs checks for jobs that have been deleted from Kubernetes
 // and terminates the corresponding RunPod instances
 func (c *JobController) CleanupDeletedJobs() error {
+	// Create a local copy of the jobs to clean up to minimize lock contention
+	jobsToCheck := make(map[string]string)
+	
 	c.deletedJobsMutex.Lock()
-	defer c.deletedJobsMutex.Unlock()
-
+	for jobKey, runpodID := range c.deletedJobs {
+		jobsToCheck[jobKey] = runpodID
+	}
+	c.deletedJobsMutex.Unlock()
+	
 	// Get current jobs to confirm which are deleted
 	currentJobs, err := c.clientset.BatchV1().Jobs("").List(
 		context.Background(),
@@ -1646,7 +1683,7 @@ func (c *JobController) CleanupDeletedJobs() error {
 	var jobsToRemove []string
 
 	// Check each tracked job
-	for jobKey, runpodID := range c.deletedJobs {
+	for jobKey, runpodID := range jobsToCheck {
 		if !existingJobs[jobKey] {
 			// Job no longer exists in K8s, terminate the RunPod instance
 			c.logger.Info("Terminating RunPod for deleted job", "job", jobKey, "runpodID", runpodID)
@@ -1674,10 +1711,14 @@ func (c *JobController) CleanupDeletedJobs() error {
 		}
 	}
 
-	// Remove terminated jobs from tracking
-	for _, jobKey := range jobsToRemove {
-		delete(c.deletedJobs, jobKey)
-		c.logger.Info("Cleanup complete, removed job from tracking", "job", jobKey)
+	// Remove terminated jobs from tracking - reacquire lock
+	if len(jobsToRemove) > 0 {
+		c.deletedJobsMutex.Lock()
+		for _, jobKey := range jobsToRemove {
+			delete(c.deletedJobs, jobKey)
+			c.logger.Info("Cleanup complete, removed job from tracking", "job", jobKey)
+		}
+		c.deletedJobsMutex.Unlock()
 	}
 
 	c.logger.Info("RunPod cleanup completed", "processed", len(jobsToRemove))
@@ -1779,18 +1820,29 @@ func (c *JobController) verifyRunPodInstance(job batchv1.Job) error {
 			"podID", podID,
 			"error", err)
 
-		// Only reset if we're sure the pod doesn't exist
-		if strings.Contains(err.Error(), "not found") {
+		// Reset if we're sure the pod doesn't exist or if there's an API error
+		// This handles both explicit "not found" errors and other API failures
+		if strings.Contains(err.Error(), "not found") || 
+		   strings.Contains(err.Error(), "404") ||
+		   strings.Contains(err.Error(), "GRAPHQL_VALIDATION_FAILED") {
+			c.logger.Info("RunPod instance appears to be gone, resetting job state",
+				"job", job.Name,
+				"namespace", job.Namespace,
+				"podID", podID,
+				"error", err)
 			return c.resetJobOffloadState(job)
 		}
-		return err
+		
+		// For other errors, log but don't reset - might be temporary API issues
+		return nil
 	}
 
-	if status == PodNotFound {
-		c.logger.Info("RunPod instance not found, resetting job state",
+	if status == PodNotFound || status == PodTerminated {
+		c.logger.Info("RunPod instance not found or terminated, resetting job state",
 			"job", job.Name,
 			"namespace", job.Namespace,
-			"podID", podID)
+			"podID", podID,
+			"status", status)
 		return c.resetJobOffloadState(job)
 	}
 
