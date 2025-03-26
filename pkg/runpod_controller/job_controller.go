@@ -209,7 +209,7 @@ func (c *RunPodClient) GetPodStatus(podID string) (PodStatus, error) {
 
 func (c *RunPodClient) GetPodStatusREST(podID string) (PodStatus, error) {
 	endpoint := fmt.Sprintf("pods/%s", podID)
-	
+
 	// Add retries for temporary errors
 	var resp *http.Response
 	retryCount := 0
@@ -221,7 +221,7 @@ func (c *RunPodClient) GetPodStatusREST(podID string) (PodStatus, error) {
 	for retryCount < maxRetries {
 		var err error
 		resp, err = c.makeRESTRequest("GET", endpoint, nil)
-		
+
 		if err == nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound) {
 			break
 		}
@@ -236,7 +236,7 @@ func (c *RunPodClient) GetPodStatusREST(podID string) (PodStatus, error) {
 				if readErr == nil {
 					lastResponseBody = string(bodyBytes)
 				}
-				
+				c.logger.Error("Failed getting pod status", "error", lastResponseBody)
 				bodyErr := resp.Body.Close()
 				if bodyErr != nil {
 					c.logger.Warn("Error closing response body", "error", bodyErr)
@@ -251,7 +251,7 @@ func (c *RunPodClient) GetPodStatusREST(podID string) (PodStatus, error) {
 			"retry", retryCount,
 			"error", err,
 			"statusCode", lastStatusCode)
-		
+
 		time.Sleep(time.Duration(retryCount) * 500 * time.Millisecond)
 	}
 
@@ -276,7 +276,7 @@ func (c *RunPodClient) GetPodStatusREST(podID string) (PodStatus, error) {
 	defer func() {
 		bodyErr := resp.Body.Close()
 		if bodyErr != nil {
-			c.logger.Info("Error closing response body", "error", bodyErr)
+			c.logger.Warn("Error closing response body", "error", bodyErr)
 		}
 	}()
 
@@ -599,7 +599,7 @@ func (c *RunPodClient) makeRESTRequest(method, endpoint string, body io.Reader) 
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute request: %w", err)
 	}
-	
+
 	// Check for 404 Not Found and return a standardized error
 	if resp.StatusCode == http.StatusNotFound {
 		// Read and close the body to prevent resource leaks
@@ -607,7 +607,7 @@ func (c *RunPodClient) makeRESTRequest(method, endpoint string, body io.Reader) 
 		resp.Body.Close()
 		return nil, fmt.Errorf("not found: %s", string(body))
 	}
-	
+
 	return resp, nil
 }
 
@@ -627,7 +627,7 @@ func (c *JobController) LoadRunning() {
 		c.runpodAvailable = false
 		return
 	}
-	
+
 	// Ensure we always close the response body
 	if resp != nil && resp.Body != nil {
 		defer func() {
@@ -640,7 +640,7 @@ func (c *JobController) LoadRunning() {
 	if resp.StatusCode != http.StatusOK {
 		body, readErr := io.ReadAll(resp.Body)
 		if readErr != nil {
-			c.logger.Error("Failed to read error response body", 
+			c.logger.Error("Failed to read error response body",
 				"statusCode", resp.StatusCode,
 				"readErr", readErr)
 		} else {
@@ -700,14 +700,14 @@ func (c *JobController) LoadRunning() {
 		// For now, use the default namespace
 		namespace := "default"
 		jobName := runpodInstance.Name
-	
+
 		// Skip jobs with invalid names
 		if len(jobName) == 0 {
 			c.logger.Info("Skipping RunPod instance with empty name",
 				"podID", runpodInstance.ID)
 			continue
 		}
-	
+
 		c.logger.Info("Processing RunPod instance",
 			"podID", runpodInstance.ID,
 			"name", runpodInstance.Name,
@@ -1348,7 +1348,7 @@ func createVirtualPodObject(job batchv1.Job, runpodID string, costPerHr float64)
 // CreateVirtualPod creates a virtual Pod representation of a RunPod instance
 func (c *JobController) CreateVirtualPod(job batchv1.Job, runpodID string, costPerHr float64) error {
 	pod := createVirtualPodObject(job, runpodID, costPerHr)
-	
+
 	// Create the Pod
 	_, err := c.clientset.CoreV1().Pods(job.Namespace).Create(
 		context.Background(),
@@ -1567,11 +1567,11 @@ func shouldForceDeleteTerminatingPod(pod corev1.Pod) bool {
 	if pod.DeletionTimestamp == nil {
 		return false
 	}
-	
+
 	deletionTime := pod.DeletionTimestamp.Time
 	terminatingDuration := time.Since(deletionTime)
 	forceDeletionThreshold := 15 * time.Minute
-	
+
 	return terminatingDuration > forceDeletionThreshold
 }
 
@@ -1681,13 +1681,13 @@ func (c *JobController) handleTerminatingPod(pod corev1.Pod) {
 func (c *JobController) CleanupDeletedJobs() error {
 	// Create a local copy of the jobs to clean up to minimize lock contention
 	jobsToCheck := make(map[string]string)
-	
+
 	c.deletedJobsMutex.Lock()
 	for jobKey, runpodID := range c.deletedJobs {
 		jobsToCheck[jobKey] = runpodID
 	}
 	c.deletedJobsMutex.Unlock()
-	
+
 	// Get current jobs to confirm which are deleted
 	currentJobs, err := c.clientset.BatchV1().Jobs("").List(
 		context.Background(),
@@ -1841,7 +1841,7 @@ func (c *JobController) verifyRunPodInstance(job batchv1.Job) error {
 
 	status, err := c.runpodClient.GetPodStatusREST(podID)
 	if err != nil {
-		c.logger.Info("Error checking RunPod instance status",
+		c.logger.Error("Error checking RunPod instance status",
 			"job", job.Name,
 			"namespace", job.Namespace,
 			"podID", podID,
@@ -1849,9 +1849,9 @@ func (c *JobController) verifyRunPodInstance(job batchv1.Job) error {
 
 		// Reset if we're sure the pod doesn't exist or if there's an API error
 		// This handles both explicit "not found" errors and other API failures
-		if strings.Contains(err.Error(), "not found") || 
-		   strings.Contains(err.Error(), "404") ||
-		   strings.Contains(err.Error(), "GRAPHQL_VALIDATION_FAILED") {
+		if strings.Contains(err.Error(), "not found") ||
+			strings.Contains(err.Error(), "404") ||
+			strings.Contains(err.Error(), "GRAPHQL_VALIDATION_FAILED") {
 			c.logger.Info("RunPod instance appears to be gone, resetting job state",
 				"job", job.Name,
 				"namespace", job.Namespace,
@@ -1859,7 +1859,7 @@ func (c *JobController) verifyRunPodInstance(job batchv1.Job) error {
 				"error", err)
 			return c.resetJobOffloadState(job)
 		}
-		
+
 		// For other errors, log but don't reset - might be temporary API issues
 		return nil
 	}
