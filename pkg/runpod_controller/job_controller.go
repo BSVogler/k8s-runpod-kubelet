@@ -256,7 +256,7 @@ func (c *RunPodClient) GetPodStatusREST(podID string) (PodStatus, error) {
 	}
 
 	if resp == nil {
-		errorMsg := fmt.Sprintf("no response received after %d retries", maxRetries)
+		errorMsg := fmt.Sprintf("API request failed after %d attempts", maxRetries)
 		if lastError != nil {
 			errorMsg = fmt.Sprintf("%s, last error: %v", errorMsg, lastError)
 		}
