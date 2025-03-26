@@ -386,6 +386,7 @@ func (c *RunPodClient) GetGPUTypes(minRAMPerGPU int, maxPrice float64, cloudType
 }
 
 func (c *RunPodClient) DeployPodREST(params map[string]interface{}) (string, float64, error) {
+	//https://rest.runpod.io/v1/docs#tag/pods/POST/pods
 	reqBody, err := json.Marshal(params)
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to marshal request: %w", err)
@@ -1032,7 +1033,7 @@ func (c *JobController) PrepareRunPodParameters(job batchv1.Job, graphql bool) (
 // CreateVirtualPod creates a virtual Pod representation of a RunPod instance
 func (c *JobController) CreateVirtualPod(job batchv1.Job, runpodID string, costPerHr float64) error {
 	// Create a Pod representation of the RunPod instance
-	podName := fmt.Sprintf("%s-runpod", job.Name)
+	podName := fmt.Sprintf("%s-runpod-%s", job.Name, runpodID)
 
 	// Create labels to link Pod to Job
 	podLabels := make(map[string]string)
