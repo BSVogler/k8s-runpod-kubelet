@@ -639,18 +639,19 @@ func (c *JobController) LoadRunning() {
 			continue
 		}
 
-		// Try to extract namespace and job name from the pod name
+		// Extract namespace and job name from the pod name
 		// Expected format: {namespace}-{jobname}
-		nameParts := strings.SplitN(runpodInstance.Name, "-", 2)
-		if len(nameParts) != 2 {
+		nameParts := strings.Split(runpodInstance.Name, "-")
+		if len(nameParts) < 2 {
 			c.logger.Info("Skipping RunPod instance with non-standard name format",
 				"podID", runpodInstance.ID,
 				"name", runpodInstance.Name)
 			continue
 		}
 
+		// The namespace is the first part, and the job name is everything else joined with hyphens
 		namespace := nameParts[0]
-		jobName := nameParts[1]
+		jobName := strings.Join(nameParts[1:], "-")
 
 		// Check if the job exists
 		job, err := c.clientset.BatchV1().Jobs(namespace).Get(
