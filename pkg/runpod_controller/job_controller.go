@@ -1273,8 +1273,8 @@ func createVirtualPodObject(job batchv1.Job, runpodID string, costPerHr float64)
 		podLabels[k] = v
 	}
 	podLabels["job-name"] = job.Name
-	podLabels["runpod.io/managed"] = "true"
-	podLabels["runpod.io/pod-id"] = runpodID
+	podLabels[RunpodManagedLabel] = "true"
+	podLabels[RunpodPodIDAnnotation] = runpodID
 
 	// Create annotations for the Pod
 	podAnnotations := make(map[string]string)
