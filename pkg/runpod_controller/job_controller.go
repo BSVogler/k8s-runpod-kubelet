@@ -581,8 +581,173 @@ func (c *JobController) LoadRunning() {
 	if c.runpodClient.apiKey == "" {
 		return
 	}
-	//https://rest.runpod.io/v1/pods?desiredStatus=RUNNING
 
+	// Make a request to the RunPod API to get all running pods
+	url := fmt.Sprintf("%spods?desiredStatus=RUNNING", c.runpodClient.baseRESTURL)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		c.logger.Error("Failed to create request for running pods", "err", err)
+		c.runpodAvailable = false
+		return
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.runpodClient.apiKey))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	resp, err := c.runpodClient.httpClient.Do(req)
+	if err != nil {
+		c.logger.Error("Failed to get running pods from RunPod API", "err", err)
+		c.runpodAvailable = false
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		c.logger.Error("RunPod API returned error",
+			"statusCode", resp.StatusCode,
+			"response", string(body))
+		c.runpodAvailable = false
+		return
+	}
+
+	// API is available
+	c.runpodAvailable = true
+
+	// Parse the response
+	var response struct {
+		Pods []struct {
+			ID        string  `json:"id"`
+			Name      string  `json:"name"`
+			CostPerHr float64 `json:"costPerHr"`
+			ImageName string  `json:"imageName"`
+		} `json:"pods"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		c.logger.Error("Failed to decode RunPod API response", "err", err)
+		return
+	}
+
+	// Get existing pods in the cluster
+	existingPods, err := c.clientset.CoreV1().Pods("").List(
+		context.Background(),
+		metav1.ListOptions{
+			LabelSelector: "runpod.io/managed=true",
+		},
+	)
+	if err != nil {
+		c.logger.Error("Failed to list existing pods", "err", err)
+		return
+	}
+
+	// Create a map of existing RunPod IDs
+	existingRunPodIDs := make(map[string]bool)
+	for _, pod := range existingPods.Items {
+		if podID, exists := pod.Annotations[RunpodPodIDAnnotation]; exists {
+			existingRunPodIDs[podID] = true
+		}
+	}
+
+	// Process each running pod from RunPod API
+	for _, runpodInstance := range response.Pods {
+		// Skip if this RunPod instance is already represented in the cluster
+		if existingRunPodIDs[runpodInstance.ID] {
+			continue
+		}
+
+		// Try to extract namespace and job name from the pod name
+		// Expected format: {namespace}-{jobname}
+		nameParts := strings.SplitN(runpodInstance.Name, "-", 2)
+		if len(nameParts) != 2 {
+			c.logger.Info("Skipping RunPod instance with non-standard name format",
+				"podID", runpodInstance.ID,
+				"name", runpodInstance.Name)
+			continue
+		}
+
+		namespace := nameParts[0]
+		jobName := nameParts[1]
+
+		// Check if the job exists
+		job, err := c.clientset.BatchV1().Jobs(namespace).Get(
+			context.Background(),
+			jobName,
+			metav1.GetOptions{},
+		)
+		if err != nil {
+			if k8serrors.IsNotFound(err) {
+				c.logger.Info("Job not found for RunPod instance, skipping",
+					"podID", runpodInstance.ID,
+					"namespace", namespace,
+					"jobName", jobName)
+				continue
+			}
+			c.logger.Error("Failed to get job for RunPod instance",
+				"podID", runpodInstance.ID,
+				"namespace", namespace,
+				"jobName", jobName,
+				"err", err)
+			continue
+		}
+
+		// Create a virtual pod for this RunPod instance
+		c.logger.Info("Creating virtual pod for existing RunPod instance",
+			"podID", runpodInstance.ID,
+			"namespace", namespace,
+			"jobName", jobName)
+
+		// Update job annotations if needed
+		jobCopy := job.DeepCopy()
+		if jobCopy.Annotations == nil {
+			jobCopy.Annotations = make(map[string]string)
+		}
+
+		// Only update if not already set
+		updateJob := false
+		if jobCopy.Annotations[RunpodPodIDAnnotation] != runpodInstance.ID {
+			jobCopy.Annotations[RunpodPodIDAnnotation] = runpodInstance.ID
+			updateJob = true
+		}
+		if jobCopy.Annotations[RunpodOffloadedAnnotation] != "true" {
+			jobCopy.Annotations[RunpodOffloadedAnnotation] = "true"
+			updateJob = true
+		}
+		if jobCopy.Annotations[RunpodCostAnnotation] != fmt.Sprintf("%f", runpodInstance.CostPerHr) {
+			jobCopy.Annotations[RunpodCostAnnotation] = fmt.Sprintf("%f", runpodInstance.CostPerHr)
+			updateJob = true
+		}
+
+		if updateJob {
+			if err := c.UpdateJobWithRetry(jobCopy); err != nil {
+				c.logger.Error("Failed to update job annotations for RunPod instance",
+					"podID", runpodInstance.ID,
+					"namespace", namespace,
+					"jobName", jobName,
+					"err", err)
+				continue
+			}
+		}
+
+		// Create the virtual pod
+		if err := c.CreateVirtualPod(*job, runpodInstance.ID, runpodInstance.CostPerHr); err != nil {
+			c.logger.Error("Failed to create virtual pod for RunPod instance",
+				"podID", runpodInstance.ID,
+				"namespace", namespace,
+				"jobName", jobName,
+				"err", err)
+			continue
+		}
+
+		c.logger.Info("Successfully created virtual pod for RunPod instance",
+			"podID", runpodInstance.ID,
+			"namespace", namespace,
+			"jobName", jobName)
+	}
 }
 
 // JobController manages Kubernetes jobs and offloads them to RunPod when necessary
