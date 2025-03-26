@@ -1739,16 +1739,15 @@ func (c *JobController) normalizeJobAnnotations(job batchv1.Job) error {
 		jobCopy.Annotations = make(map[string]string)
 	}
 
-	// Validate that a job that's marked as offloaded has a valid pod ID
+	// Validate that a job that's marked as offloaded has a pod ID
 	if jobCopy.Annotations[RunpodOffloadedAnnotation] == "true" {
 		podID := jobCopy.Annotations[RunpodPodIDAnnotation]
-		if podID == "" || len(podID) < 5 {
+		if podID == "" {
 			delete(jobCopy.Annotations, RunpodOffloadedAnnotation)
 			delete(jobCopy.Annotations, RunpodPodIDAnnotation)
 			c.logger.Info("Removed invalid offload state",
 				"job", job.Name,
-				"namespace", job.Namespace,
-				"podID", podID)
+				"namespace", job.Namespace)
 			changed = true
 		}
 	}
