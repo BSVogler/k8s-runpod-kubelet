@@ -214,18 +214,33 @@ func (c *RunPodClient) GetPodStatusREST(podID string) (PodStatus, error) {
 	var resp *http.Response
 	retryCount := 0
 	maxRetries := 3
+	var lastError error
+	var lastStatusCode int
+	var lastResponseBody string
 
 	for retryCount < maxRetries {
 		var err error
 		resp, err = c.makeRESTRequest("GET", endpoint, nil)
+		
 		if err == nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound) {
 			break
 		}
 
+		// Store the error details for better reporting
+		lastError = err
 		if resp != nil {
-			bodyErr := resp.Body.Close()
-			if bodyErr != nil {
-				c.logger.Warn("Error closing response body", "error", bodyErr)
+			lastStatusCode = resp.StatusCode
+			// Try to read the response body for error details
+			if resp.Body != nil {
+				bodyBytes, readErr := io.ReadAll(resp.Body)
+				if readErr == nil {
+					lastResponseBody = string(bodyBytes)
+				}
+				
+				bodyErr := resp.Body.Close()
+				if bodyErr != nil {
+					c.logger.Warn("Error closing response body", "error", bodyErr)
+				}
 			}
 		}
 
@@ -233,15 +248,29 @@ func (c *RunPodClient) GetPodStatusREST(podID string) (PodStatus, error) {
 
 		c.logger.Info("Retrying pod status check after error",
 			"podID", podID,
-			"retry", retryCount)
-		if resp != nil {
-			c.logger.Info("Response details", "statusCode", resp.StatusCode)
-		}
+			"retry", retryCount,
+			"error", err,
+			"statusCode", lastStatusCode)
+		
 		time.Sleep(time.Duration(retryCount) * 500 * time.Millisecond)
 	}
 
 	if resp == nil {
-		return PodNotFound, fmt.Errorf("no response received after %d retries", maxRetries)
+		errorMsg := fmt.Sprintf("no response received after %d retries", maxRetries)
+		if lastError != nil {
+			errorMsg = fmt.Sprintf("%s, last error: %v", errorMsg, lastError)
+		}
+		if lastStatusCode > 0 {
+			errorMsg = fmt.Sprintf("%s, last status code: %d", errorMsg, lastStatusCode)
+		}
+		if lastResponseBody != "" {
+			// Truncate very long response bodies
+			if len(lastResponseBody) > 200 {
+				lastResponseBody = lastResponseBody[:200] + "..."
+			}
+			errorMsg = fmt.Sprintf("%s, last response: %s", errorMsg, lastResponseBody)
+		}
+		return PodNotFound, fmt.Errorf(errorMsg)
 	}
 
 	defer func() {
