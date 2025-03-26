@@ -645,6 +645,13 @@ func (c *JobController) LoadRunning() {
 		namespace := "default"
 		jobName := runpodInstance.Name
 	
+		// Skip jobs with invalid names
+		if len(jobName) == 0 {
+			c.logger.Info("Skipping RunPod instance with empty name",
+				"podID", runpodInstance.ID)
+			continue
+		}
+	
 		c.logger.Info("Processing RunPod instance",
 			"podID", runpodInstance.ID,
 			"name", runpodInstance.Name,
@@ -1201,6 +1208,7 @@ func (c *JobController) CleanupPendingPodsForJob(job batchv1.Job) error {
 
 // createVirtualPodObject creates a Pod object representing a RunPod instance
 func createVirtualPodObject(job batchv1.Job, runpodID string, costPerHr float64) *corev1.Pod {
+	// Use consistent naming format for virtual pods
 	podName := fmt.Sprintf("runpod-%s", runpodID)
 
 	// Create labels to link Pod to Job
@@ -1450,8 +1458,8 @@ func (c *JobController) CleanupPod(namespace, jobName, runpodID string) error {
 		// Continue with cleanup even if termination fails
 	}
 
-	// Then clean up the K8s pod
-	podName := fmt.Sprintf("%s-runpod", jobName)
+	// Then clean up the K8s pod - use consistent naming format
+	podName := fmt.Sprintf("runpod-%s", runpodID)
 	err := c.clientset.CoreV1().Pods(namespace).Delete(
 		context.Background(),
 		podName,
