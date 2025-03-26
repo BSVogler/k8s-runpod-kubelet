@@ -831,6 +831,7 @@ func NewJobController(clientset *kubernetes.Clientset, logger *slog.Logger, cfg 
 }
 
 // UpdateJobWithRetry updates a job with retry logic to handle concurrent modifications
+// UpdateJobWithRetry updates a job with retry logic to handle concurrent modifications
 func (c *JobController) UpdateJobWithRetry(job *batchv1.Job) error {
 	retryCount := 0
 	maxRetries := DefaultRetryCount
@@ -851,7 +852,14 @@ func (c *JobController) UpdateJobWithRetry(job *batchv1.Job) error {
 			latestJob.Annotations = make(map[string]string)
 		}
 
-		// Copy over the annotations we want to set
+		// First, remove all RunPod-related annotations that might need to be updated
+		for k := range latestJob.Annotations {
+			if strings.HasPrefix(k, "runpod.io/") {
+				delete(latestJob.Annotations, k)
+			}
+		}
+
+		// Then copy over the annotations we want to set
 		for k, v := range job.Annotations {
 			if strings.HasPrefix(k, "runpod.io/") {
 				latestJob.Annotations[k] = v
@@ -1853,7 +1861,7 @@ func (c *JobController) verifyRunPodInstance(job batchv1.Job) error {
 			"namespace", job.Namespace,
 			"podID", podID,
 			"error", err)
-		
+
 		// Also clean up the virtual pod if it exists
 		podName := fmt.Sprintf("runpod-%s", podID)
 		if err := c.ForceDeletePod(job.Namespace, podName); err != nil {
@@ -1862,7 +1870,7 @@ func (c *JobController) verifyRunPodInstance(job batchv1.Job) error {
 				"namespace", job.Namespace,
 				"err", err)
 		}
-		
+
 		return c.resetJobOffloadState(job)
 	}
 
