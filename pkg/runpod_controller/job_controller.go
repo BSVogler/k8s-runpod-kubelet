@@ -1847,21 +1847,23 @@ func (c *JobController) verifyRunPodInstance(job batchv1.Job) error {
 			"podID", podID,
 			"error", err)
 
-		// Reset if we're sure the pod doesn't exist or if there's an API error
-		// This handles both explicit "not found" errors and other API failures
-		if strings.Contains(err.Error(), "not found") ||
-			strings.Contains(err.Error(), "404") ||
-			strings.Contains(err.Error(), "GRAPHQL_VALIDATION_FAILED") {
-			c.logger.Info("RunPod instance appears to be gone, resetting job state",
-				"job", job.Name,
+		// Reset state for any API error - better to reset and retry than leave in inconsistent state
+		c.logger.Info("RunPod API error, resetting job state",
+			"job", job.Name,
+			"namespace", job.Namespace,
+			"podID", podID,
+			"error", err)
+		
+		// Also clean up the virtual pod if it exists
+		podName := fmt.Sprintf("runpod-%s", podID)
+		if err := c.ForceDeletePod(job.Namespace, podName); err != nil {
+			c.logger.Error("Failed to cleanup virtual pod during reset",
+				"pod", podName,
 				"namespace", job.Namespace,
-				"podID", podID,
-				"error", err)
-			return c.resetJobOffloadState(job)
+				"err", err)
 		}
-
-		// For other errors, log but don't reset - might be temporary API issues
-		return nil
+		
+		return c.resetJobOffloadState(job)
 	}
 
 	if status == PodNotFound || status == PodTerminated {
@@ -1870,6 +1872,16 @@ func (c *JobController) verifyRunPodInstance(job batchv1.Job) error {
 			"namespace", job.Namespace,
 			"podID", podID,
 			"status", status)
+
+		// Clean up the virtual pod if it exists
+		podName := fmt.Sprintf("runpod-%s", podID)
+		if err := c.ForceDeletePod(job.Namespace, podName); err != nil {
+			c.logger.Error("Failed to cleanup virtual pod during reset",
+				"pod", podName,
+				"namespace", job.Namespace,
+				"err", err)
+		}
+
 		return c.resetJobOffloadState(job)
 	}
 
