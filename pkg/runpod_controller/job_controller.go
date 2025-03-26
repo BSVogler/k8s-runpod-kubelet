@@ -1202,7 +1202,7 @@ func (c *JobController) CleanupPendingPodsForJob(job batchv1.Job) error {
 
 // createVirtualPodObject creates a Pod object representing a RunPod instance
 func createVirtualPodObject(job batchv1.Job, runpodID string, costPerHr float64) *corev1.Pod {
-	podName := fmt.Sprintf("%s-runpod-%s", job.Name, runpodID)
+	podName := fmt.Sprintf("runpod-%s", runpodID)
 
 	// Create labels to link Pod to Job
 	podLabels := make(map[string]string)
