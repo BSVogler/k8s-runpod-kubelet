@@ -1030,6 +1030,49 @@ func (c *JobController) PrepareRunPodParameters(job batchv1.Job, graphql bool) (
 	return params, nil
 }
 
+// Add this function to JobController to clean up pending pods for an offloaded job
+func (c *JobController) CleanupPendingPodsForJob(job batchv1.Job) error {
+	// List all pods associated with this job
+	pods, err := c.clientset.CoreV1().Pods(job.Namespace).List(
+		context.Background(),
+		metav1.ListOptions{
+			LabelSelector: fmt.Sprintf("job-name=%s", job.Name),
+		},
+	)
+
+	if err != nil {
+		return fmt.Errorf("failed to list pods for job cleanup: %w", err)
+	}
+
+	c.logger.Info("Cleaning up pending pods for offloaded job",
+		"job", job.Name,
+		"namespace", job.Namespace,
+		"podCount", len(pods.Items))
+
+	for _, pod := range pods.Items {
+		// Skip pods that are managed by RunPod (our virtual pod)
+		if _, isRunPodManaged := pod.Labels[RunpodManagedLabel]; isRunPodManaged {
+			continue
+		}
+
+		// Check if the pod is in Pending state
+		if pod.Status.Phase == corev1.PodPending {
+			c.logger.Info("Force deleting pending pod for offloaded job",
+				"pod", pod.Name,
+				"namespace", pod.Namespace)
+
+			if err := c.ForceDeletePod(pod.Namespace, pod.Name); err != nil {
+				c.logger.Error("Failed to force delete pending pod",
+					"pod", pod.Name,
+					"namespace", pod.Namespace,
+					"err", err)
+			}
+		}
+	}
+
+	return nil
+}
+
 // CreateVirtualPod creates a virtual Pod representation of a RunPod instance
 func (c *JobController) CreateVirtualPod(job batchv1.Job, runpodID string, costPerHr float64) error {
 	// Create a Pod representation of the RunPod instance
@@ -1247,6 +1290,15 @@ func (c *JobController) OffloadJobToRunPod(job batchv1.Job) error {
 	if err := c.UpdateJobStatus(job); err != nil {
 		// Note: We don't clean up here as the pod and job annotations are already created
 		return fmt.Errorf("failed to update job status: %w", err)
+	}
+
+	// Step 5: Clean up original pending pods that are no longer needed
+	if err := c.CleanupPendingPodsForJob(job); err != nil {
+		c.logger.Error("Failed to clean up pending pods for offloaded job",
+			"job", job.Name,
+			"namespace", job.Namespace,
+			"err", err)
+		// Continue execution even if cleanup fails
 	}
 
 	c.logger.Info("Successfully offloaded job to RunPod",
@@ -1607,6 +1659,13 @@ func (c *JobController) verifyRunPodInstance(job batchv1.Job) error {
 	}
 
 	c.logger.Info("Verified RunPod instance",
+	// Instance exists, but let's ensure there are no lingering pending pods
+	if err := c.CleanupPendingPodsForJob(job); err != nil {
+		c.logger.Error("Failed to clean up pending pods during verification",
+			"job", job.Name,
+			"namespace", job.Namespace,
+			"err", err)
+		// Continue execution even if cleanup fails
 		"job", job.Name,
 		"namespace", job.Namespace,
 		"podID", podID,
