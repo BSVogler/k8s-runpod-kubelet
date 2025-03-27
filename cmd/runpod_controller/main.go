@@ -73,10 +73,14 @@ func main() {
 	sentryUrl := os.Getenv("SENTRY_URL")
 	var logger *slog.Logger
 	if sentryUrl != "" {
+		environment := os.Getenv("environment")
+		if environment == "" {
+			environment = "development"
+		}
 		err := sentry.Init(sentry.ClientOptions{
 			Dsn:           sentryUrl,
 			EnableTracing: false,
-			Environment:   "development",
+			Environment:   environment,
 		})
 		if err != nil {
 			log.Fatalf("sentry.Init: %s", err)

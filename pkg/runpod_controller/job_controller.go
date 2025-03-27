@@ -222,7 +222,7 @@ func (c *RunPodClient) GetPodStatusREST(podID string) (PodStatus, error) {
 		var err error
 		resp, err = c.makeRESTRequest("GET", endpoint, nil)
 
-		if err == nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound) {
+		if err == nil && resp != nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound) {
 			break
 		}
 
