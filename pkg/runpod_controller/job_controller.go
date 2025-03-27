@@ -535,46 +535,25 @@ func (c *RunPodClient) DeployPod(params map[string]interface{}) (string, float64
 
 // TerminatePod terminates a RunPod instance by ID
 func (c *RunPodClient) TerminatePod(podID string) error {
-	query := `
-		mutation podTerminate($input: PodTerminateInput!) {
-			podTerminate(input: $input) {
-				id
-				desiredStatus
-			}
-		}
-	`
+	endpoint := fmt.Sprintf("/pods/%s/stop", podID)
 
-	variables := map[string]interface{}{
-		"input": map[string]string{
-			"podId": podID,
-		},
-	}
-
-	var response struct {
-		Data struct {
-			PodTerminate struct {
-				ID            string `json:"id"`
-				DesiredStatus string `json:"desiredStatus"`
-			} `json:"podTerminate"`
-		} `json:"data"`
-		Errors []struct {
-			Message string `json:"message"`
-		} `json:"errors"`
-	}
-
-	if err := c.ExecuteGraphQL(query, variables, &response); err != nil {
+	resp, err := c.makeRESTRequest("POST", endpoint, nil)
+	if err != nil {
 		return err
 	}
+	defer resp.Body.Close()
 
-	// Check for API errors
-	if len(response.Errors) > 0 {
-		return fmt.Errorf("RunPod API error: %s", response.Errors[0].Message)
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("unauthorized: invalid API key")
 	}
 
-	// Check termination status
-	if response.Data.PodTerminate.DesiredStatus != "TERMINATED" {
-		return fmt.Errorf("failed to terminate RunPod instance, status: %s",
-			response.Data.PodTerminate.DesiredStatus)
+	if resp.StatusCode == http.StatusBadRequest {
+		return fmt.Errorf("invalid pod ID: %s", podID)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to terminate pod, status: %d, response: %s", resp.StatusCode, string(body))
 	}
 
 	return nil
