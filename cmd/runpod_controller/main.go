@@ -76,6 +76,7 @@ func main() {
 		err := sentry.Init(sentry.ClientOptions{
 			Dsn:           sentryUrl,
 			EnableTracing: false,
+			Environment:   "development",
 		})
 		if err != nil {
 			log.Fatalf("sentry.Init: %s", err)
@@ -90,7 +91,7 @@ func main() {
 
 		// Configure `slog` to use the multi handler
 		logger = slog.New(multiHandler)
-		logger = logger.With("release", "v1.0.1")
+		//logger = logger.With("release", "v1.0.1")
 		defer sentry.Flush(2 * time.Second) //send errors after a crash
 	} else { // Use a default logger (stdout) when Sentry is not initialized
 		logger = slog.New(slog.NewTextHandler(os.Stdout, nil))
