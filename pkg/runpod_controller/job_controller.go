@@ -426,18 +426,19 @@ func (c *RunPodClient) DeployPodREST(params map[string]interface{}) (string, flo
 	}
 
 	var response struct {
-		ID        string  `json:"id"`
-		CostPerHr float64 `json:"costPerHr"`
-		MachineID string  `json:"machineId"`
-		Name      string  `json:"name"`
-		Machine   struct {
+		ID            string `json:"id"`
+		CostPerHr     string `json:"costPerHr"` // Change to string to match JSON
+		MachineID     string `json:"machineId"`
+		Name          string `json:"name"`
+		DesiredStatus string `json:"desiredStatus"`
+		Image         string `json:"image"` // Change from ImageName to match JSON
+
+		Machine struct {
 			DataCenterID string `json:"dataCenterId"`
 			GpuTypeID    string `json:"gpuTypeId"`
 			Location     string `json:"location"`
 			SecureCloud  bool   `json:"secureCloud"`
 		} `json:"machine"`
-		DesiredStatus string `json:"desiredStatus"`
-		ImageName     string `json:"imageName"`
 	}
 
 	if err := json.Unmarshal(body, &response); err != nil {
