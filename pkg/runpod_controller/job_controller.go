@@ -1118,11 +1118,6 @@ func (c *JobController) ExtractEnvVars(job batchv1.Job) ([]RunPodEnv, error) {
 	if len(job.Spec.Template.Spec.Containers) > 0 {
 		container := job.Spec.Template.Spec.Containers[0]
 		for _, env := range container.Env {
-			// Skip empty values and secret refs (these will be handled by volume mounts)
-			if env.Value == "" || env.ValueFrom != nil {
-				continue
-			}
-
 			// Add the environment variable
 			envVars = append(envVars, RunPodEnv{
 				Key:   env.Name,
