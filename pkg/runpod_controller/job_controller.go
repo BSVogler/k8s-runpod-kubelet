@@ -34,8 +34,8 @@ const (
 	RunpodTemplateIdAnnotation            = "runpod.io/templateId"
 	GpuMemoryAnnotation                   = "runpod.io/required-gpu-memory"
 	RunpodContainerRegistryAuthAnnotation = "runpod.io/container-registry-auth-id"
+	RunpodFailureAnnotation               = "runpod.io/failure-count"
 	RunpodManagedLabel                    = "runpod.io/managed"
-
 	// DefaultMaxPrice for GPU
 	DefaultMaxPrice = 0.5
 
@@ -49,11 +49,12 @@ const (
 type PodStatus string
 
 const (
-	PodRunning     PodStatus = "RUNNING"
+	PodRunning     PodStatus = "RUNNING" //used by runpod
 	PodStarting    PodStatus = "STARTING"
-	PodTerminated  PodStatus = "TERMINATED"
 	PodTerminating PodStatus = "TERMINATING"
-	PodNotFound    PodStatus = "NOT_FOUND"
+	PodTerminated  PodStatus = "TERMINATED" //used by runpod
+	PodNotFound    PodStatus = "NOT_FOUND"  //not used by runpod according to docs
+	PodExited      PodStatus = "EXITED"     //used by runpod
 )
 
 // RunPodEnv represents the environment variable structure for RunPod API
@@ -656,15 +657,35 @@ func (c *JobController) LoadRunning() {
 
 	// Parse the response - the API returns an array directly, not a struct with a pods field
 	var pods []struct {
-		ID        string  `json:"id"`
-		Name      string  `json:"name"`
-		CostPerHr float64 `json:"costPerHr"`
-		ImageName string  `json:"imageName"`
+		ID            string  `json:"id"`
+		Name          string  `json:"name"`
+		CostPerHr     float64 `json:"costPerHr"`
+		ImageName     string  `json:"imageName"`
+		CurrentStatus string  `json:"currentStatus"`
+		DesiredStatus string  `json:"desiredStatus"`
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&pods); err != nil {
 		c.logger.Error("Failed to decode RunPod API response", "err", err)
 		return
+	}
+
+	// Also check for exited pods to properly handle them
+	respFailed, err := c.runpodClient.makeRESTRequest("GET", "pods?desiredStatus=EXITED", nil)
+	if err == nil && respFailed.StatusCode == http.StatusOK {
+		var failedPods []struct {
+			ID            string  `json:"id"`
+			Name          string  `json:"name"`
+			CostPerHr     float64 `json:"costPerHr"`
+			ImageName     string  `json:"imageName"`
+			CurrentStatus string  `json:"currentStatus"`
+			DesiredStatus string  `json:"desiredStatus"`
+		}
+
+		if err := json.NewDecoder(respFailed.Body).Decode(&failedPods); err == nil {
+			pods = append(pods, failedPods...)
+		}
+		respFailed.Body.Close()
 	}
 
 	// Get existing pods in the cluster
@@ -681,16 +702,45 @@ func (c *JobController) LoadRunning() {
 
 	// Create a map of existing RunPod IDs
 	existingRunPodIDs := make(map[string]bool)
+	existingRunPodJobNames := make(map[string]string) // Maps podID to jobName
 	for _, pod := range existingPods.Items {
 		if podID, exists := pod.Annotations[RunpodPodIDAnnotation]; exists {
 			existingRunPodIDs[podID] = true
+			if jobName, exists := pod.Labels["job-name"]; exists {
+				existingRunPodJobNames[podID] = jobName
+			}
 		}
 	}
 
-	// Process each running pod from RunPod API
+	// Process each pod from RunPod API
 	for _, runpodInstance := range pods {
 		// Skip if this RunPod instance is already represented in the cluster
 		if existingRunPodIDs[runpodInstance.ID] {
+			// Check if it's in an exited state but we haven't registered the failure yet
+			if runpodInstance.DesiredStatus == "EXITED" ||
+				runpodInstance.CurrentStatus == "EXITED" {
+
+				jobName := existingRunPodJobNames[runpodInstance.ID]
+				if jobName != "" {
+					// Get the job to handle the failure
+					job, err := c.clientset.BatchV1().Jobs("").List(
+						context.Background(),
+						metav1.ListOptions{
+							FieldSelector: fmt.Sprintf("metadata.name=%s", jobName),
+						},
+					)
+					if err == nil && len(job.Items) > 0 {
+						// Handle the failure
+						c.logger.Info("Found failed RunPod instance during API check",
+							"podID", runpodInstance.ID,
+							"job", jobName,
+							"namespace", job.Items[0].Namespace,
+							"status", runpodInstance.DesiredStatus)
+
+						c.handleRunPodFailure(job.Items[0], runpodInstance.ID, runpodInstance.DesiredStatus)
+					}
+				}
+			}
 			continue
 		}
 
@@ -711,7 +761,45 @@ func (c *JobController) LoadRunning() {
 			"podID", runpodInstance.ID,
 			"name", runpodInstance.Name,
 			"namespace", namespace,
-			"jobName", jobName)
+			"jobName", jobName,
+			"status", runpodInstance.DesiredStatus)
+
+		// If the RunPod instance is in an exited state, handle it appropriately
+		if runpodInstance.DesiredStatus == "EXITED" ||
+			runpodInstance.CurrentStatus == "EXITED" {
+
+			// Check if the job exists
+			job, err := c.clientset.BatchV1().Jobs(namespace).Get(
+				context.Background(),
+				jobName,
+				metav1.GetOptions{},
+			)
+			if err != nil {
+				if k8serrors.IsNotFound(err) {
+					c.logger.Info("Job not found for failed RunPod instance, skipping",
+						"podID", runpodInstance.ID,
+						"namespace", namespace,
+						"jobName", jobName)
+					continue
+				}
+				c.logger.Error("Failed to get job for failed RunPod instance",
+					"podID", runpodInstance.ID,
+					"namespace", namespace,
+					"jobName", jobName,
+					"err", err)
+				continue
+			}
+
+			// Handle the failure
+			c.logger.Info("Found failed RunPod instance from API",
+				"podID", runpodInstance.ID,
+				"job", jobName,
+				"namespace", namespace,
+				"status", runpodInstance.DesiredStatus)
+
+			c.handleRunPodFailure(*job, runpodInstance.ID, runpodInstance.DesiredStatus)
+			continue
+		}
 
 		// Check if the job exists
 		job, err := c.clientset.BatchV1().Jobs(namespace).Get(
@@ -1825,6 +1913,200 @@ func (c *JobController) normalizeJobAnnotations(job batchv1.Job) error {
 	return nil
 }
 
+// New function to handle a RunPod instance failure
+func (c *JobController) handleRunPodFailure(job batchv1.Job, podID string, reason string) error {
+	c.logger.Info("Handling RunPod instance failure",
+		"job", job.Name,
+		"namespace", job.Namespace,
+		"podID", podID,
+		"reason", reason)
+
+	// Step 1: Clean up the virtual pod if it exists
+	podName := fmt.Sprintf("runpod-%s", podID)
+	if err := c.ForceDeletePod(job.Namespace, podName); err != nil {
+		if !k8serrors.IsNotFound(err) {
+			c.logger.Error("Failed to cleanup virtual pod during failure handling",
+				"pod", podName,
+				"namespace", job.Namespace,
+				"err", err)
+		}
+	}
+
+	// Step 2: Get the current job to ensure we have the latest version
+	currentJob, err := c.clientset.BatchV1().Jobs(job.Namespace).Get(
+		context.Background(),
+		job.Name,
+		metav1.GetOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("failed to get current job state: %w", err)
+	}
+
+	// Step 3: Update job status to increment the failure counter
+	// Make a deep copy to avoid modifying the cache
+	jobCopy := currentJob.DeepCopy()
+
+	// Increment the failure counter in both status and annotations for tracking
+	jobCopy.Status.Failed++
+
+	if jobCopy.Annotations == nil {
+		jobCopy.Annotations = make(map[string]string)
+	}
+
+	// Track failure count in annotations too for visibility
+	failCount := 1
+	if countStr, exists := jobCopy.Annotations[RunpodFailureAnnotation]; exists {
+		if count, err := strconv.Atoi(countStr); err == nil {
+			failCount = count + 1
+		}
+	}
+	jobCopy.Annotations[RunpodFailureAnnotation] = strconv.Itoa(failCount)
+
+	// Remove RunPod annotations to reset the offload state
+	delete(jobCopy.Annotations, RunpodOffloadedAnnotation)
+	delete(jobCopy.Annotations, RunpodPodIDAnnotation)
+
+	// Update both the job and its status
+	if err := c.UpdateJobWithRetry(jobCopy); err != nil {
+		return fmt.Errorf("failed to update job annotations: %w", err)
+	}
+
+	// Update job status separately
+	_, err = c.clientset.BatchV1().Jobs(jobCopy.Namespace).UpdateStatus(
+		context.Background(),
+		jobCopy,
+		metav1.UpdateOptions{},
+	)
+	if err != nil {
+		c.logger.Error("Failed to update job status for failure",
+			"job", jobCopy.Name,
+			"namespace", jobCopy.Namespace,
+			"err", err)
+		return fmt.Errorf("failed to update job status: %w", err)
+	}
+
+	// Create a failed pod to represent the RunPod failure
+	err = c.createFailedPod(jobCopy, podID, reason)
+	if err != nil {
+		c.logger.Error("Failed to create failed pod record",
+			"job", jobCopy.Name,
+			"namespace", jobCopy.Namespace,
+			"err", err)
+		// Continue execution even if this fails
+	}
+
+	c.logger.Info("Successfully updated job to reflect RunPod failure",
+		"job", jobCopy.Name,
+		"namespace", jobCopy.Namespace,
+		"failureCount", jobCopy.Status.Failed)
+
+	return nil
+}
+
+// Helper function to create a failed pod to properly record the failure
+func (c *JobController) createFailedPod(job *batchv1.Job, runpodID string, reason string) error {
+	// Get a unique identifier for this pod
+	uid := fmt.Sprintf("%d", time.Now().UnixNano())
+	uid = uid[len(uid)-8:] // Just use last 8 digits
+
+	// Use a consistent naming scheme for the failed pod
+	podName := fmt.Sprintf("runpod-failed-%s-%s", runpodID, uid)
+
+	// Create labels to link Pod to Job
+	podLabels := make(map[string]string)
+	for k, v := range job.Labels {
+		podLabels[k] = v
+	}
+	podLabels["job-name"] = job.Name
+	podLabels[RunpodManagedLabel] = "true"
+	podLabels[RunpodPodIDAnnotation] = runpodID
+
+	// Create annotations for the Pod
+	podAnnotations := make(map[string]string)
+	podAnnotations[RunpodPodIDAnnotation] = runpodID
+	podAnnotations["runpod.io/failure-reason"] = reason
+	podAnnotations["runpod.io/job-name"] = job.Name
+
+	// Add owner references
+	ownerReferences := []metav1.OwnerReference{
+		{
+			APIVersion: "batch/v1",
+			Kind:       "Job",
+			Name:       job.Name,
+			UID:        job.UID,
+			Controller: boolPtr(true),
+		},
+	}
+
+	// Get image name from job
+	var imageName string
+	if len(job.Spec.Template.Spec.Containers) > 0 {
+		imageName = job.Spec.Template.Spec.Containers[0].Image
+	} else {
+		imageName = "placeholder:latest"
+	}
+
+	// Extract error code from reason string
+	exitCode := 1 // Default exit code for failures
+	if strings.Contains(reason, "exitCode=") {
+		// Try to parse the exit code
+		parts := strings.Split(reason, "exitCode=")
+		if len(parts) > 1 {
+			exitCodeStr := strings.Split(parts[1], ",")[0]
+			if parsedCode, err := strconv.Atoi(exitCodeStr); err == nil && parsedCode > 0 {
+				exitCode = parsedCode
+			}
+		}
+	}
+
+	// Create a failed Pod to represent the RunPod failure
+	failedPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            podName,
+			Namespace:       job.Namespace,
+			Labels:          podLabels,
+			Annotations:     podAnnotations,
+			OwnerReferences: ownerReferences,
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:    "runpod-failed",
+					Image:   imageName,
+					Command: []string{"/bin/sh", "-c", fmt.Sprintf("echo 'RunPod instance failed'; exit %d", exitCode)},
+				},
+			},
+			RestartPolicy: "Never",
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodFailed,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: "runpod-failed",
+					State: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{
+							ExitCode:   int32(exitCode),
+							Reason:     "RunPodFailed",
+							Message:    fmt.Sprintf("RunPod instance %s failed: %s", runpodID, reason),
+							FinishedAt: metav1.Now(),
+						},
+					},
+					Ready: false,
+				},
+			},
+		},
+	}
+
+	// Create the Pod
+	_, err := c.clientset.CoreV1().Pods(job.Namespace).Create(
+		context.Background(),
+		failedPod,
+		metav1.CreateOptions{},
+	)
+
+	return err
+}
+
 // verifyRunPodInstance checks if a RunPod instance still exists and is valid
 func (c *JobController) verifyRunPodInstance(job batchv1.Job) error {
 	podID := job.Annotations[RunpodPodIDAnnotation]
@@ -1840,7 +2122,19 @@ func (c *JobController) verifyRunPodInstance(job batchv1.Job) error {
 			"podID", podID,
 			"error", err)
 
-		// Reset state for any API error - better to reset and retry than leave in inconsistent state
+		// Check if this is a permanent error that should count as a job failure
+		if strings.Contains(err.Error(), "not found") ||
+			strings.Contains(err.Error(), "404") {
+			// Instance doesn't exist anymore - could have failed or been terminated externally
+			c.logger.Info("RunPod instance not found, treating as failure",
+				"job", job.Name,
+				"namespace", job.Namespace,
+				"podID", podID)
+
+			return c.handleRunPodFailure(job, podID, "Instance not found")
+		}
+
+		// For other API errors, reset the job state to allow retrying
 		c.logger.Info("RunPod API error, resetting job state",
 			"job", job.Name,
 			"namespace", job.Namespace,
@@ -1859,23 +2153,15 @@ func (c *JobController) verifyRunPodInstance(job batchv1.Job) error {
 		return c.resetJobOffloadState(job)
 	}
 
-	if status == PodNotFound || status == PodTerminated {
-		c.logger.Info("RunPod instance not found or terminated, resetting job state",
+	// Check for failure status in RunPod
+	if status == PodExited || status == PodNotFound || status == PodTerminated {
+		c.logger.Info("RunPod instance in failure state, handling as job failure",
 			"job", job.Name,
 			"namespace", job.Namespace,
 			"podID", podID,
 			"status", status)
 
-		// Clean up the virtual pod if it exists
-		podName := fmt.Sprintf("runpod-%s", podID)
-		if err := c.ForceDeletePod(job.Namespace, podName); err != nil {
-			c.logger.Error("Failed to cleanup virtual pod during reset",
-				"pod", podName,
-				"namespace", job.Namespace,
-				"err", err)
-		}
-
-		return c.resetJobOffloadState(job)
+		return c.handleRunPodFailure(job, podID, string(status))
 	}
 
 	// Instance exists, but let's ensure there are no lingering pending pods
@@ -1896,6 +2182,7 @@ func (c *JobController) verifyRunPodInstance(job batchv1.Job) error {
 }
 
 // Reconcile checks for jobs that need to be offloaded to RunPod
+// Update Reconcile method to check for failed RunPod instances
 func (c *JobController) Reconcile() error {
 	// List all jobs with the runpod.io/managed label
 	jobs, err := c.clientset.BatchV1().Jobs("").List(context.Background(), metav1.ListOptions{})
@@ -1908,7 +2195,7 @@ func (c *JobController) Reconcile() error {
 
 	for _, job := range jobs.Items {
 		// Skip jobs that don't have the runpod.io/managed label
-		if !IsRunPodJob(job) {
+		if _, hasLabel := job.Labels[RunpodManagedLabel]; !hasLabel {
 			continue
 		}
 
@@ -1946,7 +2233,7 @@ func (c *JobController) Reconcile() error {
 			continue
 
 		case "OFFLOADED":
-			// Verify that the RunPod instance still exists
+			// Verify that the RunPod instance still exists and is healthy
 			if err := c.verifyRunPodInstance(job); err != nil {
 				c.logger.Error("Failed to verify RunPod instance",
 					"job", job.Name,
@@ -1970,10 +2257,45 @@ func (c *JobController) Reconcile() error {
 		if isPending {
 			pendingCount++
 
+			// Check if job is in a failure state or has a retry annotation
+			retryAfter, hasRetryAfter := job.Annotations[RunpodRetryAnnotation]
+			if hasRetryAfter {
+				retryTime, err := time.Parse(time.RFC3339, retryAfter)
+				if err != nil || time.Now().Before(retryTime) {
+					// Skip this job until retry time has passed
+					c.logger.Info("Skipping job with retry annotation until time passes",
+						"job", job.Name,
+						"namespace", job.Namespace,
+						"retryAfter", retryAfter)
+					continue
+				}
+
+				// Retry time has passed, remove the annotation and process normally
+				jobCopy := job.DeepCopy()
+				delete(jobCopy.Annotations, RunpodRetryAnnotation)
+				if err := c.UpdateJobWithRetry(jobCopy); err != nil {
+					c.logger.Error("Failed to remove retry annotation",
+						"job", job.Name,
+						"namespace", job.Namespace,
+						"err", err)
+					continue
+				}
+			}
+
 			// Check if the job already has pods running or scheduled on cluster nodes
 			hasNonPendingPods, err := c.HasRunningOrScheduledPods(job)
 			if err != nil {
 				c.logger.Error("Failed to check if job has running pods", "job", job.Name, "err", err)
+				continue
+			}
+
+			// Check if job has already reached the backoffLimit
+			if job.Spec.BackoffLimit != nil && job.Status.Failed >= *job.Spec.BackoffLimit {
+				c.logger.Info("Job has reached backoffLimit, not offloading",
+					"job", job.Name,
+					"namespace", job.Namespace,
+					"failed", job.Status.Failed,
+					"backoffLimit", *job.Spec.BackoffLimit)
 				continue
 			}
 
