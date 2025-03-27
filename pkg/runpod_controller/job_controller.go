@@ -1198,48 +1198,134 @@ func (c *JobController) HasRunningOrScheduledPods(job batchv1.Job) (bool, error)
 }
 
 // ExtractEnvVars extracts environment variables from the Kubernetes job
+// ExtractEnvVars extracts environment variables from the Kubernetes job
 func (c *JobController) ExtractEnvVars(job batchv1.Job) ([]RunPodEnv, error) {
 	var envVars []RunPodEnv
+	var secretsToFetch = make(map[string]bool)
+	var secretEnvVars = make(map[string][]struct {
+		SecretKey string
+		EnvKey    string
+	})
+	var secretRefEnvs = make(map[string]bool)
 
-	// Extract all environment variables from the job containers
+	// First pass: collect all secrets we need to fetch
 	if len(job.Spec.Template.Spec.Containers) > 0 {
 		container := job.Spec.Template.Spec.Containers[0]
+
+		// Add regular environment variables
 		for _, env := range container.Env {
-			// Add the environment variable
-			envVars = append(envVars, RunPodEnv{
-				Key:   env.Name,
-				Value: env.Value,
-			})
+			// If this is a regular env var, add it directly
+			if env.Value != "" {
+				envVars = append(envVars, RunPodEnv{
+					Key:   env.Name,
+					Value: env.Value,
+				})
+			} else if env.ValueFrom != nil && env.ValueFrom.SecretKeyRef != nil {
+				// This is a secret reference, track it for fetching
+				secretName := env.ValueFrom.SecretKeyRef.Name
+				secretsToFetch[secretName] = true
+
+				if _, ok := secretEnvVars[secretName]; !ok {
+					secretEnvVars[secretName] = []struct {
+						SecretKey string
+						EnvKey    string
+					}{}
+				}
+
+				// Store the mapping between secret key and env var name
+				secretEnvVars[secretName] = append(secretEnvVars[secretName], struct {
+					SecretKey string
+					EnvKey    string
+				}{
+					SecretKey: env.ValueFrom.SecretKeyRef.Key,
+					EnvKey:    env.Name,
+				})
+			}
+		}
+
+		// Handle envFrom references
+		for _, envFrom := range container.EnvFrom {
+			if envFrom.SecretRef != nil {
+				secretName := envFrom.SecretRef.Name
+				secretsToFetch[secretName] = true
+				secretRefEnvs[secretName] = true
+			}
 		}
 	}
 
-	// Handle environment variables from secrets that should be included
+	// Also check for secrets mounted as volumes that should be included as env vars
 	for _, volume := range job.Spec.Template.Spec.Volumes {
 		if volume.Secret != nil {
-			// Get the secret
-			secret, err := c.clientset.CoreV1().Secrets(job.Namespace).Get(
-				context.Background(),
-				volume.Secret.SecretName,
-				metav1.GetOptions{},
-			)
-			if err != nil {
-				c.logger.Error("failed to get secret",
-					"namespace", job.Namespace,
-					"secret", volume.Secret.SecretName, "err", err)
-				continue
-			}
+			secretName := volume.Secret.SecretName
+			secretsToFetch[secretName] = true
 
-			// Check if this secret should be included as environment variables
+			// For volume mounts with specific items
 			if items := volume.Secret.Items; len(items) > 0 {
-				for _, item := range items {
-					if secretValue, ok := secret.Data[item.Key]; ok {
-						// Add it as an environment variable
-						envVars = append(envVars, RunPodEnv{
-							Key:   item.Key,
-							Value: strings.ReplaceAll(string(secretValue), "\n", "\\n"),
-						})
-					}
+				if _, ok := secretEnvVars[secretName]; !ok {
+					secretEnvVars[secretName] = []struct {
+						SecretKey string
+						EnvKey    string
+					}{}
 				}
+
+				for _, item := range items {
+					// When mounted as a volume item, use the path as env var name if not specified
+					envKey := item.Path
+					if envKey == "" {
+						envKey = item.Key
+					}
+
+					secretEnvVars[secretName] = append(secretEnvVars[secretName], struct {
+						SecretKey string
+						EnvKey    string
+					}{
+						SecretKey: item.Key,
+						EnvKey:    envKey,
+					})
+				}
+			}
+		}
+	}
+
+	// Second pass: fetch all needed secrets and extract values
+	for secretName := range secretsToFetch {
+		secret, err := c.clientset.CoreV1().Secrets(job.Namespace).Get(
+			context.Background(),
+			secretName,
+			metav1.GetOptions{},
+		)
+		if err != nil {
+			c.logger.Error("failed to get secret",
+				"namespace", job.Namespace,
+				"secret", secretName, "err", err)
+			continue
+		}
+
+		// Handle specific secret keys mapped to env vars
+		if mappings, ok := secretEnvVars[secretName]; ok {
+			for _, mapping := range mappings {
+				if secretValue, ok := secret.Data[mapping.SecretKey]; ok {
+					// Add it as an environment variable with the correct name
+					envVars = append(envVars, RunPodEnv{
+						Key:   mapping.EnvKey,
+						Value: strings.ReplaceAll(string(secretValue), "\n", "\\n"),
+					})
+				} else {
+					c.logger.Warn("Secret key not found",
+						"namespace", job.Namespace,
+						"secret", secretName,
+						"key", mapping.SecretKey)
+				}
+			}
+		}
+
+		// Handle envFrom that should import all keys from the secret
+		if secretRefEnvs[secretName] {
+			for key, value := range secret.Data {
+				envVars = append(envVars, RunPodEnv{
+					Key:   key,
+					Value: strings.ReplaceAll(string(value), "\n", "\\n"),
+				})
 			}
 		}
 	}
