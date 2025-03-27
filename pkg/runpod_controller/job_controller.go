@@ -25,17 +25,16 @@ import (
 
 // Constants for RunPod integration
 const (
-	RunpodManagedAnnotation               = "runpod.io/managed"
 	RunpodOffloadAnnotation               = "runpod.io/offload"
 	RunpodOffloadedAnnotation             = "runpod.io/offloaded"
 	RunpodPodIDAnnotation                 = "runpod.io/pod-id"
 	RunpodCostAnnotation                  = "runpod.io/cost-per-hr"
-	RunpodManagedLabel                    = "runpod.io/managed"
 	RunpodRetryAnnotation                 = "runpod.io/retry-after"
 	RunpodCloudTypeAnnotation             = "runpod.io/cloud-type"
 	RunpodTemplateIdAnnotation            = "runpod.io/templateId"
 	GpuMemoryAnnotation                   = "runpod.io/required-gpu-memory"
 	RunpodContainerRegistryAuthAnnotation = "runpod.io/container-registry-auth-id"
+	RunpodManagedLabel                    = "runpod.io/managed"
 
 	// DefaultMaxPrice for GPU
 	DefaultMaxPrice = 0.5
@@ -672,7 +671,7 @@ func (c *JobController) LoadRunning() {
 	existingPods, err := c.clientset.CoreV1().Pods("").List(
 		context.Background(),
 		metav1.ListOptions{
-			LabelSelector: "runpod.io/managed=true",
+			LabelSelector: RunpodManagedLabel + "=true",
 		},
 	)
 	if err != nil {
@@ -922,18 +921,6 @@ func (c *JobController) ForceDeletePod(namespace, name string) error {
 	return nil
 }
 
-// IsRunPodJob checks if a job should be managed by RunPod
-func IsRunPodJob(job batchv1.Job) bool {
-	_, hasRunPodAnnotation := job.Annotations[RunpodManagedAnnotation]
-	return hasRunPodAnnotation
-}
-
-// HasRunPodLabel checks if a job has the RunPod managed label
-func HasRunPodLabel(job batchv1.Job) bool {
-	_, hasLabel := job.Labels[RunpodManagedLabel]
-	return hasLabel
-}
-
 // IsPending checks if a job is in a pending state
 func IsPending(job batchv1.Job, clientset *kubernetes.Clientset) (bool, error) {
 	// Check if the job is still actively running but hasn't completed yet
@@ -1041,7 +1028,7 @@ func (c *JobController) HasRunningOrScheduledPods(job batchv1.Job) (bool, error)
 
 	for _, pod := range pods.Items {
 		// Skip pods that are managed by RunPod
-		if _, isRunPodManaged := pod.Labels[RunpodManagedLabel]; isRunPodManaged {
+		if _, hasLabel := pod.Labels[RunpodManagedLabel]; hasLabel {
 			continue
 		}
 
@@ -1544,13 +1531,11 @@ func (c *JobController) CleanupPod(namespace, jobName, runpodID string) error {
 // CleanupTerminatingPods checks for pods in Terminating state on the RunPod virtual node
 // and ensures they are properly terminated both in K8s and on RunPod
 func (c *JobController) CleanupTerminatingPods() error {
-	c.logger.Info("Checking for terminating pods on RunPod virtual node")
-
 	// Check for any pods that might be terminating but stuck
 	allPods, err := c.clientset.CoreV1().Pods("").List(
 		context.Background(),
 		metav1.ListOptions{
-			LabelSelector: "runpod.io/managed=true",
+			LabelSelector: RunpodManagedLabel + "=true",
 		},
 	)
 	if err != nil {
@@ -1583,7 +1568,7 @@ func shouldForceDeleteTerminatingPod(pod corev1.Pod) bool {
 	return terminatingDuration > forceDeletionThreshold
 }
 
-// handleTerminatingPod processes a single terminating pod
+// handleTerminatingPod processes a single terminating k8s pod
 func (c *JobController) handleTerminatingPod(pod corev1.Pod) {
 	deletionTime := pod.DeletionTimestamp.Time
 	terminatingDuration := time.Since(deletionTime)
@@ -1596,7 +1581,7 @@ func (c *JobController) handleTerminatingPod(pod corev1.Pod) {
 
 	// If pod has been terminating for more than 15 minutes, force delete it
 	if shouldForceDeleteTerminatingPod(pod) {
-		c.logger.Info("Pod has been terminating for too long, force deleting",
+		c.logger.Info("k8s Pod has been terminating for too long, force deleting",
 			"pod", pod.Name,
 			"namespace", pod.Namespace,
 			"terminatingFor", terminatingDuration.String())
@@ -1700,7 +1685,7 @@ func (c *JobController) CleanupDeletedJobs() error {
 	currentJobs, err := c.clientset.BatchV1().Jobs("").List(
 		context.Background(),
 		metav1.ListOptions{
-			LabelSelector: "runpod.io/managed=true",
+			LabelSelector: RunpodManagedLabel + "=true",
 		},
 	)
 	if err != nil {
@@ -1912,7 +1897,7 @@ func (c *JobController) verifyRunPodInstance(job batchv1.Job) error {
 
 // Reconcile checks for jobs that need to be offloaded to RunPod
 func (c *JobController) Reconcile() error {
-	// List all jobs with the runpod.io/managed annotation
+	// List all jobs with the runpod.io/managed label
 	jobs, err := c.clientset.BatchV1().Jobs("").List(context.Background(), metav1.ListOptions{})
 	if err != nil {
 		return err
@@ -1922,7 +1907,7 @@ func (c *JobController) Reconcile() error {
 	activeJobs := make(map[string]bool)
 
 	for _, job := range jobs.Items {
-		// Skip jobs that don't have the runpod.io/managed annotation
+		// Skip jobs that don't have the runpod.io/managed label
 		if !IsRunPodJob(job) {
 			continue
 		}
@@ -1940,7 +1925,7 @@ func (c *JobController) Reconcile() error {
 		}
 
 		// Check if job needs labeling
-		if !HasRunPodLabel(job) {
+		if _, hasLabel := job.Labels[RunpodManagedLabel]; !hasLabel {
 			if err := c.LabelAsRunPodJob(&job); err != nil {
 				c.logger.Error("Failed to label RunPod job", "job", job.Name, "err", err)
 				continue

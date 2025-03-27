@@ -9,7 +9,7 @@ The controller enables cost-efficient hybrid scaling between your local GPU reso
 ### How It Works
 Install the controller, add your runpod token and annotate your jobs to offload dynamically.
 
-1. **Resource Annotation**: Jobs that can be burst to RunPod must be annotated with `runpod.io/managed: "true"`.
+1. **Resource Annotation**: Jobs that can be burst to RunPod must be labeled with `runpod.io/managed: "true"`.
 
 2. **Automatic Bursting**: The controller will automatically offload jobs to RunPod when either:
    - Jobs have been pending for more than [configurable seconds](#configuration) (default 0)
@@ -84,10 +84,12 @@ I also found that `COMMUNITY` GPU types are never available via the api.
 
 To use the controller, annotate your GPU Jobs with these annotations:
 
-- `runpod.io/managed: "true"`: Indicates that this job can be managed by the controller
 - `runpod.io/required-gpu-memory: "16"`: Specify minimum GPU memory required (in GB)
 - `runpod.io/templateId`: specify a template at runpod and use this id.
 
+Label:
+- `runpod.io/managed: "true"`: Indicates that this job can be managed by the controller
+- 
 Optional:
 - `runpod.io/offload: "true"`: Explicitly request offloading to RunPod
 - `runpod.io/cloud-type`: Specify cloud type, either "SECURE" or "COMMUNITY" (default is "SECURE")
@@ -102,8 +104,9 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: my-gpu-job
-  annotations:
+  labels:
     runpod.io/managed: "true"
+  annotations:
     runpod.io/offload: "true"
     runpod.io/required-gpu-memory: "16"
     runpod.io/templateId: "yourid"
