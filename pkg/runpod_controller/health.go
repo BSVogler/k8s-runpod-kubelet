@@ -1,4 +1,4 @@
-package controller
+package runpod
 
 import (
 	"context"
