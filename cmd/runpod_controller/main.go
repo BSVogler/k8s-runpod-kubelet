@@ -7,7 +7,11 @@ import (
 	runpod "github.com/bsvogler/k8s-runpod-controller/pkg/runpod_controller"
 	"github.com/getsentry/sentry-go"
 	sentryslog "github.com/getsentry/sentry-go/slog"
+	"io"
 	"io/ioutil"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/tools/cache"
 	"log"
 	"log/slog"
 	"net/http"
@@ -21,9 +25,14 @@ import (
 	"github.com/virtual-kubelet/virtual-kubelet/node"
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	"gopkg.in/yaml.v2"
+	corev1 "k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/record"
 )
 
 var (
@@ -153,11 +162,53 @@ func main() {
 		logger.Error("Failed to create RunPod provider", "error", err)
 		os.Exit(1)
 	}
+	eventBroadcaster := record.NewBroadcaster()
+	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{
+		Interface: k8sClient.CoreV1().Events(kubenamespace),
+	})
+	eventRecorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: nodeName})
 
-	// Create pod controller
+	// Create informer factory for the default namespace or specified namespace
+	informerFactory := informers.NewSharedInformerFactoryWithOptions(
+		k8sClient,
+		30*time.Second, // Resync period
+		informers.WithNamespace(kubenamespace),
+	)
+
+	// Create pod informer
+	podInformer := informerFactory.Core().V1().Pods()
+
+	// Start the informer factory
+	informerFactory.Start(ctx.Done())
+
+	// Wait for caches to sync
+	syncCtx, syncCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer syncCancel()
+
+	_, err = k8sClient.CoreV1().Namespaces().Get(ctx, "default", metav1.GetOptions{})
+	if err != nil {
+		logger.Error("Failed to connect to Kubernetes API", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("Successfully connected to Kubernetes API")
+
+	// Wait for caches to sync with a timeout
+	logger.Info("Waiting for informer caches to sync")
+	if !cache.WaitForCacheSync(syncCtx.Done(), podInformer.Informer().HasSynced) {
+		logger.Error("Failed to sync pod informer cache within timeout")
+		// Consider continuing anyway or exiting
+		// os.Exit(1)
+
+		// For debugging, log a warning but continue
+		logger.Warn("Continuing without fully synced cache")
+	} else {
+		logger.Info("Informer caches synced successfully")
+	}
+
+	// Create pod controller with the informer
 	podController, err := node.NewPodController(node.PodControllerConfig{
 		PodClient:                         k8sClient.CoreV1(),
-		PodInformer:                       nil, // Pod informer is optional
+		PodInformer:                       podInformer,
 		Provider:                          provider,
 		EventRecorder:                     eventRecorder,
 		SyncPodsFromKubernetesRateLimiter: nil, // Optional rate limiter
@@ -179,18 +230,57 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Create a minimal API server with just the pod handler
-	mux := http.NewServeMux()
-
 	// Set up basic handlers
-	podHandler := api.AttachIO(provider)
-	mux.Handle("/", podHandler)
+	podHandlerConfig := api.PodHandlerConfig{
+		RunInContainer: func(ctx context.Context, namespace, podName, containerName string, cmd []string, attach api.AttachIO) error {
+			return fmt.Errorf("running commands in container is not supported by RunPod")
+		},
+		GetContainerLogs: func(ctx context.Context, namespace, podName, containerName string, opts api.ContainerLogOpts) (io.ReadCloser, error) {
+			return nil, fmt.Errorf("container logs not supported by RunPod")
+		},
+		GetPods: func(ctx context.Context) ([]*v1.Pod, error) {
+			return provider.GetPods(ctx)
+		},
+		GetPodsFromKubernetes: func(ctx context.Context) ([]*v1.Pod, error) {
+			return provider.GetPods(ctx)
+		},
+		// These are optional - implement if needed
+		//GetStatsSummary: nil,
+		//GetMetricsResource: nil,
+		//StreamIdleTimeout: 30 * time.Second,
+		//StreamCreationTimeout: 15 * time.Second,
+	}
+
+	// Create HTTP server
+	mux := http.NewServeMux()
+	// Attach pod routes to the mux
+	api.AttachPodRoutes(podHandlerConfig, mux, false) // Set debug to false for production
 
 	// Create HTTP server
 	apiServer := &http.Server{
 		Addr:    fmt.Sprintf("%s:%d", internalIP, listenPort),
 		Handler: mux,
 	}
+	healthServer := runpod.NewHealthServer(
+		healthServerAddress, // Using the flag value you already defined
+		func() bool {
+			// This is the readiness check function
+			// Return true if the provider is ready to accept pods
+			return provider.Ping(context.Background()) == nil
+		},
+	)
+
+	// Start the health check server
+	logger.Info("Starting health check server", "address", healthServerAddress)
+	healthServer.Start()
+
+	// Ensure shutdown on context cancellation
+	go func() {
+		<-ctx.Done()
+		if err := healthServer.Stop(); err != nil {
+			logger.Error("Health server shutdown error", "error", err)
+		}
+	}()
 
 	// Start controllers and API server
 	go func() {

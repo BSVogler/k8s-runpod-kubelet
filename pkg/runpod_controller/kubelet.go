@@ -4,19 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/bsvogler/k8s-runpod-controller/pkg/config"
+	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	"io"
+	v1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/bsvogler/k8s-runpod-controller/pkg/config"
-	v1 "k8s.io/api/core/v1"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
 )
 
 // Provider implements the virtual-kubelet provider interface for RunPod
@@ -260,6 +260,19 @@ func (p *Provider) updatePodWithRunPodInfo(pod *v1.Pod, podID string, costPerHr 
 	}
 	p.podsMutex.Unlock()
 
+	return nil
+}
+
+// Resize implements the api.AttachIO interface for terminal resizing
+// Note: RunPod.io doesn't support terminal access, so this is a no-op implementation
+func (p *Provider) Resize(ctx context.Context, namespace, podName, containerName string, size api.TermSize) error {
+	p.logger.Debug("Resize request received but RunPod doesn't support terminal access",
+		"pod", podName,
+		"namespace", namespace,
+		"container", containerName)
+
+	// Since RunPod doesn't support terminal access, we just return nil
+	// This satisfies the interface without attempting to use unsupported functionality
 	return nil
 }
 
@@ -1131,4 +1144,46 @@ func (p *Provider) translateRunPodStatus(runpodStatus string, statusMessage stri
 	})
 
 	return podStatus
+}
+
+// RunInContainer implements the ContainerExecHandlerFunc interface
+func (p *Provider) RunInContainer(ctx context.Context, namespace, podName, containerName string, cmd []string, attach api.AttachIO) error {
+	p.logger.Info("RunInContainer called but not supported by RunPod",
+		"namespace", namespace,
+		"pod", podName,
+		"container", containerName)
+	return fmt.Errorf("running commands in container is not supported by RunPod")
+}
+
+// GetContainerLogs implements the ContainerLogsHandlerFunc interface
+func (p *Provider) GetContainerLogs(ctx context.Context, namespace, podName, containerName string, opts api.ContainerLogOpts) (io.ReadCloser, error) {
+	p.logger.Info("GetContainerLogs called",
+		"namespace", namespace,
+		"pod", podName,
+		"container", containerName)
+
+	// Get the RunPod ID from the pod
+	pod, err := p.GetPod(ctx, namespace, podName)
+	if err != nil {
+		return nil, fmt.Errorf("error getting pod for logs: %w", err)
+	}
+
+	podID := pod.Annotations[RunpodPodIDAnnotation]
+	if podID == "" {
+		return nil, fmt.Errorf("pod %s/%s has no RunPod ID annotation", namespace, podName)
+	}
+
+	// If RunPod doesn't support container logs, return an error
+	return nil, fmt.Errorf("container logs not supported by RunPod")
+
+	// If RunPod supports logs, you would implement something like:
+	/*
+	   logs, err := p.runpodClient.GetPodLogs(podID)
+	   if err != nil {
+	       return nil, fmt.Errorf("failed to get container logs: %w", err)
+	   }
+
+	   // Convert string to ReadCloser
+	   return io.NopCloser(strings.NewReader(logs)), nil
+	*/
 }
