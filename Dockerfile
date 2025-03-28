@@ -1,18 +1,22 @@
 FROM golang AS builder
 
-WORKDIR /workspace
-COPY go.mod go.mod
-COPY go.sum go.sum
+WORKDIR /app
+
+# Copy go mod and sum files
+COPY go.mod go.sum ./
+
+# Download dependencies
 RUN go mod download
 
-COPY cmd/ cmd/
-COPY pkg/ pkg/
+# Copy the source code
+COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -o runpod_controller cmd/runpod_controller/
+# Build the application
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o runpod_controller ./cmd/runpod_controller
 
 FROM gcr.io/distroless/static:nonroot
 WORKDIR /
-COPY --from=builder /workspace/runpod_controller .
+COPY --from=builder /app/runpod_controller .
 USER 65532:65532
 
 ENTRYPOINT ["/runpod_controller"]
