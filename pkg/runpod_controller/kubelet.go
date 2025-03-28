@@ -828,7 +828,6 @@ func (p *Provider) CreateVirtualPod(runpodInstance RunPodInstance) error {
 
 	// Create labels to link Pod to Job
 	podLabels := make(map[string]string)
-	podLabels[RunpodManagedLabel] = "true"
 	podLabels[RunpodPodIDAnnotation] = runpodInstance.ID
 
 	// Create annotations for the Pod
@@ -934,11 +933,11 @@ func (p *Provider) fetchRunPodInstancesByStatus(status string) ([]RunPodInstance
 
 // mapExistingRunPodInstances maps existing RunPod instances in the cluster
 func (p *Provider) mapExistingRunPodInstances() map[string]RunPodInfo {
-	// Get existing pods in the cluster
+	// Get existing pods in the cluster assigned to this virtual node
 	existingPods, err := p.clientset.CoreV1().Pods("").List(
 		context.Background(),
 		metav1.ListOptions{
-			LabelSelector: RunpodManagedLabel + "=true",
+			FieldSelector: fmt.Sprintf("spec.nodeName=%s", p.nodeName),
 		},
 	)
 	if err != nil {
