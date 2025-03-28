@@ -8,7 +8,7 @@ RUN go mod download
 COPY cmd/ cmd/
 COPY pkg/ pkg/
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -o runpod_controller cmd/runpod_controller/main.go
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -o runpod_controller cmd/runpod_controller/
 
 FROM gcr.io/distroless/static:nonroot
 WORKDIR /
