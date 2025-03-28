@@ -404,7 +404,7 @@ func (c *RunPodClient) GetGPUTypes(minRAMPerGPU int, maxPrice float64, cloudType
 }
 
 func (c *RunPodClient) DeployPodREST(params map[string]interface{}) (string, float64, error) {
-	//https://rest.runpod.io/v1/docs#tag/pods/POST/pods
+	// https://rest.runpod.io/v1/docs#tag/pods/POST/pods
 	reqBody, err := json.Marshal(params)
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to marshal request: %w", err)
@@ -427,7 +427,7 @@ func (c *RunPodClient) DeployPodREST(params map[string]interface{}) (string, flo
 
 	var response struct {
 		ID            string `json:"id"`
-		CostPerHr     string `json:"costPerHr"` // Change to string to match JSON
+		CostPerHr     string `json:"costPerHr"` // JSON returns this as a string
 		MachineID     string `json:"machineId"`
 		Name          string `json:"name"`
 		DesiredStatus string `json:"desiredStatus"`
@@ -449,15 +449,22 @@ func (c *RunPodClient) DeployPodREST(params map[string]interface{}) (string, flo
 		return "", 0, fmt.Errorf("pod deployment failed: %s", string(body))
 	}
 
+	// Convert CostPerHr to float64
+	costPerHr, err := strconv.ParseFloat(response.CostPerHr, 64)
+	if err != nil {
+		c.logger.Error("Failed to convert CostPerHr to float64", "costPerHr", response.CostPerHr, "err", err)
+		return "", 0, fmt.Errorf("invalid costPerHr value: %s", response.CostPerHr)
+	}
+
 	c.logger.Info("Pod deployed successfully",
 		"podId", response.ID,
-		"costPerHr", response.CostPerHr,
+		"costPerHr", costPerHr,
 		"machineId", response.MachineID,
 		"gpuType", response.Machine.GpuTypeID,
 		"location", response.Machine.Location,
 		"dataCenter", response.Machine.DataCenterID)
 
-	return response.ID, response.CostPerHr, nil
+	return response.ID, costPerHr, nil
 }
 
 // DeployPod deploys a pod to RunPod
