@@ -8,7 +8,6 @@ import (
 	"github.com/getsentry/sentry-go"
 	sentryslog "github.com/getsentry/sentry-go/slog"
 	"io"
-	"io/ioutil"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/tools/cache"
@@ -56,20 +55,20 @@ func init() {
 	flag.IntVar(&reconcileInterval, "reconcile-interval", 30, "Reconcile interval in seconds")
 	flag.Float64Var(&maxGPUPrice, "max-gpu-price", 0.5, "Maximum price per hour for GPU instances")
 	flag.StringVar(&healthServerAddress, "health-server-address", ":8080", "Address for the health check server to listen on")
-	flag.StringVar(&nodeName, "nodename", os.Getenv("NODENAME"), "kubernetes node name")
+	flag.StringVar(&nodeName, "nodename", "virtual-runpod", "kubernetes node name")
 	flag.StringVar(&operatingSystem, "os", "Linux", "Operating system (Linux/Windows)")
 	flag.StringVar(&providerConfigPath, "provider-config", "", "path to the provider config file")
 	flag.StringVar(&internalIP, "internal-ip", "127.0.0.1", "internal IP address")
 	flag.IntVar(&listenPort, "listen-port", 10250, "port to listen on")
 	flag.StringVar(&logLevel, "log-level", "info", "log level (debug, info, warn, error)")
-	flag.StringVar(&kubenamespace, "namespace", "default", "kubernetes namespace")
+	flag.StringVar(&kubenamespace, "namespace", "kube-system", "kubernetes namespace")
 }
 
 // LoadConfig loads configuration from a YAML file
 func LoadConfig(path string) (config.Config, error) {
 	var cfg config.Config
 
-	data, err := ioutil.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return cfg, fmt.Errorf("failed to read config file: %w", err)
 	}
@@ -175,9 +174,6 @@ func main() {
 		informers.WithNamespace(kubenamespace),
 	)
 
-	// Create pod informer
-	podInformer := informerFactory.Core().V1().Pods()
-
 	// Start the informer factory
 	informerFactory.Start(ctx.Done())
 
@@ -185,12 +181,18 @@ func main() {
 	syncCtx, syncCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer syncCancel()
 
-	_, err = k8sClient.CoreV1().Namespaces().Get(ctx, "default", metav1.GetOptions{})
+	_, err = k8sClient.CoreV1().Namespaces().Get(ctx, "kube-system", metav1.GetOptions{})
 	if err != nil {
 		logger.Error("Failed to connect to Kubernetes API", "error", err)
 		os.Exit(1)
 	}
 	logger.Info("Successfully connected to Kubernetes API")
+
+	// Create pod controller with the informer
+	podInformer := informerFactory.Core().V1().Pods()
+	configMapInformer := informerFactory.Core().V1().ConfigMaps()
+	secretInformer := informerFactory.Core().V1().Secrets()
+	serviceInformer := informerFactory.Core().V1().Services()
 
 	// Wait for caches to sync with a timeout
 	logger.Info("Waiting for informer caches to sync")
@@ -204,14 +206,16 @@ func main() {
 	} else {
 		logger.Info("Informer caches synced successfully")
 	}
-
-	// Create pod controller with the informer
+	// Then when creating the pod controller, include all informers:
 	podController, err := node.NewPodController(node.PodControllerConfig{
 		PodClient:                         k8sClient.CoreV1(),
 		PodInformer:                       podInformer,
+		ConfigMapInformer:                 configMapInformer,
+		SecretInformer:                    secretInformer,
+		ServiceInformer:                   serviceInformer,
 		Provider:                          provider,
 		EventRecorder:                     eventRecorder,
-		SyncPodsFromKubernetesRateLimiter: nil, // Optional rate limiter
+		SyncPodsFromKubernetesRateLimiter: nil,
 	})
 	if err != nil {
 		logger.Error("Failed to create pod controller", "error", err)

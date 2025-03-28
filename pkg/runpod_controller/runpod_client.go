@@ -138,8 +138,8 @@ func NewRunPodClient(logger *slog.Logger, clientset *kubernetes.Clientset) *Clie
 	return &Client{
 		httpClient:     &http.Client{Timeout: DefaultAPITimeout},
 		apiKey:         apiKey,
-		baseGraphqlURL: "https://api.io/graphql",
-		baseRESTURL:    "https://rest.io/v1/",
+		baseGraphqlURL: "https://apirunpod.io/graphql",
+		baseRESTURL:    "https://rest.runpod.io/v1/",
 		logger:         logger,
 		clientset:      clientset, // Store the clientset
 	}

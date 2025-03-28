@@ -1,0 +1,40 @@
+---
+# ClusterRole with permissions needed by virtual-kubelet
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: virtual-kubelet
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes", "nodes/status", "namespaces", "configmaps", "secrets"]
+    verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods/status"]
+    verbs: ["update", "patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+---
+# ServiceAccount for the virtual kubelet to use
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: virtual-kubelet
+  namespace: kube-system  # Change this if needed
+---
+# ClusterRoleBinding to grant the ServiceAccount the required permissions
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: virtual-kubelet
+subjects:
+  - kind: ServiceAccount
+    name: virtual-kubelet
+    namespace: kube-system  # Change this if needed
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: virtual-kubelet
