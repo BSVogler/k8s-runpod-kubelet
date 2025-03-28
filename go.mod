@@ -52,6 +52,7 @@ require (
 require (
 	github.com/pingcap/errors v0.11.4
 	github.com/virtual-kubelet/virtual-kubelet v1.9.0
+	gopkg.in/yaml.v2 v2.4.0
 )
 
 require (

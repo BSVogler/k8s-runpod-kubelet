@@ -7,8 +7,10 @@ import (
 	runpod "github.com/bsvogler/k8s-runpod-controller/pkg/runpod_controller"
 	"github.com/getsentry/sentry-go"
 	sentryslog "github.com/getsentry/sentry-go/slog"
+	"io/ioutil"
 	"log"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -18,6 +20,7 @@ import (
 	"github.com/bsvogler/k8s-runpod-controller/pkg/config"
 	"github.com/virtual-kubelet/virtual-kubelet/node"
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
+	"gopkg.in/yaml.v2"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -34,7 +37,10 @@ var (
 	reconcileInterval   int
 	maxGPUPrice         float64
 	healthServerAddress string
+	kubenamespace       string
 )
+
+// Log handlers are defined in a separate file
 
 func init() {
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig file")
@@ -43,11 +49,28 @@ func init() {
 	flag.StringVar(&healthServerAddress, "health-server-address", ":8080", "Address for the health check server to listen on")
 	flag.StringVar(&nodeName, "nodename", os.Getenv("NODENAME"), "kubernetes node name")
 	flag.StringVar(&operatingSystem, "os", "Linux", "Operating system (Linux/Windows)")
-	flag.StringVar(&kubeconfig, "kubeconfig", "", "kubeconfig file")
 	flag.StringVar(&providerConfigPath, "provider-config", "", "path to the provider config file")
 	flag.StringVar(&internalIP, "internal-ip", "127.0.0.1", "internal IP address")
 	flag.IntVar(&listenPort, "listen-port", 10250, "port to listen on")
 	flag.StringVar(&logLevel, "log-level", "info", "log level (debug, info, warn, error)")
+	flag.StringVar(&kubenamespace, "namespace", "default", "kubernetes namespace")
+}
+
+// LoadConfig loads configuration from a YAML file
+func LoadConfig(path string) (config.Config, error) {
+	var cfg config.Config
+
+	data, err := ioutil.ReadFile(path)
+	if err != nil {
+		return cfg, fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	err = yaml.Unmarshal(data, &cfg)
+	if err != nil {
+		return cfg, fmt.Errorf("failed to parse config file: %w", err)
+	}
+
+	return cfg, nil
 }
 
 func main() {
@@ -101,7 +124,7 @@ func main() {
 	var providerConfig config.Config
 	if providerConfigPath != "" {
 		var err error
-		providerConfig, err = config.LoadConfig(providerConfigPath)
+		providerConfig, err = LoadConfig(providerConfigPath)
 		if err != nil {
 			logger.Error("Failed to load provider config", "error", err)
 			os.Exit(1)
@@ -136,11 +159,7 @@ func main() {
 		PodClient:                         k8sClient.CoreV1(),
 		PodInformer:                       nil, // Pod informer is optional
 		Provider:                          provider,
-		EventRecorder:                     nil, // You can create an event recorder if needed
-		Recorder:                          nil, // You can create a metrics recorder if needed
-		ConfigNamespace:                   kubenamespace,
-		ConfigMaps:                        nil, // You can specify config maps to watch
-		Secrets:                           nil, // You can specify secrets to watch
+		EventRecorder:                     eventRecorder,
 		SyncPodsFromKubernetesRateLimiter: nil, // Optional rate limiter
 	})
 	if err != nil {
@@ -153,30 +172,24 @@ func main() {
 		provider,
 		provider.GetNodeStatus(),
 		k8sClient.CoreV1().Nodes(),
-		node.WithNodeEnableLeaseV1(k8sClient.CoordinationV1().Leases(kubenamespace), 30*time.Second),
+		node.WithNodeEnableLeaseV1(k8sClient.CoordinationV1().Leases(kubenamespace), int32(30)),
 	)
 	if err != nil {
 		logger.Error("Failed to create node controller", "error", err)
 		os.Exit(1)
 	}
 
-	// Create API server for kubectl logs/exec
-	apiServerConfig := api.ServerConfig{
-		KubeletNamespace:      kubenamespace,
-		KubeConfigPath:        kubeconfig,
-		StreamIdleTimeout:     30 * time.Minute,
-		StreamCreationTimeout: 10 * time.Second,
-		Provider:              provider,
-		NodeName:              nodeName,
-		InternalIP:            internalIP,
-		DaemonPort:            int(listenPort),
-		DisableTaintNode:      false,
-	}
+	// Create a minimal API server with just the pod handler
+	mux := http.NewServeMux()
 
-	apiServer, err := api.NewServerWithConfig(apiServerConfig)
-	if err != nil {
-		logger.Error("Failed to create API server", "error", err)
-		os.Exit(1)
+	// Set up basic handlers
+	podHandler := api.AttachIO(provider)
+	mux.Handle("/", podHandler)
+
+	// Create HTTP server
+	apiServer := &http.Server{
+		Addr:    fmt.Sprintf("%s:%d", internalIP, listenPort),
+		Handler: mux,
 	}
 
 	// Start controllers and API server
@@ -199,9 +212,19 @@ func main() {
 
 	go func() {
 		logger.Info("Starting API server", "port", listenPort)
-		if err := apiServer.Run(ctx); err != nil && ctx.Err() == nil {
+		if err := apiServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("Failed to run API server", "error", err)
 			cancel()
+		}
+	}()
+
+	// Ensure server shutdown on context cancellation
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
+		if err := apiServer.Shutdown(shutdownCtx); err != nil {
+			logger.Error("API server shutdown error", "error", err)
 		}
 	}()
 

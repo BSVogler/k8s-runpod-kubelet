@@ -6,6 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	batchv1 "k8s.io/api/batch/v1"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	"log/slog"
 	"net/http"
 	"os"
@@ -22,28 +26,23 @@ type Client struct {
 	baseGraphqlURL string
 	baseRESTURL    string
 	logger         *slog.Logger
+	clientset      *kubernetes.Clientset // Add clientset field
 }
 
 // Constants for RunPod integration
 const (
-	RunpodOffloadAnnotation               = "runpod.io/offload"
-	RunpodOffloadedAnnotation             = "runpod.io/offloaded"
 	RunpodPodIDAnnotation                 = "runpod.io/pod-id"
 	RunpodCostAnnotation                  = "runpod.io/cost-per-hr"
-	RunpodRetryAnnotation                 = "runpod.io/retry-after"
 	RunpodCloudTypeAnnotation             = "runpod.io/cloud-type"
 	RunpodTemplateIdAnnotation            = "runpod.io/templateId"
 	GpuMemoryAnnotation                   = "runpod.io/required-gpu-memory"
 	RunpodContainerRegistryAuthAnnotation = "runpod.io/container-registry-auth-id"
-	RunpodFailureAnnotation               = "runpod.io/failure-count"
 	RunpodManagedLabel                    = "runpod.io/managed"
 	// DefaultMaxPrice for GPU
 	DefaultMaxPrice = 0.5
 
 	// DefaultAPITimeout API and timeout defaults
 	DefaultAPITimeout = 30 * time.Second
-	DefaultRetryCount = 5
-	DefaultRetryDelay = 100 * time.Millisecond
 )
 
 // PodStatus represents the status of a RunPod instance
@@ -130,7 +129,7 @@ type MachineInfo struct {
 }
 
 // NewRunPodClient creates a new RunPod API client
-func NewRunPodClient(logger *slog.Logger) *Client {
+func NewRunPodClient(logger *slog.Logger, clientset *kubernetes.Clientset) *Client {
 	apiKey := os.Getenv("RUNPOD_KEY")
 	if apiKey == "" {
 		logger.Error("RUNPOD_KEY environment variable is not set")
@@ -142,6 +141,7 @@ func NewRunPodClient(logger *slog.Logger) *Client {
 		baseGraphqlURL: "https://api.io/graphql",
 		baseRESTURL:    "https://rest.io/v1/",
 		logger:         logger,
+		clientset:      clientset, // Store the clientset
 	}
 }
 
@@ -705,4 +705,299 @@ func IsSuccessfulCompletion(status *RunPodDetailedStatus) bool {
 	}
 
 	return false
+}
+
+// FormatEnvVarsForGraphQL formats environment variables for GraphQL API
+func FormatEnvVarsForGraphQL(envVars []RunPodEnv) []map[string]string {
+	formatted := make([]map[string]string, len(envVars))
+	for i, env := range envVars {
+		formatted[i] = map[string]string{
+			"key":   env.Key,
+			"value": env.Value,
+		}
+	}
+	return formatted
+}
+
+// FormatEnvVarsForREST formats environment variables for REST API
+func FormatEnvVarsForREST(envVars []RunPodEnv) map[string]string {
+	formatted := make(map[string]string)
+	for _, env := range envVars {
+		formatted[env.Key] = env.Value
+	}
+	return formatted
+}
+
+// ExtractEnvVars extracts environment variables from a pod
+func (c *Client) ExtractEnvVars(pod *v1.Pod) ([]RunPodEnv, error) {
+	var envVars []RunPodEnv
+	var secretsToFetch = make(map[string]bool)
+	var secretEnvVars = make(map[string][]struct {
+		SecretKey string
+		EnvKey    string
+	})
+	var secretRefEnvs = make(map[string]bool)
+
+	// First pass: collect all secrets we need to fetch
+	if len(pod.Spec.Containers) > 0 {
+		container := pod.Spec.Containers[0]
+
+		// Add regular environment variables
+		for _, env := range container.Env {
+			// If this is a regular env var, add it directly
+			if env.Value != "" {
+				envVars = append(envVars, RunPodEnv{
+					Key:   env.Name,
+					Value: env.Value,
+				})
+			} else if env.ValueFrom != nil && env.ValueFrom.SecretKeyRef != nil {
+				// This is a secret reference, track it for fetching
+				secretName := env.ValueFrom.SecretKeyRef.Name
+				secretsToFetch[secretName] = true
+
+				if _, ok := secretEnvVars[secretName]; !ok {
+					secretEnvVars[secretName] = []struct {
+						SecretKey string
+						EnvKey    string
+					}{}
+				}
+
+				// Store the mapping between secret key and env var name
+				secretEnvVars[secretName] = append(secretEnvVars[secretName], struct {
+					SecretKey string
+					EnvKey    string
+				}{
+					SecretKey: env.ValueFrom.SecretKeyRef.Key,
+					EnvKey:    env.Name,
+				})
+			}
+		}
+
+		// Handle envFrom references
+		for _, envFrom := range container.EnvFrom {
+			if envFrom.SecretRef != nil {
+				secretName := envFrom.SecretRef.Name
+				secretsToFetch[secretName] = true
+				secretRefEnvs[secretName] = true
+			}
+		}
+	}
+
+	// Also check for secrets mounted as volumes that should be included as env vars
+	for _, volume := range pod.Spec.Volumes {
+		if volume.Secret != nil {
+			secretName := volume.Secret.SecretName
+			secretsToFetch[secretName] = true
+
+			// For volume mounts with specific items
+			if items := volume.Secret.Items; len(items) > 0 {
+				if _, ok := secretEnvVars[secretName]; !ok {
+					secretEnvVars[secretName] = []struct {
+						SecretKey string
+						EnvKey    string
+					}{}
+				}
+
+				for _, item := range items {
+					// When mounted as a volume item, use the path as env var name if not specified
+					envKey := item.Path
+					if envKey == "" {
+						envKey = item.Key
+					}
+
+					secretEnvVars[secretName] = append(secretEnvVars[secretName], struct {
+						SecretKey string
+						EnvKey    string
+					}{
+						SecretKey: item.Key,
+						EnvKey:    envKey,
+					})
+				}
+			}
+		}
+	}
+
+	// Second pass: fetch all needed secrets and extract values
+	for secretName := range secretsToFetch {
+		// Use the clientset from the Client struct
+		secret, err := c.clientset.CoreV1().Secrets(pod.Namespace).Get(
+			context.Background(),
+			secretName,
+			metav1.GetOptions{},
+		)
+		if err != nil {
+			c.logger.Error("failed to get secret",
+				"namespace", pod.Namespace,
+				"secret", secretName, "err", err)
+			continue
+		}
+
+		// Handle specific secret keys mapped to env vars
+		if mappings, ok := secretEnvVars[secretName]; ok {
+			for _, mapping := range mappings {
+				if secretValue, ok := secret.Data[mapping.SecretKey]; ok {
+					// Add it as an environment variable with the correct name
+					envVars = append(envVars, RunPodEnv{
+						Key:   mapping.EnvKey,
+						Value: strings.ReplaceAll(string(secretValue), "\n", "\\n"),
+					})
+				} else {
+					c.logger.Warn("Secret key not found",
+						"namespace", pod.Namespace,
+						"secret", secretName,
+						"key", mapping.SecretKey)
+				}
+			}
+		}
+
+		// Handle envFrom that should import all keys from the secret
+		if secretRefEnvs[secretName] {
+			for key, value := range secret.Data {
+				envVars = append(envVars, RunPodEnv{
+					Key:   key,
+					Value: strings.ReplaceAll(string(value), "\n", "\\n"),
+				})
+			}
+		}
+	}
+
+	return envVars, nil
+}
+
+// PrepareRunPodParameters prepares parameters for RunPod deployment
+// Update PrepareRunPodParameters to use the clientset from the Client struct
+func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]interface{}, error) {
+	// Determine cloud type - default to SECURE but allow override via annotation
+	cloudType := "SECURE"
+	if cloudTypeVal, exists := pod.Annotations[RunpodCloudTypeAnnotation]; exists {
+		// Validate and normalize the cloud type value
+		cloudTypeUpperCase := strings.ToUpper(cloudTypeVal)
+		if cloudTypeUpperCase == "SECURE" || cloudTypeUpperCase == "COMMUNITY" {
+			cloudType = cloudTypeUpperCase
+		} else {
+			c.logger.Warn("Invalid cloud type specified, using default",
+				"pod", pod.Name,
+				"namespace", pod.Namespace,
+				"specifiedValue", cloudTypeVal,
+				"defaultValue", cloudType)
+		}
+	}
+
+	// Check if pod is owned by a job and use job annotations if available
+	var ownerJob *batchv1.Job
+	for _, owner := range pod.OwnerReferences {
+		if owner.Kind == "Job" {
+			// Fetch the job to access its annotations using the clientset
+			job, err := c.clientset.BatchV1().Jobs(pod.Namespace).Get(
+				context.Background(),
+				owner.Name,
+				metav1.GetOptions{},
+			)
+			if err == nil {
+				ownerJob = job
+				break
+			}
+		}
+	}
+
+	// If job owner found, use its annotations for RunPod parameters
+	if ownerJob != nil {
+		if cloudTypeFromJob, exists := ownerJob.Annotations[RunpodCloudTypeAnnotation]; exists {
+			cloudTypeUpperCase := strings.ToUpper(cloudTypeFromJob)
+			if cloudTypeUpperCase == "SECURE" || cloudTypeUpperCase == "COMMUNITY" {
+				cloudType = cloudTypeUpperCase
+			}
+		}
+	}
+
+	// Extract container registry auth ID if provided
+	containerRegistryAuthId := ""
+	if authID, exists := pod.Annotations[RunpodContainerRegistryAuthAnnotation]; exists && authID != "" {
+		containerRegistryAuthId = authID
+	} else if ownerJob != nil && ownerJob.Annotations != nil {
+		if authID, exists := ownerJob.Annotations[RunpodContainerRegistryAuthAnnotation]; exists && authID != "" {
+			containerRegistryAuthId = authID
+		}
+	}
+
+	// Extract template ID if provided
+	templateId := ""
+	if tplID, exists := pod.Annotations[RunpodTemplateIdAnnotation]; exists && tplID != "" {
+		templateId = tplID
+	} else if ownerJob != nil && ownerJob.Annotations != nil {
+		if tplID, exists := ownerJob.Annotations[RunpodTemplateIdAnnotation]; exists && tplID != "" {
+			templateId = tplID
+		}
+	}
+
+	// Determine minimum GPU memory required
+	minRAMPerGPU := 16 // Default minimum memory
+	if memStr, exists := pod.Annotations[GpuMemoryAnnotation]; exists {
+		if mem, err := strconv.Atoi(memStr); err == nil {
+			minRAMPerGPU = mem
+		}
+	} else if ownerJob != nil && ownerJob.Annotations != nil {
+		if memStr, exists := ownerJob.Annotations[GpuMemoryAnnotation]; exists {
+			if mem, err := strconv.Atoi(memStr); err == nil {
+				minRAMPerGPU = mem
+			}
+		}
+	}
+
+	// Get GPU types - pass the cloud type to filter correctly
+	gpuTypes, err := c.GetGPUTypes(minRAMPerGPU, DefaultMaxPrice, cloudType)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get GPU types: %w", err)
+	}
+
+	// Extract environment variables from job
+	envVars, err := c.ExtractEnvVars(pod)
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract environment variables: %w", err)
+	}
+
+	var formattedEnvVars interface{}
+	if graphql {
+		formattedEnvVars = FormatEnvVarsForGraphQL(envVars)
+	} else {
+		formattedEnvVars = FormatEnvVarsForREST(envVars)
+	}
+
+	// Determine image name from pod
+	var imageName string
+	if len(pod.Spec.Containers) > 0 {
+		imageName = pod.Spec.Containers[0].Image
+	} else {
+		return nil, fmt.Errorf("pod has no containers")
+	}
+
+	// Use the pod name as the RunPod name
+	runpodName := pod.Name
+
+	// Default values
+	volumeInGb := 0
+	containerDiskInGb := 15
+
+	// Create deployment parameters
+	params := map[string]interface{}{
+		"cloudType":         cloudType,
+		"volumeInGb":        volumeInGb,
+		"containerDiskInGb": containerDiskInGb,
+		"minRAMPerGPU":      minRAMPerGPU,
+		"gpuTypeIds":        gpuTypes, // Use the array directly, don't stringify it
+		"name":              runpodName,
+		"imageName":         imageName,
+		"env":               formattedEnvVars,
+	}
+
+	// Add templateId to params if it exists
+	if templateId != "" {
+		params["templateId"] = templateId
+	}
+
+	if containerRegistryAuthId != "" {
+		params["containerRegistryAuthId"] = containerRegistryAuthId
+	}
+
+	return params, nil
 }

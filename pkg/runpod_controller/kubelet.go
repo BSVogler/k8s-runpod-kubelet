@@ -4,18 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/pingcap/errors"
 	"io"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"log/slog"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/bsvogler/k8s-runpod-controller/pkg/config"
-	batchv1 "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,7 +32,6 @@ type Provider struct {
 	runpodAvailable    bool
 	deletedPods        map[string]string
 	deletedPodsMutex   sync.Mutex
-	maxPrice           float64
 
 	// For pod tracking (replaces resourceManager)
 	pods        map[string]*v1.Pod     // Map of podKey -> Pod
@@ -90,8 +86,8 @@ func (p *Provider) checkRunPodAPIHealth() {
 func NewProvider(ctx context.Context, nodeName, operatingSystem string, internalIP string,
 	daemonEndpointPort int, config config.Config, clientset *kubernetes.Clientset, logger *slog.Logger) (*Provider, error) {
 
-	// Create a new RunPod client
-	runpodClient := NewRunPodClient(logger)
+	// Create a new RunPod client and pass the clientset
+	runpodClient := NewRunPodClient(logger, clientset)
 
 	provider := &Provider{
 		nodeName:           nodeName,
@@ -105,7 +101,6 @@ func NewProvider(ctx context.Context, nodeName, operatingSystem string, internal
 		runpodAvailable:    false,
 		deletedPods:        make(map[string]string),
 		deletedPodsMutex:   sync.Mutex{},
-		maxPrice:           DefaultMaxPrice, // Use default or from config
 		pods:               make(map[string]*v1.Pod),
 		podStatus:          make(map[string]*RunPodInfo),
 		podsMutex:          sync.RWMutex{},
@@ -117,6 +112,7 @@ func NewProvider(ctx context.Context, nodeName, operatingSystem string, internal
 	// Start background processes
 	go provider.startPeriodicStatusUpdates()
 	go provider.startPeriodicCleanup()
+	go provider.startPendingPodProcessor() // Add the pending pod processor
 
 	return provider, nil
 }
@@ -139,6 +135,20 @@ func (p *Provider) CreatePod(ctx context.Context, pod *v1.Pod) error {
 	}
 	p.podsMutex.Unlock()
 
+	// Deploy to RunPod if needed
+	// This is where we integrate with the RunPod API
+	err := p.DeployPodToRunPod(pod)
+	if err != nil {
+		p.logger.Error("Failed to deploy pod to RunPod",
+			"pod", pod.Name,
+			"namespace", pod.Namespace,
+			"error", err)
+
+		// Even if RunPod deployment fails, we still track the pod
+		// The pod will be in a pending state in Kubernetes
+		return nil
+	}
+
 	return nil
 }
 
@@ -151,6 +161,103 @@ func (p *Provider) UpdatePod(ctx context.Context, pod *v1.Pod) error {
 	podKey := fmt.Sprintf("%s-%s", pod.Namespace, pod.Name)
 	p.podsMutex.Lock()
 	p.pods[podKey] = pod.DeepCopy()
+	p.podsMutex.Unlock()
+
+	return nil
+}
+
+// DeployPodToRunPod handles the deployment of a Kubernetes pod to RunPod
+func (p *Provider) DeployPodToRunPod(pod *v1.Pod) error {
+	p.logger.Info("Deploying pod to RunPod",
+		"pod", pod.Name,
+		"namespace", pod.Namespace)
+
+	// Check if RunPod API is available
+	if !p.runpodAvailable {
+		return fmt.Errorf("RunPod API is not available")
+	}
+
+	// Prepare RunPod parameters - use REST API by default
+	params, err := p.runpodClient.PrepareRunPodParameters(pod, false)
+	if err != nil {
+		p.logger.Error("Failed to prepare RunPod parameters",
+			"pod", pod.Name,
+			"namespace", pod.Namespace,
+			"error", err)
+		return err
+	}
+
+	// Deploy to RunPod using REST API
+	podID, costPerHr, err := p.runpodClient.DeployPodREST(params)
+	if err != nil {
+		p.logger.Error("Failed to deploy pod to RunPod",
+			"pod", pod.Name,
+			"namespace", pod.Namespace,
+			"error", err)
+		return err
+	}
+
+	p.logger.Info("Successfully deployed pod to RunPod",
+		"pod", pod.Name,
+		"namespace", pod.Namespace,
+		"runpodID", podID,
+		"costPerHr", costPerHr)
+
+	// Update pod with RunPod annotations
+	return p.updatePodWithRunPodInfo(pod, podID, costPerHr)
+}
+
+// updatePodWithRunPodInfo updates the pod with RunPod instance information
+func (p *Provider) updatePodWithRunPodInfo(pod *v1.Pod, podID string, costPerHr float64) error {
+	// Get the latest version of the pod to avoid conflicts
+	currentPod, err := p.clientset.CoreV1().Pods(pod.Namespace).Get(
+		context.Background(),
+		pod.Name,
+		metav1.GetOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("failed to get current pod state: %w", err)
+	}
+
+	// Make a deep copy to avoid modifying the cache
+	podCopy := currentPod.DeepCopy()
+
+	// Update annotations
+	if podCopy.Annotations == nil {
+		podCopy.Annotations = make(map[string]string)
+	}
+	podCopy.Annotations[RunpodPodIDAnnotation] = podID
+	podCopy.Annotations[RunpodCostAnnotation] = fmt.Sprintf("%f", costPerHr)
+
+	// Update the pod
+	_, err = p.clientset.CoreV1().Pods(podCopy.Namespace).Update(
+		context.Background(),
+		podCopy,
+		metav1.UpdateOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update pod with RunPod info: %w", err)
+	}
+
+	// Update our local tracking map
+	podKey := fmt.Sprintf("%s-%s", pod.Namespace, pod.Name)
+	p.podsMutex.Lock()
+	p.pods[podKey] = podCopy
+	if podInfo, exists := p.podStatus[podKey]; exists {
+		podInfo.ID = podID
+		podInfo.CostPerHr = costPerHr
+		podInfo.Status = string(PodStarting)
+		p.podStatus[podKey] = podInfo
+	} else {
+		p.podStatus[podKey] = &RunPodInfo{
+			ID:           podID,
+			CostPerHr:    costPerHr,
+			PodName:      pod.Name,
+			Namespace:    pod.Namespace,
+			Status:       string(PodStarting),
+			CreationTime: time.Now(),
+		}
+	}
 	p.podsMutex.Unlock()
 
 	return nil
@@ -257,6 +364,80 @@ func (p *Provider) NotifyPods(ctx context.Context, notifyFunc func(*v1.Pod)) {
 	}()
 }
 
+// startPendingPodProcessor starts a background process to check for pending pods
+func (p *Provider) startPendingPodProcessor() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			p.processPendingPods()
+		}
+	}
+}
+
+// processPendingPods checks for pending pods that need to be deployed to RunPod
+func (p *Provider) processPendingPods() {
+	p.podsMutex.RLock()
+	podKeys := make([]string, 0, len(p.pods))
+	for podKey, pod := range p.pods {
+		// Check if the pod is pending deployment to RunPod
+		if pod.Status.Phase == v1.PodPending {
+			podKeys = append(podKeys, podKey)
+		}
+	}
+	p.podsMutex.RUnlock()
+
+	for _, podKey := range podKeys {
+		p.podsMutex.RLock()
+		pod := p.pods[podKey]
+		p.podsMutex.RUnlock()
+
+		if pod == nil {
+			continue
+		}
+
+		// Try to deploy the pod to RunPod
+		err := p.DeployPodToRunPod(pod)
+		if err != nil {
+			p.logger.Error("Failed to deploy pending pod to RunPod",
+				"pod", pod.Name,
+				"namespace", pod.Namespace,
+				"error", err)
+
+			// Check if we've reached the retry limit
+			podInfo, exists := p.podStatus[podKey]
+			if exists {
+				// If pod has been pending too long, mark it as failed
+				if time.Since(podInfo.CreationTime) > 15*time.Minute {
+					p.logger.Warn("Pod has been pending too long, marking as failed",
+						"pod", pod.Name,
+						"namespace", pod.Namespace)
+
+					updatedPod := pod.DeepCopy()
+					updatedPod.Status.Phase = v1.PodFailed
+					updatedPod.Status.Reason = "RunPodDeploymentFailed"
+					updatedPod.Status.Message = "Failed to deploy pod to RunPod after multiple attempts"
+
+					p.podsMutex.Lock()
+					p.pods[podKey] = updatedPod
+					p.podsMutex.Unlock()
+
+					// Notify about status change
+					p.notifyMutex.RLock()
+					notifyFunc := p.notifyFunc
+					p.notifyMutex.RUnlock()
+
+					if notifyFunc != nil {
+						notifyFunc(updatedPod)
+					}
+				}
+			}
+		}
+	}
+}
+
 func (p *Provider) updateAllPodStatuses() {
 	// Get all pods we're tracking
 	p.podsMutex.RLock()
@@ -336,7 +517,7 @@ func (p *Provider) updateAllPodStatuses() {
 	}
 }
 
-// Modify handlePodCompletion to work with new pod tracking
+// handlePodCompletion processes a pod that has completed execution
 func (p *Provider) handlePodCompletion(pod *v1.Pod, podInfo *RunPodInfo) {
 	// Get the RunPod ID from annotations
 	podID := pod.Annotations[RunpodPodIDAnnotation]
@@ -566,141 +747,6 @@ func (p *Provider) cleanupDeletedPods() {
 	}
 }
 
-// ExtractEnvVars extracts environment variables from a pod
-func (p *Provider) ExtractEnvVars(pod *v1.Pod) ([]RunPodEnv, error) {
-	var envVars []RunPodEnv
-	var secretsToFetch = make(map[string]bool)
-	var secretEnvVars = make(map[string][]struct {
-		SecretKey string
-		EnvKey    string
-	})
-	var secretRefEnvs = make(map[string]bool)
-
-	// First pass: collect all secrets we need to fetch
-	if len(pod.Spec.Containers) > 0 {
-		container := pod.Spec.Containers[0]
-
-		// Add regular environment variables
-		for _, env := range container.Env {
-			// If this is a regular env var, add it directly
-			if env.Value != "" {
-				envVars = append(envVars, RunPodEnv{
-					Key:   env.Name,
-					Value: env.Value,
-				})
-			} else if env.ValueFrom != nil && env.ValueFrom.SecretKeyRef != nil {
-				// This is a secret reference, track it for fetching
-				secretName := env.ValueFrom.SecretKeyRef.Name
-				secretsToFetch[secretName] = true
-
-				if _, ok := secretEnvVars[secretName]; !ok {
-					secretEnvVars[secretName] = []struct {
-						SecretKey string
-						EnvKey    string
-					}{}
-				}
-
-				// Store the mapping between secret key and env var name
-				secretEnvVars[secretName] = append(secretEnvVars[secretName], struct {
-					SecretKey string
-					EnvKey    string
-				}{
-					SecretKey: env.ValueFrom.SecretKeyRef.Key,
-					EnvKey:    env.Name,
-				})
-			}
-		}
-
-		// Handle envFrom references
-		for _, envFrom := range container.EnvFrom {
-			if envFrom.SecretRef != nil {
-				secretName := envFrom.SecretRef.Name
-				secretsToFetch[secretName] = true
-				secretRefEnvs[secretName] = true
-			}
-		}
-	}
-
-	// Also check for secrets mounted as volumes that should be included as env vars
-	for _, volume := range pod.Spec.Volumes {
-		if volume.Secret != nil {
-			secretName := volume.Secret.SecretName
-			secretsToFetch[secretName] = true
-
-			// For volume mounts with specific items
-			if items := volume.Secret.Items; len(items) > 0 {
-				if _, ok := secretEnvVars[secretName]; !ok {
-					secretEnvVars[secretName] = []struct {
-						SecretKey string
-						EnvKey    string
-					}{}
-				}
-
-				for _, item := range items {
-					// When mounted as a volume item, use the path as env var name if not specified
-					envKey := item.Path
-					if envKey == "" {
-						envKey = item.Key
-					}
-
-					secretEnvVars[secretName] = append(secretEnvVars[secretName], struct {
-						SecretKey string
-						EnvKey    string
-					}{
-						SecretKey: item.Key,
-						EnvKey:    envKey,
-					})
-				}
-			}
-		}
-	}
-
-	// Second pass: fetch all needed secrets and extract values
-	for secretName := range secretsToFetch {
-		secret, err := p.clientset.CoreV1().Secrets(pod.Namespace).Get(
-			context.Background(),
-			secretName,
-			metav1.GetOptions{},
-		)
-		if err != nil {
-			p.logger.Error("failed to get secret",
-				"namespace", pod.Namespace,
-				"secret", secretName, "err", err)
-			continue
-		}
-
-		// Handle specific secret keys mapped to env vars
-		if mappings, ok := secretEnvVars[secretName]; ok {
-			for _, mapping := range mappings {
-				if secretValue, ok := secret.Data[mapping.SecretKey]; ok {
-					// Add it as an environment variable with the correct name
-					envVars = append(envVars, RunPodEnv{
-						Key:   mapping.EnvKey,
-						Value: strings.ReplaceAll(string(secretValue), "\n", "\\n"),
-					})
-				} else {
-					p.logger.Warn("Secret key not found",
-						"namespace", pod.Namespace,
-						"secret", secretName,
-						"key", mapping.SecretKey)
-				}
-			}
-		}
-
-		// Handle envFrom that should import all keys from the secret
-		if secretRefEnvs[secretName] {
-			for key, value := range secret.Data {
-				envVars = append(envVars, RunPodEnv{
-					Key:   key,
-					Value: strings.ReplaceAll(string(value), "\n", "\\n"),
-				})
-			}
-		}
-	}
-
-	return envVars, nil
-}
-
 // LoadRunning loads from the runpod api the running pods and if missing adds them to the list of virtual pods in the cluster
 func (p *Provider) LoadRunning() {
 	// Skip check if no API key
@@ -751,9 +797,6 @@ func (p *Provider) fetchRunPodInstances() (running []RunPodInstance, exited []Ru
 func (p *Provider) processRunPodInstance(runpodInstance RunPodInstance, existingRunPodMap map[string]RunPodInfo) {
 	// Skip if this RunPod instance is already represented in the cluster
 	if _, exists := existingRunPodMap[runpodInstance.ID]; exists {
-		if runpodInstance.DesiredStatus == "EXITED" || runpodInstance.CurrentStatus == "EXITED" {
-			p.handleRunPodExitStatus(runpodInstance)
-		}
 		return
 	}
 
@@ -881,7 +924,7 @@ func (p *Provider) mapExistingRunPodInstances() map[string]RunPodInfo {
 	// Get existing pods in the cluster
 	existingPods, err := p.clientset.CoreV1().Pods("").List(
 		context.Background(),
-		v1.ListOptions{
+		metav1.ListOptions{
 			LabelSelector: RunpodManagedLabel + "=true",
 		},
 	)
@@ -890,15 +933,13 @@ func (p *Provider) mapExistingRunPodInstances() map[string]RunPodInfo {
 		return make(map[string]RunPodInfo)
 	}
 
-	// Create a map of existing RunPod IDs to job info
+	// Create a map of existing RunPod IDs to pod info
 	existingRunPodMap := make(map[string]RunPodInfo)
 	for _, pod := range existingPods.Items {
 		if podID, exists := pod.Annotations[RunpodPodIDAnnotation]; exists {
-			if jobName, exists := pod.Labels["job-name"]; exists {
-				existingRunPodMap[podID] = RunPodInfo{
-					JobName:   jobName,
-					Namespace: pod.Namespace,
-				}
+			existingRunPodMap[podID] = RunPodInfo{
+				PodName:   pod.Name,
+				Namespace: pod.Namespace,
 			}
 		}
 	}
@@ -906,104 +947,8 @@ func (p *Provider) mapExistingRunPodInstances() map[string]RunPodInfo {
 	return existingRunPodMap
 }
 
-// PrepareRunPodParameters prepares parameters for RunPod deployment
-func (p *Provider) PrepareRunPodParameters(job batchv1.Job, graphql bool) (map[string]interface{}, error) {
-	// Determine cloud type - default to COMMUNITY but allow override via annotation
-	cloudType := "SECURE"
-	if cloudTypeVal, exists := job.Annotations[RunpodCloudTypeAnnotation]; exists {
-		// Validate and normalize the cloud type value
-		cloudTypeUpperCase := strings.ToUpper(cloudTypeVal)
-		if cloudTypeUpperCase == "SECURE" || cloudTypeUpperCase == "COMMUNITY" {
-			cloudType = cloudTypeUpperCase
-		} else {
-			p.logger.Warn("Invalid cloud type specified, using default",
-				"job", job.Name,
-				"namespace", job.Namespace,
-				"specifiedValue", cloudTypeVal,
-				"defaultValue", cloudType)
-		}
-	}
-
-	// Extract container registry auth ID if provided
-	containerRegistryAuthId := ""
-	if authID, exists := job.Annotations[RunpodContainerRegistryAuthAnnotation]; exists && authID != "" {
-		containerRegistryAuthId = authID
-	}
-
-	// Extract template ID if provided
-	templateId := ""
-	if tplID, exists := job.Annotations[RunpodTemplateIdAnnotation]; exists && tplID != "" {
-		templateId = tplID
-	}
-
-	// Determine minimum GPU memory required
-	minRAMPerGPU := 16 // Default minimum memory
-	if memStr, exists := job.Annotations[GpuMemoryAnnotation]; exists {
-		if mem, err := strconv.Atoi(memStr); err == nil {
-			minRAMPerGPU = mem
-		}
-	}
-
-	// Get GPU types - pass the cloud type to filter correctly
-	gpuTypes, err := p.runpodClient.GetGPUTypes(minRAMPerGPU, p.maxPrice, cloudType)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get GPU types: %w", err)
-	}
-
-	// Extract environment variables from job
-	envVars, err := p.ExtractEnvVars(job)
-	if err != nil {
-		return nil, fmt.Errorf("failed to extract environment variables: %w", err)
-	}
-
-	var formattedEnvVars interface{}
-	if graphql {
-		formattedEnvVars = FormatEnvVarsForGraphQL(envVars)
-	} else {
-		formattedEnvVars = FormatEnvVarsForREST(envVars)
-	}
-	// Determine image name from job
-	var imageName string
-	if len(job.Spec.Template.Spec.Containers) > 0 {
-		imageName = job.Spec.Template.Spec.Containers[0].Image
-	} else {
-		return nil, fmt.Errorf("job has no containers")
-	}
-
-	// Use the job name directly without namespace prefix
-	runpodJobName := job.Name
-
-	// Default values
-	volumeInGb := 0
-	containerDiskInGb := 15
-
-	// Create deployment parameters - use the same cloudType as used for filtering https://graphql-spec.runpod.io/#definition-PodFindAndDeployOnDemandInput
-	params := map[string]interface{}{
-		"cloudType":         cloudType,
-		"volumeInGb":        volumeInGb,
-		"containerDiskInGb": containerDiskInGb,
-		"minRAMPerGPU":      minRAMPerGPU,
-		"gpuTypeIds":        gpuTypes, // Use the array directly, don't stringify it
-		"name":              runpodJobName,
-		"imageName":         imageName,
-		"templateId":        templateId,
-		"env":               formattedEnvVars,
-	}
-
-	// Add templateId to params if it exists
-	if templateId != "" {
-		params["templateId"] = templateId
-	}
-
-	if containerRegistryAuthId != "" {
-		params["containerRegistryAuthId"] = containerRegistryAuthId
-	}
-
-	return params, nil
-}
-
 // ForceDeletePod forcefully removes a pod from the Kubernetes API
-func (c *Provider) ForceDeletePod(namespace, name string) error {
+func (p *Provider) ForceDeletePod(namespace, name string) error {
 	// Create zero grace period for immediate deletion
 	gracePeriod := int64(0)
 	deleteOptions := metav1.DeleteOptions{
@@ -1011,7 +956,7 @@ func (c *Provider) ForceDeletePod(namespace, name string) error {
 		PropagationPolicy:  &[]metav1.DeletionPropagation{metav1.DeletePropagationBackground}[0],
 	}
 
-	err := c.clientset.CoreV1().Pods(namespace).Delete(
+	err := p.clientset.CoreV1().Pods(namespace).Delete(
 		context.Background(),
 		name,
 		deleteOptions,
@@ -1021,300 +966,7 @@ func (c *Provider) ForceDeletePod(namespace, name string) error {
 		return err
 	}
 
-	c.logger.Info("Successfully force deleted pod", "pod", name, "namespace", namespace)
-	return nil
-}
-
-// handleRunPodFailure handles a RunPod instance failure using job annotations as tracking
-func (c *Provider) handleRunPodFailure(podID string, reason string) error {
-	c.logger.Debug("Handling RunPod instance failure",
-		"podID", podID,
-		"reason", reason)
-	var namespace = "default"
-	// Step 1: Check if the virtual pod exists before attempting to delete it
-	podName := fmt.Sprintf("runpod-%s", podID)
-
-	_, err := c.clientset.CoreV1().Pods(namespace).Get(
-		context.Background(),
-		podName,
-		metav1.GetOptions{},
-	)
-
-	// Only attempt deletion if the pod exists
-	if err == nil {
-		c.logger.Info("Found virtual pod for failed RunPod instance, deleting",
-			"pod", podName)
-
-		if err := c.ForceDeletePod(namespace, podName); err != nil {
-			c.logger.Error("Failed to cleanup virtual pod during failure handling",
-				"pod", podName,
-				"err", err)
-		} else {
-			c.logger.Info("Successfully force deleted pod",
-				"pod", podName)
-		}
-	} else if !k8serrors.IsNotFound(err) {
-		// Some other error occurred when trying to get the pod
-		c.logger.Error("Error checking if pod exists",
-			"pod", podName,
-			"err", err)
-	}
-
-	// Step 2: Update job with retries
-	retryCount := 0
-	maxRetries := DefaultRetryCount
-
-	for retryCount < maxRetries {
-		// Get the latest version of the job to avoid conflicts
-		currentJob, err := c.clientset.BatchV1().Jobs(job.Namespace).Get(
-			context.Background(),
-			job.Name,
-			metav1.GetOptions{},
-		)
-		if err != nil {
-			if k8serrors.IsNotFound(err) {
-				c.logger.Info("Job not found during failure handling, skipping",
-					"job", job.Name,
-					"namespace", job.Namespace,
-					"podID", podID)
-				return nil
-			}
-			return fmt.Errorf("failed to get current job state: %w", err)
-		}
-
-		// Make a deep copy to avoid modifying the cache
-		jobCopy := currentJob.DeepCopy()
-
-		// Check if job has been updated with this specific failure info already
-		if jobCopy.Annotations != nil {
-			specificFailureKey := fmt.Sprintf("runpod.io/failure-%s", podID)
-			if _, hasFailureAnnotation := jobCopy.Annotations[specificFailureKey]; hasFailureAnnotation {
-				c.logger.Debug("Job already marked for this failure, skipping update",
-					"job", job.Name,
-					"namespace", job.Namespace,
-					"podID", podID)
-				return nil
-			}
-		}
-
-		// Increment the failure counter in both status and annotations for tracking
-		jobCopy.Status.Failed++
-
-		if jobCopy.Annotations == nil {
-			jobCopy.Annotations = make(map[string]string)
-		}
-
-		// Track failure count in annotations too for visibility
-		failCount := 1
-		if countStr, exists := jobCopy.Annotations[RunpodFailureAnnotation]; exists {
-			if count, err := strconv.Atoi(countStr); err == nil {
-				failCount = count + 1
-			}
-		}
-		jobCopy.Annotations[RunpodFailureAnnotation] = strconv.Itoa(failCount)
-
-		// Add an annotation to identify this specific failure with timestamp and reason
-		specificFailureKey := fmt.Sprintf("runpod.io/failure-%s", podID)
-		jobCopy.Annotations[specificFailureKey] = fmt.Sprintf("%s|%s",
-			time.Now().Format(time.RFC3339), reason)
-
-		// Remove RunPod annotations to reset the offload state
-		delete(jobCopy.Annotations, RunpodOffloadedAnnotation)
-		delete(jobCopy.Annotations, RunpodPodIDAnnotation)
-
-		// First update annotations
-		if err := c.UpdateJobWithRetry(jobCopy); err != nil {
-			c.logger.Error("Failed to update job annotations",
-				"job", job.Name,
-				"namespace", job.Namespace,
-				"err", err)
-			retryCount++
-			time.Sleep(DefaultRetryDelay)
-			continue
-		}
-
-		// Then update job status with retry logic
-		_, err = c.clientset.BatchV1().Jobs(jobCopy.Namespace).UpdateStatus(
-			context.Background(),
-			jobCopy,
-			metav1.UpdateOptions{},
-		)
-
-		if err == nil {
-			// Update succeeded
-			c.logger.Info("Successfully updated job to reflect RunPod failure",
-				"job", job.Name,
-				"namespace", job.Namespace,
-				"podID", podID,
-				"failureCount", jobCopy.Status.Failed)
-			return nil
-		}
-
-		// Check if this is a conflict error
-		if !k8serrors.IsConflict(err) {
-			c.logger.Error("Failed to update job status for failure, non-conflict error",
-				"job", jobCopy.Name,
-				"namespace", jobCopy.Namespace,
-				"err", err)
-			// For non-conflict errors, we still continue with retries
-		}
-
-		// Increment retry count
-		retryCount++
-
-		// Wait briefly before retrying
-		time.Sleep(DefaultRetryDelay)
-
-		c.logger.Info("Retrying job status update after error",
-			"job", job.Name,
-			"namespace", job.Namespace,
-			"retry", retryCount,
-			"error", err)
-	}
-
-	if retryCount == maxRetries {
-		c.logger.Error("Failed to update job status after maximum retries",
-			"job", job.Name,
-			"namespace", job.Namespace,
-			"maxRetries", maxRetries)
-		return fmt.Errorf("failed to update job status after %d retries", maxRetries)
-	}
-
-	return nil
-}
-
-// handleRunPodExitStatus handles a RunPod instance that has exited
-func (p *Provider) handleRunPodExitStatus(runpodInstance RunPodInstance) error {
-	p.logger.Info("Found exited RunPod instance during API check",
-		"podID", runpodInstance.ID,
-		"namespace", info.Namespace,
-		"status", runpodInstance.DesiredStatus)
-	// Get detailed status from RunPod API
-	status, err := p.runpodClient.GetDetailedPodStatus(runpodInstance.ID)
-	if err != nil {
-		p.logger.Error("Failed to get detailed pod status",
-			"podID", runpodInstance.ID,
-			"err", err)
-
-		// If we can't get details, assume failure to be safe
-		return p.handleRunPodFailure(runpodInstance.ID, "Failed to get status details")
-	}
-
-	// Determine if this was a successful completion
-	isSuccess := IsSuccessfulCompletion(status)
-
-	// Get exit details
-	exitCode := 0
-	exitMessage := ""
-	if status.Runtime != nil {
-		exitCode = status.Runtime.Container.ExitCode
-		exitMessage = status.Runtime.Container.Message
-	}
-
-	p.logger.Info("Processing RunPod exit status",
-		"job", job.Name,
-		"namespace", job.Namespace,
-		"podID", podID,
-		"exitCode", exitCode,
-		"isSuccess", isSuccess,
-		"message", exitMessage)
-
-	if isSuccess {
-		// Handle as a success
-		p.handleRunPodSuccess(podID, exitCode, exitMessage)
-		return nil
-	} else {
-		// Handle as a failure
-		return p.handleRunPodFailure(podID, fmt.Sprintf("ExitCode: %d, Message: %s", exitCode, exitMessage))
-	}
-}
-
-// handleRunPodSuccess handles a successfully completed RunPod instance
-func (p *Provider) handleRunPodSuccess(podID string, exitCode int, message string) error {
-	p.logger.Info("Handling RunPod instance success",
-		"job", job.Name,
-		"namespace", job.Namespace,
-		"podID", podID,
-		"exitCode", exitCode)
-
-	// Get current job to make sure we're working with the latest version
-	currentJob, err := p.clientset.BatchV1().Jobs(job.Namespace).Get(
-		context.Background(),
-		job.Name,
-		v1.GetOptions{},
-	)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			p.logger.Info("Job not found during success handling, skipping",
-				"job", job.Name,
-				"namespace", job.Namespace,
-				"podID", podID)
-			return nil
-		}
-		return fmt.Errorf("failed to get job: %w", err)
-	}
-
-	// Make a deep copy to avoid modifying the cache
-	jobCopy := currentJob.DeepCopy()
-
-	// Update job annotations to record success
-	if jobCopy.Annotations == nil {
-		jobCopy.Annotations = make(map[string]string)
-	}
-
-	successKey := fmt.Sprintf("io/success-%s", podID)
-	jobCopy.Annotations[successKey] = fmt.Sprintf("exitCode=%d,time=%s",
-		exitCode, time.Now().Format(time.RFC3339))
-
-	// Update the job
-	if err := p.UpdateJobWithRetry(jobCopy); err != nil {
-		p.logger.Error("Failed to update job annotations for success",
-			"job", job.Name,
-			"namespace", job.Namespace,
-			"podID", podID,
-			"err", err)
-	}
-
-	// Clean up the RunPod virtual pod if it exists
-	podName := fmt.Sprintf("runpod-%s", podID)
-	if err := p.ForceDeletePod(job.Namespace, podName); err != nil {
-		if !errors.IsNotFound(err) {
-			p.logger.Error("Failed to delete virtual pod for successful RunPod instance",
-				"pod", podName,
-				"namespace", job.Namespace,
-				"err", err)
-		}
-	}
-
-	// Create a success pod to properly record the completion in Kubernetes
-	if err := p.createSuccessPod(&job, podID, exitCode, message); err != nil {
-		p.logger.Error("Failed to create success pod",
-			"job", job.Name,
-			"namespace", job.Namespace,
-			"podID", podID,
-			"err", err)
-	}
-
-	// Update job status to mark as succeeded
-	jobStatusCopy := jobCopy.DeepCopy()
-	jobStatusCopy.Status.Succeeded++
-
-	// Try to update the job status
-	_, err = p.clientset.BatchV1().Jobs(jobStatusCopy.Namespace).UpdateStatus(
-		context.Background(),
-		jobStatusCopy,
-		v1.UpdateOptions{},
-	)
-
-	if err != nil {
-		p.logger.Error("Failed to update job status for success",
-			"job", job.Name,
-			"namespace", job.Namespace,
-			"podID", podID,
-			"err", err)
-		// Continue anyway, this isn't a critical error
-	}
-
+	p.logger.Info("Successfully force deleted pod", "pod", name, "namespace", namespace)
 	return nil
 }
 
