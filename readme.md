@@ -244,4 +244,4 @@ This project is licensed under a Non-Commercial License - see the [LICENSE](LICE
 - **Prohibited**: Commercial use without explicit permission
 - **Required**: License and copyright notice
 
-For commercial licensing inquiries or to discuss custom development work as a freelancer, please contact me at [your-email@example.com] or via [your preferred contact method].
+For commercial licensing inquiries or to discuss custom development work as a freelancer, please contact me at engineering@benediktsvogler.com or via [benediktsvogler.com](https://benediktsvogler.com).
