@@ -2,7 +2,7 @@
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/bsvogler/k8s-runpod-controller)](https://goreportcard.com/report/github.com/bsvogler/k8s-runpod-controller)
 [![License](https://img.shields.io/github/license/bsvogler/k8s-runpod-controller)](LICENSE)
-[![Docker Pulls](https://img.shields.io/docker/pulls/bsvogler/k8s-runpod-controller)](https://hub.docker.com/r/bsvogler/k8s-runpod-controller)
+[![Container Registry](https://img.shields.io/badge/container-ghcr.io-blue)](https://github.com/bsvogler/k8s-runpod-controller/pkgs/container/k8s-runpod-controller)
 [![Release](https://img.shields.io/github/v/release/bsvogler/k8s-runpod-controller)](https://github.com/bsvogler/k8s-runpod-controller/releases)
 
 This Virtual Kubelet implementation provides seamless integration between Kubernetes and RunPod, enabling dynamic, cloud-native GPU workload scaling across local and cloud resources - automatically extend your cluster with on-demand GPUs without managing infrastructure.
