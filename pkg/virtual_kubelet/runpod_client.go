@@ -137,7 +137,7 @@ func NewRunPodClient(logger *slog.Logger, clientset *kubernetes.Clientset) *Clie
 	return &Client{
 		httpClient:     &http.Client{Timeout: DefaultAPITimeout},
 		apiKey:         apiKey,
-		baseGraphqlURL: "https://apirunpod.io/graphql",
+		baseGraphqlURL: "https://api.runpod.io/graphql",
 		baseRESTURL:    "https://rest.runpod.io/v1/",
 		logger:         logger,
 		clientset:      clientset, // Store the clientset
@@ -311,7 +311,7 @@ func (c *Client) GetPodStatusREST(podID string) (PodStatus, error) {
 			}
 			errorMsg = fmt.Sprintf("%s, last response: %s", errorMsg, lastResponseBody)
 		}
-		return PodNotFound, fmt.Errorf(errorMsg)
+		return PodNotFound, fmt.Errorf("%s", errorMsg)
 	}
 
 	defer func() {
