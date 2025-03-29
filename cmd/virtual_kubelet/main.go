@@ -4,7 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	runpod "github.com/bsvogler/k8s-runpod-controller/pkg/runpod_controller"
+	runpod "github.com/bsvogler/k8s-runpod-controller/pkg/virtual_kubelet"
 	"github.com/getsentry/sentry-go"
 	sentryslog "github.com/getsentry/sentry-go/slog"
 	"io"

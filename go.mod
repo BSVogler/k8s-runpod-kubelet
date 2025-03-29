@@ -50,6 +50,7 @@ require (
 )
 
 require (
+	github.com/stretchr/testify v1.9.0
 	github.com/virtual-kubelet/virtual-kubelet v1.9.0
 	gopkg.in/yaml.v2 v2.4.0
 )
@@ -66,6 +67,7 @@ require (
 	github.com/matttproud/golang_protobuf_extensions v1.0.4 // indirect
 	github.com/moby/spdystream v0.5.0 // indirect
 	github.com/mxk/go-flowrate v0.0.0-20140419014527-cca7078d478f // indirect
+	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/prometheus/client_golang v1.14.0 // indirect
 	github.com/prometheus/client_model v0.3.0 // indirect
 	github.com/prometheus/common v0.42.0 // indirect

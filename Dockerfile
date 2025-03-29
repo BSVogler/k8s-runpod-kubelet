@@ -12,7 +12,7 @@ RUN go mod download
 COPY . .
 
 # Build the application
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o runpod_controller ./cmd/runpod_controller
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o virtual_kubelet ./cmd/virtual_kubelet
 
 FROM gcr.io/distroless/static:nonroot
 WORKDIR /
