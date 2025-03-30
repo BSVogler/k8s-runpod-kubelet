@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -17,7 +16,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-func TestRunPodCreateCheckAndTerminate(t *testing.T) {
+func TestRunPodIntegration(t *testing.T) {
 	// Skip if this is a short test run
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
@@ -68,13 +67,13 @@ func TestRunPodCreateCheckAndTerminate(t *testing.T) {
 		}
 	}()
 
-	// Create a test pod configuration, the runpod needs to have some annotations like the template to even work with the API
+	// Create a test pod configuration
 	pod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: fmt.Sprintf("runpod-test-pod-%d", time.Now().Unix()),
 			Annotations: map[string]string{
-				runpod.RunpodCloudTypeAnnotation:  "STANDARD", // Use community cloud for lower costs during testing
-				runpod.GpuMemoryAnnotation:        "2",        // Request minimum 16GB GPU memory
+				runpod.RunpodCloudTypeAnnotation:  "STANDARD",
+				runpod.GpuMemoryAnnotation:        "2",
 				runpod.RunpodTemplateIdAnnotation: "8pjdlrsfmx",
 			},
 		},
@@ -83,8 +82,8 @@ func TestRunPodCreateCheckAndTerminate(t *testing.T) {
 			Containers: []v1.Container{
 				{
 					Name:    "test-container",
-					Image:   "nvidia/cuda:11.7.1-base-ubuntu22.04", // Use a simple CUDA image
-					Command: []string{"nvidia-smi", "-L"},          // List GPUs and exit
+					Image:   "nvidia/cuda:11.7.1-base-ubuntu22.04",
+					Command: []string{"nvidia-smi", "-L"},
 					Env: []v1.EnvVar{
 						{
 							Name:  "TEST_ENV_VAR",
@@ -96,20 +95,24 @@ func TestRunPodCreateCheckAndTerminate(t *testing.T) {
 		},
 	}
 
-	// 1. Create the pod in Kubernetes
-	createdPod, err := clientset.CoreV1().Pods(ns.Name).Create(context.Background(), pod, metav1.CreateOptions{})
-	require.NoError(t, err, "Failed to create test pod")
-
 	// Variables to track created RunPod instance
 	var runpodID string
 	var costPerHr float64
+	var params map[string]interface{}
+	var createdPod *v1.Pod
+	var lastStatus runpod.PodStatus
+	var detailedStatus *runpod.RunPodDetailedStatus
+	var terminatedID string
 
-	// Ensure pod is cleaned up at the end
+	// Ensure resources are cleaned up at the end
 	defer func() {
-		// Clean up the Kubernetes pod
-		err := clientset.CoreV1().Pods(ns.Name).Delete(context.Background(), pod.Name, metav1.DeleteOptions{})
-		if err != nil {
-			t.Logf("Failed to delete pod: %v", err)
+		// Clean up the Kubernetes pod if it was created
+		if createdPod != nil {
+			t.Logf("Cleaning up Kubernetes pod: %s", pod.Name)
+			err := clientset.CoreV1().Pods(ns.Name).Delete(context.Background(), pod.Name, metav1.DeleteOptions{})
+			if err != nil {
+				t.Logf("Failed to delete pod: %v", err)
+			}
 		}
 
 		// If we created a RunPod instance, make sure to terminate it
@@ -122,132 +125,247 @@ func TestRunPodCreateCheckAndTerminate(t *testing.T) {
 		}
 	}()
 
-	// 2. Prepare RunPod parameters
-	params, err := client.PrepareRunPodParameters(createdPod, false) // false for REST API
-	require.NoError(t, err, "Failed to prepare RunPod parameters")
+	// Use t.Run with a boolean success flag to control progression
+	var testFailed bool
 
-	// 3. Deploy pod to RunPod using REST API
-	t.Log("Deploying pod to RunPod...")
-	runpodID, costPerHr, err = client.DeployPodREST(params)
-	require.NoError(t, err, "Failed to deploy pod to RunPod")
-	require.NotEmpty(t, runpodID, "RunPod ID should not be empty")
-	require.Greater(t, costPerHr, 0.0, "Cost per hour should be greater than 0")
+	// Step 1: Create and verify pod creation
+	t.Run("1. CreatePod", func(t *testing.T) {
+		if testFailed {
+			t.Skip("Skipping due to previous test failure")
+		}
 
-	t.Logf("Pod deployed to RunPod with ID: %s, cost: $%.4f/hr", runpodID, costPerHr)
+		var err error
+		createdPod, err = clientset.CoreV1().Pods(ns.Name).Create(context.Background(), pod, metav1.CreateOptions{})
+		if err != nil {
+			testFailed = true
+			t.Fatalf("Failed to create test pod: %v", err)
+		}
 
-	// 4. Check pod status multiple ways
-	t.Log("Checking pod status...")
+		if createdPod == nil || createdPod.Name != pod.Name {
+			testFailed = true
+			t.Fatalf("Created pod verification failed")
+		}
 
-	// Update the pod in Kubernetes with the RunPod ID
-	patch := fmt.Sprintf(`{"metadata":{"annotations":{"%s":"%s","%s":"%g"}}}`,
-		runpod.RunpodPodIDAnnotation, runpodID,
-		runpod.RunpodCostAnnotation, costPerHr)
+		t.Logf("Pod created successfully: %s", createdPod.Name)
+	})
 
-	_, err = clientset.CoreV1().Pods(ns.Name).Patch(
-		context.Background(),
-		pod.Name,
-		"application/strategic-merge-patch+json",
-		[]byte(patch),
-		metav1.PatchOptions{},
-	)
-	require.NoError(t, err, "Failed to update pod with RunPod ID")
+	// Step 2: Prepare RunPod parameters
+	t.Run("2. PrepareParameters", func(t *testing.T) {
+		if testFailed {
+			t.Skip("Skipping due to previous test failure")
+		}
 
-	// 5. Wait for pod to start and check status with GraphQL API
-	maxWaitTime := 5 * time.Minute
-	interval := 10 * time.Second
-	deadline := time.Now().Add(maxWaitTime)
+		var err error
+		createdPod, err = clientset.CoreV1().Pods(ns.Name).Get(context.Background(), pod.Name, metav1.GetOptions{})
+		if err != nil {
+			testFailed = true
+			t.Fatalf("Failed to get created pod: %v", err)
+		}
 
-	var lastStatus runpod.PodStatus
-	var detailedStatus *runpod.RunPodDetailedStatus
+		params, err = client.PrepareRunPodParameters(createdPod, false) // false for REST API
+		if err != nil {
+			testFailed = true
+			t.Fatalf("Failed to prepare RunPod parameters: %v", err)
+		}
 
-	t.Logf("Waiting up to %s for pod to start...", maxWaitTime)
+		if params == nil {
+			testFailed = true
+			t.Fatalf("RunPod parameters should not be nil")
+		}
 
-	for time.Now().Before(deadline) {
-		// Check status using GraphQL API
-		status, err := client.GetPodStatus(runpodID)
-		if err == nil {
-			lastStatus = status
-			t.Logf("Pod status (GraphQL): %s", status)
+		t.Log("RunPod parameters prepared successfully")
+	})
 
-			// If pod is running or has completed, we can proceed
-			if status == runpod.PodRunning || status == runpod.PodExited {
-				break
+	// Step 3: Deploy pod to RunPod
+	t.Run("3. DeployToRunPod", func(t *testing.T) {
+		if testFailed {
+			t.Skip("Skipping due to previous test failure")
+		}
+
+		var err error
+		t.Log("Deploying pod to RunPod...")
+		runpodID, costPerHr, err = client.DeployPodREST(params)
+		if err != nil {
+			testFailed = true
+			t.Fatalf("Failed to deploy pod to RunPod: %v", err)
+		}
+
+		if runpodID == "" {
+			testFailed = true
+			t.Fatalf("RunPod ID should not be empty")
+		}
+
+		if costPerHr <= 0.0 {
+			testFailed = true
+			t.Fatalf("Cost per hour should be greater than 0, got: %f", costPerHr)
+		}
+
+		t.Logf("Pod deployed to RunPod with ID: %s, cost: $%.4f/hr", runpodID, costPerHr)
+	})
+
+	// Step 4: Update pod with RunPod ID
+	t.Run("4. UpdatePodAnnotations", func(t *testing.T) {
+		if testFailed {
+			t.Skip("Skipping due to previous test failure")
+		}
+
+		patch := fmt.Sprintf(`{"metadata":{"annotations":{"%s":"%s","%s":"%g"}}}`,
+			runpod.RunpodPodIDAnnotation, runpodID,
+			runpod.RunpodCostAnnotation, costPerHr)
+
+		_, err = clientset.CoreV1().Pods(ns.Name).Patch(
+			context.Background(),
+			pod.Name,
+			"application/strategic-merge-patch+json",
+			[]byte(patch),
+			metav1.PatchOptions{},
+		)
+		if err != nil {
+			testFailed = true
+			t.Fatalf("Failed to update pod with RunPod ID: %v", err)
+		}
+
+		t.Log("Pod annotations updated successfully")
+	})
+
+	// Step 5: Wait for pod to start and check status
+	t.Run("5. WaitForPodStartAndCheckStatus", func(t *testing.T) {
+		if testFailed {
+			t.Skip("Skipping due to previous test failure")
+		}
+
+		maxWaitTime := 5 * time.Minute
+		interval := 10 * time.Second
+		deadline := time.Now().Add(maxWaitTime)
+
+		t.Logf("Waiting up to %s for pod to start...", maxWaitTime)
+		podReady := false
+
+		for time.Now().Before(deadline) && !podReady {
+			// check status using REST API
+			restStatus, err := client.GetPodStatusREST(runpodID)
+			if err == nil {
+				t.Logf("Pod status (REST): %s", restStatus)
+			} else {
+				t.Logf("Error getting pod status via REST: %v", err)
 			}
-		} else {
-			t.Logf("Error getting pod status via GraphQL: %v", err)
+
+			// Get detailed status
+			detailedStatus, err = client.GetDetailedPodStatus(runpodID)
+			if err == nil {
+				t.Logf("Detailed pod status: currentStatus=%s, desiredStatus=%s",
+					detailedStatus.CurrentStatus, detailedStatus.DesiredStatus)
+
+				// If we have runtime info, check for completion
+				if detailedStatus.Runtime != nil {
+					t.Logf("Runtime info: exitCode=%d, message=%s, completionStatus=%s",
+						detailedStatus.Runtime.Container.ExitCode,
+						detailedStatus.Runtime.Container.Message,
+						detailedStatus.Runtime.PodCompletionStatus)
+
+					// Check if pod has finished successfully
+					if runpod.IsSuccessfulCompletion(detailedStatus) {
+						t.Log("Pod has completed successfully")
+						podReady = true
+						break
+					}
+				}
+			} else {
+				t.Logf("Error getting detailed pod status: %v", err)
+			}
+
+			time.Sleep(interval)
 		}
 
-		// Also check status using REST API
-		restStatus, err := client.GetPodStatusREST(runpodID)
-		if err == nil {
-			t.Logf("Pod status (REST): %s", restStatus)
-		} else {
-			t.Logf("Error getting pod status via REST: %v", err)
+		// Assert that pod reached running or exited state
+		if !podReady {
+			testFailed = true
+			t.Fatalf("Pod did not reach running or exited state within timeout period")
 		}
 
-		// Get detailed status
-		detailedStatus, err = client.GetDetailedPodStatus(runpodID)
-		if err == nil {
-			t.Logf("Detailed pod status: currentStatus=%s, desiredStatus=%s",
-				detailedStatus.CurrentStatus, detailedStatus.DesiredStatus)
+		if !contains([]runpod.PodStatus{runpod.PodRunning, runpod.PodExited}, lastStatus) {
+			testFailed = true
+			t.Fatalf("Pod should reach running or exited state, got: %s", lastStatus)
+		}
 
-			// If we have runtime info, check for completion
-			if detailedStatus.Runtime != nil {
-				t.Logf("Runtime info: exitCode=%d, message=%s, completionStatus=%s",
-					detailedStatus.Runtime.Container.ExitCode,
-					detailedStatus.Runtime.Container.Message,
-					detailedStatus.Runtime.PodCompletionStatus)
+		t.Logf("Pod reached expected status: %s", lastStatus)
+	})
 
-				// Check if pod has finished successfully
-				if runpod.IsSuccessfulCompletion(detailedStatus) {
-					t.Log("Pod has completed successfully")
+	// Step 6: Terminate pod
+	t.Run("6. TerminatePod", func(t *testing.T) {
+		if testFailed {
+			t.Skip("Skipping due to previous test failure")
+		}
+
+		t.Log("Terminating pod...")
+		err = client.TerminatePod(runpodID)
+		if err != nil {
+			testFailed = true
+			t.Fatalf("Failed to terminate pod: %v", err)
+		}
+
+		// Store the ID and clear runpodID so we don't try to terminate it again in the defer block
+		terminatedID = runpodID
+		runpodID = ""
+
+		t.Log("Pod termination initiated")
+	})
+
+	// Step 7: Verify pod termination
+	t.Run("7. VerifyPodTermination", func(t *testing.T) {
+		if testFailed {
+			t.Skip("Skipping due to previous test failure")
+		}
+
+		if terminatedID == "" {
+			testFailed = true
+			t.Fatalf("No terminated pod ID to verify")
+		}
+
+		t.Log("Verifying pod termination...")
+
+		// Wait for pod to be terminated
+		deadline := time.Now().Add(2 * time.Minute)
+		interval := 10 * time.Second
+		terminated := false
+
+		for time.Now().Before(deadline) && !terminated {
+			status, err := client.GetPodStatusREST(terminatedID)
+			if err != nil {
+				t.Logf("Error getting pod status during termination: %v", err)
+			} else {
+				t.Logf("Pod termination status: %s", status)
+
+				if status == runpod.PodTerminated || status == runpod.PodNotFound {
+					terminated = true
 					break
 				}
 			}
-		} else {
-			t.Logf("Error getting detailed pod status: %v", err)
+
+			time.Sleep(interval)
 		}
 
-		time.Sleep(interval)
-	}
-
-	// Assert that pod reached running or exited state
-	require.Contains(t, []runpod.PodStatus{runpod.PodRunning, runpod.PodExited}, lastStatus,
-		"Pod should reach running or exited state")
-
-	// 6. Terminate pod and verify termination
-	t.Log("Terminating pod...")
-	err = client.TerminatePod(runpodID)
-	require.NoError(t, err, "Failed to terminate pod")
-
-	// Set runpodID to empty so we don't try to terminate it again in the defer block
-	terminatedID := runpodID
-	runpodID = ""
-
-	// 7. Verify pod termination
-	t.Log("Verifying pod termination...")
-
-	// Wait for pod to be terminated
-	deadline = time.Now().Add(2 * time.Minute)
-	terminated := false
-
-	for time.Now().Before(deadline) {
-		status, err := client.GetPodStatusREST(terminatedID)
-		if err != nil {
-			t.Logf("Error getting pod status during termination: %v", err)
-		} else {
-			t.Logf("Pod termination status: %s", status)
-
-			if status == runpod.PodTerminated || status == runpod.PodNotFound {
-				terminated = true
-				break
-			}
+		if !terminated {
+			testFailed = true
+			t.Fatalf("Pod was not confirmed terminated within timeout period")
 		}
 
-		time.Sleep(interval)
+		t.Log("Pod termination verified successfully")
+	})
+
+	if testFailed {
+		t.Fatalf("Test failed - see subtest failures for details")
+	} else {
+		t.Log("All tests completed successfully")
 	}
+}
 
-	assert.True(t, terminated, "Pod should be terminated")
-
-	t.Log("Test completed successfully")
+// Helper function to check if a slice contains a value
+func contains(slice []runpod.PodStatus, value runpod.PodStatus) bool {
+	for _, item := range slice {
+		if item == value {
+			return true
+		}
+	}
+	return false
 }

@@ -105,7 +105,7 @@ type RunPodDetailedStatus struct {
 	Name          string            `json:"name"`
 	DesiredStatus string            `json:"desiredStatus"`
 	CurrentStatus string            `json:"currentStatus,omitempty"`
-	CostPerHr     string            `json:"costPerHr"`
+	CostPerHr     float64           `json:"costPerHr"`
 	Image         string            `json:"image"`
 	Env           map[string]string `json:"env"`
 	MachineID     string            `json:"machineId"`
@@ -181,8 +181,8 @@ func (c *Client) ExecuteGraphQL(query string, variables map[string]interface{}, 
 	return json.NewDecoder(resp.Body).Decode(response)
 }
 
-// GetPodStatus checks the status of a RunPod instance
-func (c *Client) GetPodStatus(podID string) (PodStatus, error) {
+// GetPodStatus checks the status of a RunPod instance, experimental as it was not working
+func (c *Client) GetPodStatusGraphql(podID string) (PodStatus, error) {
 	//in tests this did not work
 	query := `
         query pod($input: PodFilter!) {
@@ -637,6 +637,8 @@ func (c *Client) makeRESTRequest(method, endpoint string, body io.Reader) (*http
 func (c *Client) GetDetailedPodStatus(podID string) (*RunPodDetailedStatus, error) {
 	endpoint := fmt.Sprintf("pods/%s", podID)
 
+	//example response
+	//{\"consumerUserId\":\"user_2QkkFxZghNIYZFVD7mAVsVxNjF1\",\"containerDiskInGb\":15,\"costPerHr\":0.29,\"createdAt\":\"2025-03-30 19:14:42.76 +0000 UTC\",\"desiredStatus\":\"RUNNING\",\"env\":{\"TEST_ENV_VAR\":\"test_value\"},\"gpuCount\":1,\"id\":\"bhxlpbddq58wog\",\"imageName\":\"nvidia/cuda:11.7.1-base-ubuntu22.04\",\"lastStartedAt\":\"2025-03-30 19:14:42.752 +0000 UTC\",\"lastStatusChange\":\"Rented by User: Sun Mar 30 2025 19:14:42 GMT+0000 (Coordinated Universal Time)\",\"machine\":{},\"machineId\":\"p1pm7pqlvvco\",\"memoryInGb\":62,\"name\":\"runpod-test-pod-1743362081\",\"portMappings\":null,\"publicIp\":\"\",\"templateId\":\"8pjdlrsfmx\",\"vcpuCount\":16,\"volumeInGb\":0,\"volumeMountPath\":\"/workspace\"}\n"}
 	resp, err := c.makeRESTRequest("GET", endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get pod details: %w", err)
