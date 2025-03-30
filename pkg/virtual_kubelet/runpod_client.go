@@ -467,12 +467,12 @@ func (c *Client) DeployPodREST(params map[string]interface{}) (string, float64, 
 	}
 
 	var response struct {
-		ID            string `json:"id"`
-		CostPerHr     string `json:"costPerHr"` // JSON returns this as a string
-		MachineID     string `json:"machineId"`
-		Name          string `json:"name"`
-		DesiredStatus string `json:"desiredStatus"`
-		Image         string `json:"image"` // Change from ImageName to match JSON
+		ID            string  `json:"id"`
+		CostPerHr     float64 `json:"costPerHr"` // JSON returns this as a string
+		MachineID     string  `json:"machineId"`
+		Name          string  `json:"name"`
+		DesiredStatus string  `json:"desiredStatus"`
+		Image         string  `json:"image"` // Change from ImageName to match JSON
 
 		Machine struct {
 			DataCenterID string `json:"dataCenterId"`
@@ -490,22 +490,15 @@ func (c *Client) DeployPodREST(params map[string]interface{}) (string, float64, 
 		return "", 0, fmt.Errorf("pod deployment failed: %s", string(body))
 	}
 
-	// Convert CostPerHr to float64
-	costPerHr, err := strconv.ParseFloat(response.CostPerHr, 64)
-	if err != nil {
-		c.logger.Error("Failed to convert CostPerHr to float64", "costPerHr", response.CostPerHr, "err", err)
-		return "", 0, fmt.Errorf("invalid costPerHr value: %s", response.CostPerHr)
-	}
-
 	c.logger.Info("Pod deployed successfully",
 		"podId", response.ID,
-		"costPerHr", costPerHr,
+		"costPerHr", response.CostPerHr,
 		"machineId", response.MachineID,
 		"gpuType", response.Machine.GpuTypeID,
 		"location", response.Machine.Location,
 		"dataCenter", response.Machine.DataCenterID)
 
-	return response.ID, costPerHr, nil
+	return response.ID, response.CostPerHr, nil
 }
 
 // DeployPod deploys a pod to RunPod
