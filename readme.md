@@ -1,9 +1,9 @@
 # 🚀 Virtual Kubelet for RunPod
 
-[![Go Report Card](https://goreportcard.com/badge/github.com/bsvogler/k8s-runpod-controller)](https://goreportcard.com/report/github.com/bsvogler/k8s-runpod-controller)
-[![License](https://img.shields.io/github/license/bsvogler/k8s-runpod-controller)](LICENSE)
-[![Container Registry](https://img.shields.io/badge/container-ghcr.io-blue)](https://github.com/bsvogler/k8s-runpod-controller/pkgs/container/k8s-runpod-controller)
-[![Release](https://img.shields.io/github/v/release/bsvogler/k8s-runpod-controller)](https://github.com/bsvogler/k8s-runpod-controller/releases)
+[![Go Report Card](https://goreportcard.com/badge/github.com/bsvogler/k8s-runpod-kubelet)](https://goreportcard.com/report/github.com/bsvogler/k8s-runpod-kubelet)
+[![License](https://img.shields.io/github/license/bsvogler/k8s-runpod-kubelet)](LICENSE)
+[![Container Registry](https://img.shields.io/badge/container-ghcr.io-blue)](https://github.com/bsvogler/k8s-runpod-kubelet/pkgs/container/k8s-runpod-kubelet)
+[![Release](https://img.shields.io/github/v/release/bsvogler/k8s-runpod-kubelet)](https://github.com/bsvogler/k8s-runpod-kubelet/releases)
 
 This Virtual Kubelet implementation provides seamless integration between Kubernetes and RunPod, enabling dynamic, cloud-native GPU workload scaling across local and cloud resources - automatically extend your cluster with on-demand GPUs without managing infrastructure.
 
@@ -73,7 +73,7 @@ kubectl create secret generic runpod-secret \
   --from-literal=RUNPOD_KEY=<your-runpod-api-key>
 
 # Apply controller deployment
-kubectl apply -f https://raw.githubusercontent.com/bsvogler/k8s-runpod-controller/main/deploy/runpod-controller.yaml
+kubectl apply -f https://raw.githubusercontent.com/bsvogler/k8s-runpod-kubelet/main/deploy/runpod-controller.yaml
 ```
 
 ### Configuration
@@ -81,7 +81,7 @@ kubectl apply -f https://raw.githubusercontent.com/bsvogler/k8s-runpod-controlle
 Configure using environment variables or command-line flags:
 
 ```bash
-./k8s-runpod-controller \
+./k8s-runpod-kubelet \
   --nodename=virtual-runpod \
   --namespace=kube-system \
   --max-gpu-price=0.5 \
@@ -191,14 +191,14 @@ curl http://localhost:8080/readyz   # Readiness probe
 
 ```bash
 # Clone the repository
-git clone https://github.com/bsvogler/k8s-runpod-controller.git
-cd k8s-runpod-controller
+git clone https://github.com/bsvogler/k8s-runpod-kubelet.git
+cd k8s-runpod-kubelet
 
 # Build the binary
-go build -o k8s-runpod-controller ./cmd/main.go
+go build -o k8s-runpod-kubelet ./cmd/main.go
 
 # Run locally
-./k8s-runpod-controller --kubeconfig=$HOME/.kube/config
+./k8s-runpod-kubelet --kubeconfig=$HOME/.kube/config
 ```
 
 ## 🧪 Testing
