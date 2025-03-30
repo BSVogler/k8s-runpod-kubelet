@@ -5,7 +5,9 @@
 [![Container Registry](https://img.shields.io/badge/container-ghcr.io-blue)](https://github.com/bsvogler/k8s-runpod-kubelet/pkgs/container/k8s-runpod-kubelet)
 [![Release](https://img.shields.io/github/v/release/bsvogler/k8s-runpod-kubelet)](https://github.com/bsvogler/k8s-runpod-kubelet/releases)
 
-This Virtual Kubelet implementation provides seamless integration between Kubernetes and RunPod, enabling dynamic, cloud-native GPU workload scaling across local and cloud resources - automatically extend your cluster with on-demand GPUs without managing infrastructure.
+This Virtual Kubelet implementation provides seamless integration between Kubernetes and RunPod, enabling dynamic,
+cloud-native GPU workload scaling across local and cloud resources - automatically extend your cluster with on-demand
+GPUs without managing infrastructure.
 
 ## 🌟 Key Features
 
@@ -19,7 +21,9 @@ This Virtual Kubelet implementation provides seamless integration between Kubern
 
 ## 🔧 How It Works
 
-The controller implements the [Virtual Kubelet](https://virtual-kubelet.io/) provider interface to represent RunPod as a node in your Kubernetes cluster. When pods are scheduled to this virtual node, they are automatically deployed to RunPod's infrastructure.
+The controller implements the [Virtual Kubelet](https://virtual-kubelet.io/) provider interface to represent RunPod as a
+node in your Kubernetes cluster. When pods are scheduled to this virtual node, they are automatically deployed to
+RunPod's infrastructure.
 
 The Virtual Kubelet acts as a bridge between Kubernetes and RunPod, providing a fully integrated experience:
 
@@ -90,6 +94,7 @@ Configure using environment variables or command-line flags:
 ```
 
 Common configuration options:
+
 - `RUNPOD_KEY`: RunPod API authentication key
 - `--nodename`: Name of the virtual node (default: "virtual-runpod")
 - `--namespace`: Kubernetes namespace (default: "kube-system")
@@ -99,7 +104,8 @@ Common configuration options:
 
 ## 🔍 Usage
 
-Once installed, the controller will register a virtual node named `virtual-runpod` in your cluster. To schedule a pod to RunPod, add the appropriate node selector and tolerations:
+Once installed, the controller will register a virtual node named `virtual-runpod` in your cluster. To schedule a pod to
+RunPod, add the appropriate node selector and tolerations:
 
 ```yaml
 apiVersion: v1
@@ -108,68 +114,39 @@ metadata:
   name: gpu-workload
 spec:
   containers:
-  - name: gpu-container
-    image: nvidia/cuda:11.7.1-base-ubuntu22.04
-    command: ["nvidia-smi", "-L"]
-    resources:
-      limits:
-        nvidia.com/gpu: 1
+    - name: gpu-container
+      image: nvidia/cuda:11.7.1-base-ubuntu22.04
+      command: [ "nvidia-smi", "-L" ]
+      resources:
+        requests:
+          nvidia.com/gpu: 1
+        limits:
+          nvidia.com/gpu: 1
   nodeSelector:
     type: virtual-kubelet
   tolerations:
-  - key: "virtual-kubelet.io/provider"
-    operator: "Equal"
-    value: "runpod"
-    effect: "NoSchedule"
-```
-
-### Job Example
-
-For batch workloads, you can use a Kubernetes Job:
-
-```yaml
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: gpu-workload
-  labels:
-    runpod.io/managed: "true"
-  annotations:
-    runpod.io/required-gpu-memory: "16"
-spec:
-  template:
-    spec:
-      containers:
-      - name: gpu-task
-        image: my-gpu-image:latest
-        resources:
-          requests:
-            nvidia.com/gpu: 1
-          limits:
-            nvidia.com/gpu: 1
-      nodeSelector:
-        type: virtual-kubelet
-      tolerations:
-      - key: "virtual-kubelet.io/provider"
-        operator: "Equal"
-        value: "runpod"
-        effect: "NoSchedule"
-      restartPolicy: Never
+    - key: "virtual-kubelet.io/provider"
+      operator: "Equal"
+      value: "runpod"
+      effect: "NoSchedule"
 ```
 
 ### Annotations
 
-You can customize the RunPod deployment using annotations:
+You can customize the RunPod deployment using annotations. Add annotations to the pod or to the controlling job.
 
 ```yaml
 metadata:
   annotations:
-    runpod.io/managed: "true"           # Enable RunPod management
-    runpod.io/cloud-type: "COMMUNITY"   # SECURE or COMMUNITY
     runpod.io/required-gpu-memory: "16" # Minimum GPU memory in GB
-    runpod.io/templateId: "your-template-id"  # Use a specific RunPod template
-    runpod.io/container-registry-auth-id: "your-auth-id"  # For private registries
+    runpod.io/templateId: "your-template-id"  # Use a specific RunPod template to use a preregistered authentication.
 ```
+
+Experimental. Implemented here but not working with the API.
+``
+    runpod.io/cloud-type: "COMMUNITY"   # SECURE or COMMUNITY.should in THEORY support COMMUNITY and STANDARD but in tests only STANDARD lead to results when using the API. Therefore, defaults to STANDARD.
+    runpod.io/container-registry-auth-id: "your-auth-id"  # For private registries. Should be supported in theory but only working solution so far found when using template id and preregistering.
+``
 
 ### Monitoring
 
@@ -244,4 +221,5 @@ This project is licensed under a Non-Commercial License - see the [LICENSE](LICE
 - **Prohibited**: Commercial use without explicit permission
 - **Required**: License and copyright notice
 
-For commercial licensing inquiries or to discuss custom development work as a freelancer, please contact me at engineering@benediktsvogler.com or via [benediktsvogler.com](https://benediktsvogler.com).
+For commercial licensing inquiries or to discuss custom development work as a freelancer, please contact me at
+engineering@benediktsvogler.com or via [benediktsvogler.com](https://benediktsvogler.com).
