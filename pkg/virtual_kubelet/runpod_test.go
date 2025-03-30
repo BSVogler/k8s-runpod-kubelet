@@ -68,13 +68,14 @@ func TestRunPodCreateCheckAndTerminate(t *testing.T) {
 		}
 	}()
 
-	// Create a test pod configuration
+	// Create a test pod configuration, the runpod needs to have some annotations like the template to even work with the API
 	pod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: fmt.Sprintf("runpod-test-pod-%d", time.Now().Unix()),
 			Annotations: map[string]string{
-				runpod.RunpodCloudTypeAnnotation: "COMMUNITY", // Use community cloud for lower costs during testing
-				runpod.GpuMemoryAnnotation:       "16",        // Request minimum 16GB GPU memory
+				runpod.RunpodCloudTypeAnnotation:  "STANDARD", // Use community cloud for lower costs during testing
+				runpod.GpuMemoryAnnotation:        "2",        // Request minimum 16GB GPU memory
+				runpod.RunpodTemplateIdAnnotation: "8pjdlrsfmx",
 			},
 		},
 		Spec: v1.PodSpec{
