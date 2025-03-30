@@ -31,8 +31,9 @@ type Client struct {
 
 // Constants for RunPod integration
 const (
-	RunpodPodIDAnnotation                 = "runpod.io/pod-id"
-	RunpodCostAnnotation                  = "runpod.io/cost-per-hr"
+	RunpodPodIDAnnotation = "runpod.io/pod-id"
+	RunpodCostAnnotation  = "runpod.io/cost-per-hr"
+	//RunpodCloudTypeAnnotation should in THEORY support COMMUNITY and STANDARD but in tests only STANDARD lead to results when using the API. Therefore, defaults to STANDARD.
 	RunpodCloudTypeAnnotation             = "runpod.io/cloud-type"
 	RunpodTemplateIdAnnotation            = "runpod.io/templateId"
 	GpuMemoryAnnotation                   = "runpod.io/required-gpu-memory"
