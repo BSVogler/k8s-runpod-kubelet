@@ -4,7 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	runpod "github.com/bsvogler/k8s-runpod-controller/pkg/virtual_kubelet"
+	runpod "github.com/bsvogler/k8s-runpod-kubelet/pkg/virtual_kubelet"
 	"github.com/getsentry/sentry-go"
 	sentryslog "github.com/getsentry/sentry-go/slog"
 	"io"
@@ -20,7 +20,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bsvogler/k8s-runpod-controller/pkg/config"
+	"github.com/bsvogler/k8s-runpod-kubelet/pkg/config"
 	"github.com/virtual-kubelet/virtual-kubelet/node"
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	"gopkg.in/yaml.v2"

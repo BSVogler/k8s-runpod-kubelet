@@ -77,7 +77,7 @@ kubectl create secret generic runpod-secret \
   --from-literal=RUNPOD_KEY=<your-runpod-api-key>
 
 # Apply controller deployment
-kubectl apply -f https://raw.githubusercontent.com/bsvogler/k8s-runpod-kubelet/main/deploy/runpod-controller.yaml
+kubectl apply -f https://raw.githubusercontent.com/bsvogler/k8s-runpod-kubelet/main/deploy/kubelet.yaml
 ```
 
 ### Configuration

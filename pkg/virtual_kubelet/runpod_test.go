@@ -3,7 +3,7 @@ package runpod_test
 import (
 	"context"
 	"fmt"
-	runpod "github.com/bsvogler/k8s-runpod-controller/pkg/virtual_kubelet"
+	runpod "github.com/bsvogler/k8s-runpod-kubelet/pkg/virtual_kubelet"
 	"log/slog"
 	"os"
 	"testing"

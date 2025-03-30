@@ -1,4 +1,4 @@
-module github.com/bsvogler/k8s-runpod-controller
+module github.com/bsvogler/k8s-runpod-kubelet
 
 go 1.24.0
 

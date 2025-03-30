@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/bsvogler/k8s-runpod-controller/pkg/config"
+	"github.com/bsvogler/k8s-runpod-kubelet/pkg/config"
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	"io"
 	v1 "k8s.io/api/core/v1"
