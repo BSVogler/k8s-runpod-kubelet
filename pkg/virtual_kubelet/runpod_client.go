@@ -878,6 +878,18 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 
 	// Determine cloud type - default to SECURE but allow override via annotation
 	cloudType := "SECURE"
+	// Helper function to get annotation value with fallback to job annotations
+	getAnnotation := func(annotationKey string, defaultValue string) string {
+		if val, exists := pod.Annotations[annotationKey]; exists && val != "" {
+			return val
+		}
+		if ownerJob != nil && ownerJob.Annotations != nil {
+			if val, exists := ownerJob.Annotations[annotationKey]; exists && val != "" {
+				return val
+			}
+		}
+		return defaultValue
+	}
 	if cloudTypeVal := getAnnotation(RunpodCloudTypeAnnotation, ""); cloudTypeVal != "" {
 		// Validate and normalize the cloud type value
 		cloudTypeUpperCase := strings.ToUpper(cloudTypeVal)
@@ -892,23 +904,7 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 		}
 	}
 
-	// Helper function to get annotation value with fallback to job annotations
-	getAnnotation := func(annotationKey string, defaultValue string) string {
-		if val, exists := pod.Annotations[annotationKey]; exists && val != "" {
-			return val
-		}
-		if ownerJob != nil && ownerJob.Annotations != nil {
-			if val, exists := ownerJob.Annotations[annotationKey]; exists && val != "" {
-				return val
-			}
-		}
-		return defaultValue
-	}
-
-	// Extract container registry auth ID if provided
 	containerRegistryAuthId := getAnnotation(RunpodContainerRegistryAuthAnnotation, "")
-
-	// Extract template ID if provided
 	templateId := getAnnotation(RunpodTemplateIdAnnotation, "")
 
 	// Determine minimum GPU memory required
