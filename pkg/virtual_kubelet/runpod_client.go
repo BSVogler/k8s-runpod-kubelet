@@ -866,22 +866,6 @@ func (c *Client) ExtractEnvVars(pod *v1.Pod) ([]RunPodEnv, error) {
 // PrepareRunPodParameters prepares parameters for RunPod deployment
 // Update PrepareRunPodParameters to use the clientset from the Client struct
 func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]interface{}, error) {
-	// Determine cloud type - default to SECURE but allow override via annotation
-	cloudType := "SECURE"
-	if cloudTypeVal, exists := pod.Annotations[RunpodCloudTypeAnnotation]; exists {
-		// Validate and normalize the cloud type value
-		cloudTypeUpperCase := strings.ToUpper(cloudTypeVal)
-		if cloudTypeUpperCase == "SECURE" || cloudTypeUpperCase == "COMMUNITY" {
-			cloudType = cloudTypeUpperCase
-		} else {
-			c.logger.Warn("Invalid cloud type specified, using default",
-				"pod", pod.Name,
-				"namespace", pod.Namespace,
-				"specifiedValue", cloudTypeVal,
-				"defaultValue", cloudType)
-		}
-	}
-
 	// Check if pod is owned by a job and use job annotations if available
 	var ownerJob *batchv1.Job
 	for _, owner := range pod.OwnerReferences {
@@ -899,13 +883,19 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 		}
 	}
 
-	// If job owner found, use its annotations for RunPod parameters
-	if ownerJob != nil {
-		if cloudTypeFromJob, exists := ownerJob.Annotations[RunpodCloudTypeAnnotation]; exists {
-			cloudTypeUpperCase := strings.ToUpper(cloudTypeFromJob)
-			if cloudTypeUpperCase == "SECURE" || cloudTypeUpperCase == "COMMUNITY" {
-				cloudType = cloudTypeUpperCase
-			}
+	// Determine cloud type - default to SECURE but allow override via annotation
+	cloudType := "SECURE"
+	if cloudTypeVal := getAnnotation(RunpodCloudTypeAnnotation, ""); cloudTypeVal != "" {
+		// Validate and normalize the cloud type value
+		cloudTypeUpperCase := strings.ToUpper(cloudTypeVal)
+		if cloudTypeUpperCase == "SECURE" || cloudTypeUpperCase == "COMMUNITY" {
+			cloudType = cloudTypeUpperCase
+		} else {
+			c.logger.Warn("Invalid cloud type specified, using default",
+				"pod", pod.Name,
+				"namespace", pod.Namespace,
+				"specifiedValue", cloudTypeVal,
+				"defaultValue", cloudType)
 		}
 	}
 
