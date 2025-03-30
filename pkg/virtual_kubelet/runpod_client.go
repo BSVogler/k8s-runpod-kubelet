@@ -909,37 +909,30 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 		}
 	}
 
-	// Extract container registry auth ID if provided
-	containerRegistryAuthId := ""
-	if authID, exists := pod.Annotations[RunpodContainerRegistryAuthAnnotation]; exists && authID != "" {
-		containerRegistryAuthId = authID
-	} else if ownerJob != nil && ownerJob.Annotations != nil {
-		if authID, exists := ownerJob.Annotations[RunpodContainerRegistryAuthAnnotation]; exists && authID != "" {
-			containerRegistryAuthId = authID
+	// Helper function to get annotation value with fallback to job annotations
+	getAnnotation := func(annotationKey string, defaultValue string) string {
+		if val, exists := pod.Annotations[annotationKey]; exists && val != "" {
+			return val
 		}
+		if ownerJob != nil && ownerJob.Annotations != nil {
+			if val, exists := ownerJob.Annotations[annotationKey]; exists && val != "" {
+				return val
+			}
+		}
+		return defaultValue
 	}
 
+	// Extract container registry auth ID if provided
+	containerRegistryAuthId := getAnnotation(RunpodContainerRegistryAuthAnnotation, "")
+
 	// Extract template ID if provided
-	templateId := ""
-	if tplID, exists := pod.Annotations[RunpodTemplateIdAnnotation]; exists && tplID != "" {
-		templateId = tplID
-	} else if ownerJob != nil && ownerJob.Annotations != nil {
-		if tplID, exists := ownerJob.Annotations[RunpodTemplateIdAnnotation]; exists && tplID != "" {
-			templateId = tplID
-		}
-	}
+	templateId := getAnnotation(RunpodTemplateIdAnnotation, "")
 
 	// Determine minimum GPU memory required
 	minRAMPerGPU := 16 // Default minimum memory
-	if memStr, exists := pod.Annotations[GpuMemoryAnnotation]; exists {
+	if memStr := getAnnotation(GpuMemoryAnnotation, ""); memStr != "" {
 		if mem, err := strconv.Atoi(memStr); err == nil {
 			minRAMPerGPU = mem
-		}
-	} else if ownerJob != nil && ownerJob.Annotations != nil {
-		if memStr, exists := ownerJob.Annotations[GpuMemoryAnnotation]; exists {
-			if mem, err := strconv.Atoi(memStr); err == nil {
-				minRAMPerGPU = mem
-			}
 		}
 	}
 
