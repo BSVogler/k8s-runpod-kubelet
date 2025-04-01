@@ -662,11 +662,13 @@ func (p *Provider) GetNodeStatus() *v1.Node {
 				v1.ResourceCPU:    resource.MustParse("20"),
 				v1.ResourceMemory: resource.MustParse("100Gi"),
 				v1.ResourcePods:   resource.MustParse("100"),
+				"nvidia.com/gpu":  resource.MustParse("4"), //always 4 but it would be cool to make this dynamic
 			},
 			Allocatable: v1.ResourceList{
 				v1.ResourceCPU:    resource.MustParse("20"),
 				v1.ResourceMemory: resource.MustParse("100Gi"),
 				v1.ResourcePods:   resource.MustParse("100"),
+				"nvidia.com/gpu":  resource.MustParse("4"),
 			},
 			Conditions: []v1.NodeCondition{
 				{
