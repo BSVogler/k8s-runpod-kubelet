@@ -1,9 +1,9 @@
 ---
-# ClusterRole with permissions needed by virtual-kubelet
+# ClusterRole with permissions needed by runpod-kubelet
 kind: ClusterRole
 apiVersion: rbac.authorization.k8s.io/v1
 metadata:
-  name: virtual-kubelet
+  name: runpod-kubelet
 rules:
   - apiGroups: [""]
     resources: ["pods", "nodes", "nodes/status", "namespaces", "configmaps", "secrets"]
@@ -22,19 +22,81 @@ rules:
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: virtual-kubelet
+  name: runpod-kubelet
   namespace: kube-system  # Change this if needed
 ---
 # ClusterRoleBinding to grant the ServiceAccount the required permissions
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: virtual-kubelet
+  name: runpod-kubelet
 subjects:
   - kind: ServiceAccount
-    name: virtual-kubelet
+    name: runpod-kubelet
     namespace: kube-system  # Change this if needed
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: virtual-kubelet
+  name: runpod-kubelet
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: runpod-kubelet
+  namespace: kube-system
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: runpod-kubelet
+  template:
+    metadata:
+      labels:
+        app: runpod-kubelet
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: runpod-runpod-kubelet
+      serviceAccountName: runpod-kubelet
+      imagePullSecrets:
+        - name: regcred
+      containers:
+        - name: kubelet
+          image: ghcr.io/bsvogler/gpu-runpod-kubelet:latest
+          args:
+            - "--reconcile-interval=30"
+            - "--pending-job-threshold=1"
+            - "--max-pending-time=0"
+            - "--max-gpu-price=0.5"
+            - "--health-server-address=:8080"
+          ports:
+            - containerPort: 8080
+              name: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          envFrom:
+            - secretRef:
+                name: runpod-kubelet-secrets
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
