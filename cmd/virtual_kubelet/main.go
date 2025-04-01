@@ -7,6 +7,7 @@ import (
 	runpod "github.com/bsvogler/k8s-runpod-kubelet/pkg/virtual_kubelet"
 	"github.com/getsentry/sentry-go"
 	sentryslog "github.com/getsentry/sentry-go/slog"
+	"github.com/google/uuid"
 	"io"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
@@ -32,6 +33,10 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/record"
+)
+import (
+	authenticationv1 "k8s.io/api/authentication/v1"
+	authorizationv1 "k8s.io/api/authorization/v1"
 )
 
 var (
@@ -79,6 +84,96 @@ func LoadConfig(path string) (config.Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func logAuthInfo(k8sClient *kubernetes.Clientset, logger *slog.Logger) {
+	// Get current user info
+	selfSubject, err := k8sClient.AuthorizationV1().SelfSubjectAccessReviews().Create(
+		context.Background(),
+		&authorizationv1.SelfSubjectAccessReview{
+			Spec: authorizationv1.SelfSubjectAccessReviewSpec{
+				ResourceAttributes: &authorizationv1.ResourceAttributes{
+					Verb:     "get",
+					Resource: "pods",
+				},
+			},
+		},
+		metav1.CreateOptions{},
+	)
+
+	if err != nil {
+		logger.Error("Failed to get authentication info", "error", err)
+		return
+	}
+
+	// Try to get user info from API server
+	userInfo, err := k8sClient.AuthenticationV1().SelfSubjectReviews().Create(
+		context.Background(),
+		&authenticationv1.SelfSubjectReview{},
+		metav1.CreateOptions{},
+	)
+
+	if err != nil {
+		logger.Error("Failed to get user info", "error", err)
+	} else if userInfo.Status.UserInfo.Username != "" {
+		logger.Info("Authenticated as",
+			"username", userInfo.Status.UserInfo.Username,
+			"groups", userInfo.Status.UserInfo.Groups)
+		return
+	}
+
+	// If direct method fails, use a generic method that works for in-cluster and kubeconfig
+	// Create a pod with an annotation in a test namespace, then check who created it
+	testNs := "default"
+	testPodName := "auth-test-" + uuid.NewString()[:8]
+
+	// First check if we can create a pod
+	testPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: testPodName,
+			Annotations: map[string]string{
+				"purpose": "auth-check",
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  "pause",
+					Image: "k8s.gcr.io/pause:3.5",
+				},
+			},
+			RestartPolicy: corev1.RestartPolicyNever,
+		},
+	}
+
+	pod, err := k8sClient.CoreV1().Pods(testNs).Create(
+		context.Background(),
+		testPod,
+		metav1.CreateOptions{})
+
+	// Always clean up the test pod
+	defer func() {
+		if pod != nil {
+			err := k8sClient.CoreV1().Pods(testNs).Delete(
+				context.Background(),
+				testPodName,
+				metav1.DeleteOptions{})
+			if err != nil {
+				logger.Warn("Failed to clean up test pod", "error", err)
+			}
+		}
+	}()
+
+	if err != nil {
+		logger.Error("Failed to create test pod", "error", err)
+		logger.Info("Auth info", "authorized", selfSubject.Status.Allowed)
+		return
+	}
+
+	// Log the creator information
+	logger.Info("Authentication succeeded",
+		"createdBy", pod.ObjectMeta.CreationTimestamp,
+		"authorized", selfSubject.Status.Allowed)
 }
 
 func main() {
@@ -145,6 +240,9 @@ func main() {
 		logger.Error("Failed to create Kubernetes client", "error", err)
 		os.Exit(1)
 	}
+	if k8sClient != nil {
+		logAuthInfo(k8sClient, logger)
+	}
 
 	// Create the RunPod provider
 	provider, err := runpod.NewProvider(
@@ -195,7 +293,7 @@ func main() {
 
 	// Wait for caches to sync with a timeout
 	logger.Info("Waiting for informer caches to sync")
-	if !cache.WaitForCacheSync(syncCtx.Done(), podInformer.Informer().HasSynced) {
+	if !cache.WaitForNamedCacheSync("RunPodController", syncCtx.Done(), podInformer.Informer().HasSynced) {
 		logger.Error("Failed to sync pod informer cache within timeout")
 		// Consider continuing anyway or exiting
 		// os.Exit(1)
@@ -304,7 +402,7 @@ func main() {
 	}()
 
 	go func() {
-		logger.Info("Starting API server", "port", listenPort)
+		logger.Info("Starting API server for K8S to use", "port", listenPort)
 		if err := apiServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("Failed to run API server", "error", err)
 			cancel()
