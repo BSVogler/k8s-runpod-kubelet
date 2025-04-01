@@ -170,7 +170,7 @@ func main() {
 	// Create informer factory for the default namespace or specified namespace
 	informerFactory := informers.NewSharedInformerFactoryWithOptions(
 		k8sClient,
-		30*time.Second, // Resync period
+		time.Duration(reconcileInterval)*time.Second,
 	)
 
 	// Start the informer factory
