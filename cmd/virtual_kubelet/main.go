@@ -171,7 +171,6 @@ func main() {
 	informerFactory := informers.NewSharedInformerFactoryWithOptions(
 		k8sClient,
 		30*time.Second, // Resync period
-		informers.WithNamespace(kubenamespace),
 	)
 
 	// Start the informer factory
