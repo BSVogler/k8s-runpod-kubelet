@@ -320,11 +320,18 @@ func main() {
 	}
 
 	// Create node controller
+	_, err = k8sClient.Discovery().ServerResourcesForGroupVersion("coordination.k8s.io/v1")
+	var nodeControllerOpts []node.NodeControllerOpt
+	if err == nil {
+		// Only enable leases if the API is available
+		nodeControllerOpts = append(nodeControllerOpts, node.WithNodeEnableLeaseV1(k8sClient.CoordinationV1().Leases(kubenamespace), int32(30)))
+	}
+
 	nodeController, err := node.NewNodeController(
 		provider,
 		provider.GetNodeStatus(),
 		k8sClient.CoreV1().Nodes(),
-		node.WithNodeEnableLeaseV1(k8sClient.CoordinationV1().Leases(kubenamespace), int32(30)),
+		nodeControllerOpts...,
 	)
 	if err != nil {
 		logger.Error("Failed to create node controller", "error", err)
