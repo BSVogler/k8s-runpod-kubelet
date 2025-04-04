@@ -29,3 +29,4 @@ go.work
 # Explicitly do not ignore these files
 !go.mod
 !go.sum
+.run/go build github.com_bsvogler_k8s-runpod-kubelet_cmd_virtual_kubelet.run.xml
