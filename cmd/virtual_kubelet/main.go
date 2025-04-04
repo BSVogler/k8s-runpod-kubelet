@@ -11,7 +11,7 @@ import (
 	"io"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
-	"k8s.io/client-go/tools/cache"
+	"k8s.io/klog/v2"
 	"log"
 	"log/slog"
 	"net/http"
@@ -51,6 +51,7 @@ var (
 	maxGPUPrice         float64
 	healthServerAddress string
 	kubenamespace       string
+	disableLeases       bool
 )
 
 // Log handlers are defined in a separate file
@@ -67,6 +68,7 @@ func init() {
 	flag.IntVar(&listenPort, "listen-port", 10250, "port to listen on")
 	flag.StringVar(&logLevel, "log-level", "info", "log level (debug, info, warn, error)")
 	flag.StringVar(&kubenamespace, "namespace", "kube-system", "kubernetes namespace")
+	flag.BoolVar(&disableLeases, "disable-leases", false, "Disable node lease feature")
 }
 
 // LoadConfig loads configuration from a YAML file
@@ -202,12 +204,14 @@ func main() {
 
 		// Configure `slog` to use the multi handler
 		logger = slog.New(multiHandler)
-		//logger = logger.With("release", "v1.0.1")
 		defer sentry.Flush(2 * time.Second) //send errors after a crash
 	} else { // Use a default logger (stdout) when Sentry is not initialized
 		logger = slog.New(slog.NewTextHandler(os.Stdout, nil))
 	}
-
+	klog.InitFlags(nil)
+	flag.Set("v", "5") // High verbosity shows HTTP requests
+	flag.Set("alsologtostderr", "true")
+	flag.Parse()
 	flag.Parse()
 
 	// Create a context with cancellation
@@ -265,43 +269,34 @@ func main() {
 	})
 	eventRecorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: nodeName})
 
-	// Create informer factory for the default namespace or specified namespace
-	informerFactory := informers.NewSharedInformerFactoryWithOptions(
+	informerFactory := informers.NewSharedInformerFactory(
 		k8sClient,
 		time.Duration(reconcileInterval)*time.Second,
 	)
 
-	// Start the informer factory
-	informerFactory.Start(ctx.Done())
-
-	// Wait for caches to sync
-	syncCtx, syncCancel := context.WithTimeout(ctx, 30*time.Second)
-	defer syncCancel()
-
-	_, err = k8sClient.CoreV1().Namespaces().Get(ctx, "kube-system", metav1.GetOptions{})
-	if err != nil {
-		logger.Error("Failed to connect to Kubernetes API", "error", err)
-		os.Exit(1)
-	}
-	logger.Info("Successfully connected to Kubernetes API")
-
-	// Create pod controller with the informer
+	// Create the essential informers
 	podInformer := informerFactory.Core().V1().Pods()
 	configMapInformer := informerFactory.Core().V1().ConfigMaps()
 	secretInformer := informerFactory.Core().V1().Secrets()
 	serviceInformer := informerFactory.Core().V1().Services()
 
-	// Wait for caches to sync with a timeout
-	logger.Info("Waiting for informer caches to sync")
-	if !cache.WaitForNamedCacheSync("RunPodController", syncCtx.Done(), podInformer.Informer().HasSynced) {
-		logger.Error("Failed to sync pod informer cache within timeout")
-		// Consider continuing anyway or exiting
-		// os.Exit(1)
+	// Start the informer factory
+	informerFactory.Start(ctx.Done())
 
-		// For debugging, log a warning but continue
-		logger.Warn("Continuing without fully synced cache")
-	} else {
-		logger.Info("Informer caches synced successfully")
+	// Wait for the pod informer cache to sync with a longer timeout
+	syncCtx, syncCancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer syncCancel()
+
+	logger.Info("Waiting for pod informer cache to sync")
+	syncResult := informerFactory.WaitForCacheSync(syncCtx.Done())
+
+	// Check results for each informer
+	for informerType, synced := range syncResult {
+		if !synced {
+			logger.Error("Failed to sync cache", "informerType", informerType)
+		} else {
+			logger.Info("Cache synced successfully", "informerType", informerType)
+		}
 	}
 	// Then when creating the pod controller, include all informers:
 	podController, err := node.NewPodController(node.PodControllerConfig{
