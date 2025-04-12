@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	runpod "github.com/bsvogler/k8s-runpod-kubelet/pkg/virtual_kubelet"
@@ -410,7 +411,7 @@ func main() {
 
 	go func() {
 		logger.Info("Starting API server for K8S to use", "port", listenPort)
-		if err := apiServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := apiServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("Failed to run API server", "error", err)
 			cancel()
 		}
