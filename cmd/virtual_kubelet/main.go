@@ -443,30 +443,30 @@ func main() {
 
 // createK8sClient creates a Kubernetes client
 func createK8sClient(kubeconfig string) (*kubernetes.Clientset, error) {
-	var config *rest.Config
+	var clusterConfig *rest.Config
 	var err error
 
 	if kubeconfig == "" {
-		// Try loading in-cluster config
-		config, err = rest.InClusterConfig()
+		// Try loading in-cluster clusterConfig
+		clusterConfig, err = rest.InClusterConfig()
 		if err != nil {
-			// If no in-cluster config, look for kubeconfig in default location
+			// If no in-cluster clusterConfig, look for kubeconfig in default location
 			home := homeDir()
 			if home != "" {
-				kubeconfig = filepath.Join(home, ".kube", "config")
+				kubeconfig = filepath.Join(home, ".kube", "clusterConfig")
 			}
 		}
 	}
 
-	if config == nil {
-		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if clusterConfig == nil {
+		clusterConfig, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load kubeconfig: %w", err)
 		}
 	}
 
 	// Create the clientset
-	clientset, err := kubernetes.NewForConfig(config)
+	clientset, err := kubernetes.NewForConfig(clusterConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create kubernetes client: %w", err)
 	}
