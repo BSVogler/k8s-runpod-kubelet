@@ -498,6 +498,52 @@ func (p *Provider) updateAllPodStatuses() {
 			continue
 		}
 
+		// If status is NOT_FOUND, remove annotations immediately
+		if status == PodNotFound {
+			p.logger.Info("RunPod instance not found, removing RunPod annotations",
+				"pod", pod.Name, "namespace", pod.Namespace, "runpodID", podID)
+
+			// Get current version of the pod
+			currentPod, err := p.clientset.CoreV1().Pods(pod.Namespace).Get(
+				context.Background(),
+				pod.Name,
+				metav1.GetOptions{},
+			)
+			if err == nil {
+				// Make a deep copy to avoid modifying the cache
+				podCopy := currentPod.DeepCopy()
+
+				// Remove the RunPod annotations
+				if podCopy.Annotations != nil {
+					delete(podCopy.Annotations, RunpodPodIDAnnotation)
+					delete(podCopy.Annotations, RunpodCostAnnotation)
+
+					// Update the pod
+					_, updateErr := p.clientset.CoreV1().Pods(podCopy.Namespace).Update(
+						context.Background(),
+						podCopy,
+						metav1.UpdateOptions{},
+					)
+					if updateErr != nil {
+						p.logger.Error("Failed to remove RunPod annotations from pod",
+							"pod", pod.Name, "namespace", pod.Namespace, "error", updateErr)
+					} else {
+						p.logger.Info("Removed RunPod annotations from pod",
+							"pod", pod.Name, "namespace", pod.Namespace)
+
+						// Update our local cache as well
+						p.podsMutex.Lock()
+						p.pods[podKey] = podCopy
+						if pInfo, exists := p.podStatus[podKey]; exists {
+							pInfo.ID = "" // Clear the RunPod ID
+							p.podStatus[podKey] = pInfo
+						}
+						p.podsMutex.Unlock()
+					}
+				}
+			}
+		}
+
 		// Update pod info if status changed
 		if string(status) != podInfo.Status {
 			// Update status in our tracking map
@@ -1516,11 +1562,14 @@ func (p *Provider) translateRunPodStatus(runpodStatus string, statusMessage stri
 		containerStatus.Started = &falseVal
 
 	case string(PodNotFound):
-		phase = v1.PodUnknown
+		phase = v1.PodFailed
 		containerStatus.State = v1.ContainerState{
-			Waiting: &v1.ContainerStateWaiting{
-				Reason:  "ContainerStatusUnknown",
-				Message: "Pod not found in RunPod API",
+			Terminated: &v1.ContainerStateTerminated{
+				ExitCode:   1,
+				Reason:     "PodDeleted",
+				Message:    "Pod was deleted from RunPod API",
+				StartedAt:  startTime,
+				FinishedAt: now,
 			},
 		}
 		falseVal := false
