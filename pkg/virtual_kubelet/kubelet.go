@@ -199,12 +199,6 @@ func (p *Provider) DeployPodToRunPod(pod *v1.Pod) error {
 		return err
 	}
 
-	p.logger.Info("Successfully deployed pod to RunPod",
-		"pod", pod.Name,
-		"namespace", pod.Namespace,
-		"runpodID", podID,
-		"costPerHr", costPerHr)
-
 	// Update pod with RunPod annotations
 	return p.updatePodWithRunPodInfo(pod, podID, costPerHr)
 }
@@ -413,6 +407,15 @@ func (p *Provider) processPendingPods() {
 			continue
 		}
 
+		// Check if pod already has a RunPod ID - if so, skip it
+		if podID := pod.Annotations[RunpodPodIDAnnotation]; podID != "" {
+			p.logger.Debug("Skipping deployment of pod with existing RunPod ID",
+				"pod", pod.Name,
+				"namespace", pod.Namespace,
+				"runpodID", podID)
+			continue
+		}
+
 		// Try to deploy the pod to RunPod
 		err := p.DeployPodToRunPod(pod)
 		if err != nil {
@@ -494,11 +497,13 @@ func (p *Provider) updateAllPodStatuses() {
 
 		// Update pod info if status changed
 		if string(status) != podInfo.Status {
+			// Update the pod's status in our tracking map first
+			newStatus := p.translateRunPodStatus(string(status), podInfo.StatusMessage)
 			p.logger.Info("Pod status changed",
 				"pod", pod.Name,
 				"namespace", pod.Namespace,
 				"prevStatus", podInfo.Status,
-				"newStatus", string(status))
+				"newStatus", *newStatus)
 
 			// Update status in our tracking map
 			p.podsMutex.Lock()
@@ -511,22 +516,42 @@ func (p *Provider) updateAllPodStatuses() {
 				p.handlePodCompletion(pod, podInfo)
 			}
 
+			// Deep copy the pod and update status
+			updatedPod := pod.DeepCopy()
+			updatedPod.Status = *newStatus
+
+			// Update our local tracking with the updated pod
+			p.podsMutex.Lock()
+			p.pods[podKey] = updatedPod
+			p.podsMutex.Unlock()
+
 			// Notify status change if a notify function is registered
+			// We do this after updating our local state
 			p.notifyMutex.RLock()
 			notifyFunc := p.notifyFunc
 			p.notifyMutex.RUnlock()
 
 			if notifyFunc != nil {
-				// Update pod status before notification
-				newStatus := p.translateRunPodStatus(string(status), podInfo.StatusMessage)
-				updatedPod := pod.DeepCopy()
-				updatedPod.Status = *newStatus
+				// Try-catch equivalent to prevent panic from notifyFunc
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							p.logger.Error("Panic in notifyFunc recovered",
+								"pod", pod.Name,
+								"namespace", pod.Namespace,
+								"panic", r)
+						}
+					}()
 
-				p.podsMutex.Lock()
-				p.pods[podKey] = updatedPod
-				p.podsMutex.Unlock()
+					p.logger.Debug("Calling notifyFunc for pod status update",
+						"pod", updatedPod.Name,
+						"namespace", updatedPod.Namespace,
+						"status", updatedPod.Status.Phase)
 
-				notifyFunc(updatedPod)
+					notifyFunc(updatedPod)
+				}()
+			} else {
+				p.logger.Warn("No notifyFunc registered for pod status updates")
 			}
 		}
 	}
@@ -1019,17 +1044,52 @@ func (p *Provider) LoadRunning() {
 					CreationTime: pod.CreationTimestamp.Time,
 				}
 			} else {
-				// Pod has ID but instance not found in RunPod - mark for retry
-				p.logger.Warn("Pod has RunPod ID but instance not found in RunPod API. Will be retried.",
+				// Pod has ID but instance not found in RunPod - remove annotation and mark for retry
+				p.logger.Warn("Pod has RunPod ID but instance not found in RunPod API. Removing annotation and marking for retry.",
 					"pod", pod.Name,
 					"namespace", pod.Namespace,
 					"runpodID", podID)
 
+				// Get current version of the pod and update it
+				currentPod, err := p.clientset.CoreV1().Pods(pod.Namespace).Get(
+					context.Background(),
+					pod.Name,
+					metav1.GetOptions{},
+				)
+				if err == nil {
+					// Make a deep copy to avoid modifying the cache
+					podCopy := currentPod.DeepCopy()
+
+					// Remove the RunPod annotations
+					if podCopy.Annotations != nil {
+						delete(podCopy.Annotations, RunpodPodIDAnnotation)
+						delete(podCopy.Annotations, RunpodCostAnnotation)
+
+						// Update the pod
+						_, updateErr := p.clientset.CoreV1().Pods(podCopy.Namespace).Update(
+							context.Background(),
+							podCopy,
+							metav1.UpdateOptions{},
+						)
+						if updateErr != nil {
+							p.logger.Error("Failed to remove RunPod annotations from pod",
+								"pod", pod.Name,
+								"namespace", pod.Namespace,
+								"error", updateErr)
+						} else {
+							p.logger.Info("Successfully removed RunPod annotations from pod",
+								"pod", pod.Name,
+								"namespace", pod.Namespace)
+						}
+					}
+				}
+
+				// Update local tracking with removed annotation
 				p.podStatus[podKey] = &RunPodInfo{
-					ID:           podID,
+					ID:           "", // Clear the ID
 					PodName:      pod.Name,
 					Namespace:    pod.Namespace,
-					Status:       string(PodNotFound),
+					Status:       string(PodStarting), // Mark as starting so it will be redeployed
 					CreationTime: pod.CreationTimestamp.Time,
 				}
 			}
