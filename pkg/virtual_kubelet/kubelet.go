@@ -468,10 +468,10 @@ func (p *Provider) updateAllPodStatuses() {
 	for _, podKey := range podKeys {
 		p.podsMutex.RLock()
 		pod := p.pods[podKey]
-		podInfo := p.podStatus[podKey]
+		runPodInfo := p.podStatus[podKey]
 		p.podsMutex.RUnlock()
 
-		if pod == nil || podInfo == nil {
+		if pod == nil || runPodInfo == nil {
 			continue
 		}
 
@@ -496,25 +496,28 @@ func (p *Provider) updateAllPodStatuses() {
 		}
 
 		// Update pod info if status changed
-		if string(status) != podInfo.Status {
-			// Update the pod's status in our tracking map first
-			newStatus := p.translateRunPodStatus(string(status), podInfo.StatusMessage)
+		if string(status) != runPodInfo.Status {
+			// Update status in our tracking map first
+			p.podsMutex.Lock()
+			runPodInfo.Status = string(status)
+			p.podStatus[podKey] = runPodInfo
+			p.podsMutex.Unlock()
+
+			// Log the status change with actual status values (not the entire struct)
 			p.logger.Info("Pod status changed",
 				"pod", pod.Name,
 				"namespace", pod.Namespace,
-				"prevStatus", podInfo.Status,
-				"newStatus", *newStatus)
-
-			// Update status in our tracking map
-			p.podsMutex.Lock()
-			podInfo.Status = string(status)
-			p.podStatus[podKey] = podInfo
-			p.podsMutex.Unlock()
+				"prevStatus", runPodInfo.Status,
+				"newStatus", string(status),
+				"resultingPhase", translateRunPodStatusToPhase(string(status)))
 
 			// Handle pod completion if needed
 			if status == PodExited {
-				p.handlePodCompletion(pod, podInfo)
+				p.handlePodCompletion(pod, runPodInfo)
 			}
+
+			// Create the new Kubernetes PodStatus
+			newStatus := p.translateRunPodStatus(string(status), runPodInfo.StatusMessage)
 
 			// Deep copy the pod and update status
 			updatedPod := pod.DeepCopy()
@@ -526,7 +529,6 @@ func (p *Provider) updateAllPodStatuses() {
 			p.podsMutex.Unlock()
 
 			// Notify status change if a notify function is registered
-			// We do this after updating our local state
 			p.notifyMutex.RLock()
 			notifyFunc := p.notifyFunc
 			p.notifyMutex.RUnlock()
@@ -554,6 +556,27 @@ func (p *Provider) updateAllPodStatuses() {
 				p.logger.Warn("No notifyFunc registered for pod status updates")
 			}
 		}
+	}
+}
+
+// Helper function to translate RunPod status to Kubernetes PodPhase
+// for cleaner logging and debugging
+func translateRunPodStatusToPhase(runpodStatus string) string {
+	switch runpodStatus {
+	case string(PodRunning):
+		return string(v1.PodRunning)
+	case string(PodStarting):
+		return string(v1.PodPending)
+	case string(PodExited):
+		return string(v1.PodSucceeded) // Default to succeeded, handlePodCompletion will set to Failed if needed
+	case string(PodTerminating):
+		return string(v1.PodRunning)
+	case string(PodTerminated):
+		return string(v1.PodSucceeded)
+	case string(PodNotFound):
+		return string(v1.PodUnknown)
+	default:
+		return string(v1.PodUnknown)
 	}
 }
 
@@ -1346,6 +1369,8 @@ func (p *Provider) translateRunPodStatus(runpodStatus string, statusMessage stri
 				StartedAt: now,
 			},
 		}
+		containerStatus.Ready = true
+		containerStatus.Started = &[]bool{true}[0] // Set Started to true for running containers
 	case string(PodStarting):
 		phase = v1.PodPending
 		containerState = v1.ContainerState{
@@ -1354,6 +1379,8 @@ func (p *Provider) translateRunPodStatus(runpodStatus string, statusMessage stri
 				Message: statusMessage,
 			},
 		}
+		containerStatus.Ready = false
+		containerStatus.Started = &[]bool{false}[0]
 	case string(PodExited):
 		// For exited pods, we need to check if it was successful or not
 		// This is typically determined by the exit code which would be set by handlePodCompletion
@@ -1380,6 +1407,8 @@ func (p *Provider) translateRunPodStatus(runpodStatus string, statusMessage stri
 				},
 			}
 		}
+		containerStatus.Ready = false
+		containerStatus.Started = &[]bool{false}[0]
 	case string(PodTerminating):
 		phase = v1.PodRunning
 		containerState = v1.ContainerState{
@@ -1387,6 +1416,8 @@ func (p *Provider) translateRunPodStatus(runpodStatus string, statusMessage stri
 				StartedAt: now,
 			},
 		}
+		containerStatus.Ready = true
+		containerStatus.Started = &[]bool{true}[0]
 	case string(PodTerminated):
 		phase = v1.PodSucceeded // Assume success for clean termination
 		containerState = v1.ContainerState{
@@ -1398,6 +1429,8 @@ func (p *Provider) translateRunPodStatus(runpodStatus string, statusMessage stri
 				StartedAt:  now, // We may not know actual start time
 			},
 		}
+		containerStatus.Ready = false
+		containerStatus.Started = &[]bool{false}[0]
 	case string(PodNotFound):
 		phase = v1.PodUnknown
 		containerState = v1.ContainerState{
@@ -1406,6 +1439,8 @@ func (p *Provider) translateRunPodStatus(runpodStatus string, statusMessage stri
 				Message: "Pod not found in RunPod API",
 			},
 		}
+		containerStatus.Ready = false
+		containerStatus.Started = &[]bool{false}[0]
 	default:
 		phase = v1.PodUnknown
 		containerState = v1.ContainerState{
@@ -1414,6 +1449,8 @@ func (p *Provider) translateRunPodStatus(runpodStatus string, statusMessage stri
 				Message: fmt.Sprintf("Unknown RunPod status: %s", runpodStatus),
 			},
 		}
+		containerStatus.Ready = false
+		containerStatus.Started = &[]bool{false}[0]
 	}
 
 	// Set the container state
@@ -1425,8 +1462,8 @@ func (p *Provider) translateRunPodStatus(runpodStatus string, statusMessage stri
 		Conditions:        []v1.PodCondition{},
 		Message:           statusMessage,
 		Reason:            "",
-		HostIP:            "",
-		PodIP:             "", // This should be set if available
+		HostIP:            "10.0.0.1", // Add a placeholder IP
+		PodIP:             "10.0.0.2", // Add a placeholder IP
 		StartTime:         &now,
 		QOSClass:          v1.PodQOSGuaranteed, // Default to guaranteed QoS
 		ContainerStatuses: []v1.ContainerStatus{containerStatus},
