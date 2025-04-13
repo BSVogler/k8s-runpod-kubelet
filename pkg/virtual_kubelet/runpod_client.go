@@ -483,14 +483,47 @@ func (c *Client) DeployPodREST(params map[string]interface{}) (string, float64, 
 		c.logger.Error("REST API request failed when deploying pod", "err", err)
 		return "", 0, fmt.Errorf("API request failed: %w", err)
 	}
+
+	if resp == nil {
+		return "", 0, fmt.Errorf("received nil response from makeRESTRequest")
+	}
+
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	// Read the full response body
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		c.logger.Error("Failed to read response body",
+			"error", readErr,
+			"statusCode", resp.StatusCode)
+		return "", 0, fmt.Errorf("failed to read response body: %w", readErr)
+	}
+
+	// Log the raw response for debugging (truncated if too large)
+	responseString := string(body)
+	if len(responseString) > 500 {
+		c.logger.Debug("Received response from RunPod API (truncated)",
+			"statusCode", resp.StatusCode,
+			"bodyLength", len(responseString),
+			"responseStart", responseString[:500])
+	} else {
+		c.logger.Debug("Received response from RunPod API",
+			"statusCode", resp.StatusCode,
+			"response", responseString)
+	}
+
 	if resp.StatusCode >= 400 {
 		c.logger.Error("RunPod REST API returned error",
 			"statusCode", resp.StatusCode,
 			"response", string(body))
 		return "", 0, fmt.Errorf("API returned error: %d %s", resp.StatusCode, string(body))
+	}
+
+	// Check if response is empty
+	if len(body) == 0 {
+		c.logger.Error("RunPod API returned empty response body",
+			"statusCode", resp.StatusCode)
+		return "", 0, fmt.Errorf("API returned empty response body with status %d", resp.StatusCode)
 	}
 
 	var response struct {
@@ -510,6 +543,10 @@ func (c *Client) DeployPodREST(params map[string]interface{}) (string, float64, 
 	}
 
 	if err := json.Unmarshal(body, &response); err != nil {
+		c.logger.Error("Failed to parse JSON response",
+			"error", err,
+			"response", string(body),
+			"responseLength", len(body))
 		return "", 0, fmt.Errorf("failed to parse response: %w", err)
 	}
 
@@ -639,11 +676,17 @@ func (c *Client) makeRESTRequest(method, endpoint string, body io.Reader) (*http
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.apiKey))
 
-	ctx, cancel := context.WithTimeout(context.Background(), DefaultAPITimeout)
-	defer cancel()
-	req = req.WithContext(ctx)
+	// Determine an appropriate timeout based on the endpoint
+	timeout := DefaultAPITimeout
+	if method == "POST" && endpoint == "pods" {
+		timeout = 60 * time.Second // Use a longer timeout for pod deployment
+	}
 
-	resp, err := c.httpClient.Do(req)
+	// Don't use context with timeout for the request, use it for the client instead
+	client := &http.Client{Timeout: timeout}
+
+	// No context timeout here, just use the request as is
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute request: %w", err)
 	}

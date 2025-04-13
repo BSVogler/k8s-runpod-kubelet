@@ -908,7 +908,7 @@ func (p *Provider) cleanupStuckTerminatingPods() {
 		}
 	}
 
-	p.logger.Info("Terminating pod cleanup complete",
+	p.logger.Debug("Terminating pod cleanup complete",
 		"found", terminatingCount,
 		"forcefullyDeleted", deletedCount,
 		"node", p.nodeName)
@@ -935,7 +935,7 @@ func (p *Provider) LoadRunning() {
 		return
 	}
 
-	p.logger.Info("Found pods assigned to this node", "count", len(k8sPods.Items))
+	p.logger.Debug("Found pods assigned to this node", "count", len(k8sPods.Items))
 
 	// Step 2: Fetch RunPod instances from API
 	runningPods, exitedPods, ok := p.fetchRunPodInstances()
@@ -1020,7 +1020,7 @@ func (p *Provider) LoadRunning() {
 				}
 			} else {
 				// Pod has ID but instance not found in RunPod - mark for retry
-				p.logger.Warn("Pod has RunPod ID but instance not found in RunPod API",
+				p.logger.Warn("Pod has RunPod ID but instance not found in RunPod API. Will be retried.",
 					"pod", pod.Name,
 					"namespace", pod.Namespace,
 					"runpodID", podID)
