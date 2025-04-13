@@ -264,6 +264,7 @@ func (c *Client) GetPodStatusREST(podID string) (PodStatus, error) {
 		var err error
 		resp, err = c.makeRESTRequest("GET", endpoint, nil)
 
+		// Both 200 OK and 404 Not Found are considered valid responses for our purpose
 		if err == nil && resp != nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound) {
 			break
 		}
@@ -322,7 +323,32 @@ func (c *Client) GetPodStatusREST(podID string) (PodStatus, error) {
 		}
 	}()
 
+	// Handle 404 Not Found responses
 	if resp.StatusCode == http.StatusNotFound {
+		// Read the response body
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return PodNotFound, fmt.Errorf("Error reading 404 response body: %w", readErr)
+		}
+
+		// Check if this is the specific "pod not found" message we expect
+		var errorResponse struct {
+			Error  string `json:"error"`
+			Status int    `json:"status"`
+		}
+
+		if err := json.Unmarshal(body, &errorResponse); err == nil {
+			if errorResponse.Error == "pod not found" && errorResponse.Status == 404 {
+				// This is the expected "pod not found" response, return PodNotFound status
+				return PodNotFound, nil
+			}
+		}
+
+		// If we can't parse the JSON or it doesn't match our expected error format,
+		// log it but still return PodNotFound since a 404 generally indicates the pod doesn't exist
+		c.logger.Warn("Received unexpected 404 response format",
+			"podID", podID,
+			"body", string(body))
 		return PodNotFound, nil
 	}
 
@@ -622,14 +648,8 @@ func (c *Client) makeRESTRequest(method, endpoint string, body io.Reader) (*http
 		return nil, fmt.Errorf("failed to execute request: %w", err)
 	}
 
-	// Check for 404 Not Found and return a standardized error
-	if resp.StatusCode == http.StatusNotFound {
-		// Read and close the body to prevent resource leaks
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		return nil, fmt.Errorf("not found: %s", string(body))
-	}
-
+	// No longer treat 404 as an error - return the response as is
+	// The calling function will determine how to handle 404 status codes
 	return resp, nil
 }
 
