@@ -64,6 +64,7 @@ func (p *Provider) startPeriodicCleanup() {
 		select {
 		case <-ticker.C:
 			p.cleanupDeletedPods()
+			p.cleanupStuckTerminatingPods()
 		}
 	}
 }
@@ -108,7 +109,7 @@ func NewProvider(ctx context.Context, nodeName, operatingSystem string, internal
 
 	// Initialize provider
 	provider.checkRunPodAPIHealth()
-
+	provider.cleanupStuckTerminatingPods()
 	// Start background processes
 	go provider.startPeriodicStatusUpdates()
 	go provider.startPeriodicCleanup()
@@ -118,6 +119,7 @@ func NewProvider(ctx context.Context, nodeName, operatingSystem string, internal
 }
 
 // Implementation of required interface methods to fulfill the PodLifecycleHandler interface
+
 // CreatePod takes a Kubernetes Pod and deploys it within the provider
 func (p *Provider) CreatePod(ctx context.Context, pod *v1.Pod) error {
 	// Implementation for creating a pod
@@ -762,7 +764,157 @@ func (p *Provider) cleanupDeletedPods() {
 	}
 }
 
-// LoadRunning loads from the runpod api the running pods and if missing adds them to the list of virtual pods in the cluster
+// cleanupStuckTerminatingPods finds pods that are stuck in Terminating state
+// and forcefully removes them if they no longer exist in RunPod
+func (p *Provider) cleanupStuckTerminatingPods() {
+	// Get all pods in all namespaces that are stuck in Terminating state
+	pods, err := p.clientset.CoreV1().Pods("").List(
+		context.Background(),
+		metav1.ListOptions{
+			FieldSelector: fmt.Sprintf("spec.nodeName=%s", p.nodeName),
+		},
+	)
+	if err != nil {
+		p.logger.Error("Failed to list pods for termination cleanup", "err", err)
+		return
+	}
+
+	terminatingCount := 0
+	deletedCount := 0
+	for _, pod := range pods.Items {
+		// Check if pod is terminating (has a deletion timestamp but still exists)
+		if pod.DeletionTimestamp != nil {
+			terminatingCount++
+
+			// Get the RunPod ID from annotations
+			podID := pod.Annotations[RunpodPodIDAnnotation]
+			if podID == "" {
+				// Pod has no RunPod ID - it was never deployed to RunPod
+				// We should force delete it as it has nothing to clean up remotely
+				p.logger.Info("Force deleting terminating pod with no RunPod ID",
+					"pod", pod.Name,
+					"namespace", pod.Namespace,
+					"deletionTimestamp", pod.DeletionTimestamp)
+
+				err = p.ForceDeletePod(pod.Namespace, pod.Name)
+				if err != nil {
+					p.logger.Error("Failed to force delete terminating pod without RunPod ID",
+						"pod", pod.Name,
+						"namespace", pod.Namespace,
+						"error", err)
+				} else {
+					deletedCount++
+				}
+				continue
+			}
+
+			// Check if the pod still exists in RunPod
+			status, err := p.runpodClient.GetPodStatusREST(podID)
+			if err != nil {
+				p.logger.Error("Failed to check pod status in RunPod",
+					"pod", pod.Name,
+					"namespace", pod.Namespace,
+					"runpodID", podID,
+					"error", err)
+
+				// Even if we can't check the status, if the pod has been terminating
+				// for a long time, we should try to force delete it
+				terminatingDuration := time.Since(pod.DeletionTimestamp.Time)
+				if terminatingDuration > 10*time.Minute {
+					p.logger.Info("Pod has been terminating for too long with status check errors, force deleting",
+						"pod", pod.Name,
+						"namespace", pod.Namespace,
+						"runpodID", podID,
+						"terminatingDuration", terminatingDuration)
+
+					err = p.ForceDeletePod(pod.Namespace, pod.Name)
+					if err != nil {
+						p.logger.Error("Failed to force delete terminating pod with status check errors",
+							"pod", pod.Name,
+							"namespace", pod.Namespace,
+							"error", err)
+					} else {
+						deletedCount++
+					}
+				}
+
+				continue
+			}
+
+			// If pod doesn't exist in RunPod or is in terminated/exited state, force delete it from Kubernetes
+			if status == PodNotFound || status == PodExited || status == PodTerminated {
+				p.logger.Info("Force deleting stuck terminating pod",
+					"pod", pod.Name,
+					"namespace", pod.Namespace,
+					"runpodID", podID,
+					"runpodStatus", status)
+
+				// Force delete the pod
+				err = p.ForceDeletePod(pod.Namespace, pod.Name)
+				if err != nil {
+					p.logger.Error("Failed to force delete terminating pod",
+						"pod", pod.Name,
+						"namespace", pod.Namespace,
+						"error", err)
+				} else {
+					deletedCount++
+				}
+			} else {
+				p.logger.Info("Pod is terminating but RunPod instance still exists",
+					"pod", pod.Name,
+					"namespace", pod.Namespace,
+					"runpodID", podID,
+					"runpodStatus", status)
+
+				// If pod is still in RunPod but has been terminating for too long, try to terminate it again
+				terminatingDuration := time.Since(pod.DeletionTimestamp.Time)
+				if terminatingDuration > 5*time.Minute {
+					p.logger.Info("Pod has been terminating for too long, re-attempting RunPod termination",
+						"pod", pod.Name,
+						"namespace", pod.Namespace,
+						"runpodID", podID,
+						"terminatingDuration", terminatingDuration)
+
+					// Try to terminate the RunPod instance again
+					if err := p.runpodClient.TerminatePod(podID); err != nil {
+						p.logger.Error("Failed to re-terminate RunPod instance",
+							"pod", pod.Name,
+							"namespace", pod.Namespace,
+							"runpodID", podID,
+							"error", err)
+					}
+
+					// If it's been terminating for an extremely long time, force delete regardless of remote status
+					if terminatingDuration > 15*time.Minute {
+						p.logger.Info("Pod has been terminating for too long, force deleting despite remote instance",
+							"pod", pod.Name,
+							"namespace", pod.Namespace,
+							"runpodID", podID,
+							"runpodStatus", status,
+							"terminatingDuration", terminatingDuration)
+
+						err = p.ForceDeletePod(pod.Namespace, pod.Name)
+						if err != nil {
+							p.logger.Error("Failed to force delete long-terminating pod",
+								"pod", pod.Name,
+								"namespace", pod.Namespace,
+								"error", err)
+						} else {
+							deletedCount++
+						}
+					}
+				}
+			}
+		}
+	}
+
+	p.logger.Info("Terminating pod cleanup complete",
+		"found", terminatingCount,
+		"forcefullyDeleted", deletedCount,
+		"node", p.nodeName)
+}
+
+// LoadRunning loads existing pods and reconciles state between Kubernetes and RunPod
 func (p *Provider) LoadRunning() {
 	// Skip check if no API key
 	if p.runpodClient.apiKey == "" {
@@ -771,7 +923,21 @@ func (p *Provider) LoadRunning() {
 		return
 	}
 
-	// Fetch RunPod instances from API
+	// Step 1: Get all pods assigned to this node from Kubernetes
+	k8sPods, err := p.clientset.CoreV1().Pods("").List(
+		context.Background(),
+		metav1.ListOptions{
+			FieldSelector: fmt.Sprintf("spec.nodeName=%s", p.nodeName),
+		},
+	)
+	if err != nil {
+		p.logger.Error("Failed to list pods assigned to this node", "error", err)
+		return
+	}
+
+	p.logger.Info("Found pods assigned to this node", "count", len(k8sPods.Items))
+
+	// Step 2: Fetch RunPod instances from API
 	runningPods, exitedPods, ok := p.fetchRunPodInstances()
 	if !ok {
 		p.runpodAvailable = false
@@ -781,15 +947,125 @@ func (p *Provider) LoadRunning() {
 	// API is available
 	p.runpodAvailable = true
 
-	// Combine running and exited pods
-	allPods := append(runningPods, exitedPods...)
+	// Step 3: Create a map of RunPod IDs to instances for lookup
+	runpodInstanceMap := make(map[string]RunPodInstance)
+	for _, instance := range append(runningPods, exitedPods...) {
+		runpodInstanceMap[instance.ID] = instance
+	}
 
-	// Map existing RunPod instances in the cluster
+	// Step 4: Process kubernetes pods assigned to this node
+	for _, pod := range k8sPods.Items {
+		// Skip pods that are already completed, failed, or terminating
+		if pod.Status.Phase == v1.PodSucceeded ||
+			pod.Status.Phase == v1.PodFailed ||
+			pod.DeletionTimestamp != nil {
+			// If a pod is being deleted (has DeletionTimestamp), skip it
+			p.logger.Debug("Skipping pod that is completed, failed, or terminating",
+				"pod", pod.Name,
+				"namespace", pod.Namespace,
+				"phase", pod.Status.Phase,
+				"deletionTimestamp", pod.DeletionTimestamp)
+			continue
+		}
+
+		podKey := fmt.Sprintf("%s-%s", pod.Namespace, pod.Name)
+
+		// First check if we're already tracking this pod
+		p.podsMutex.RLock()
+		_, alreadyTracking := p.pods[podKey]
+		p.podsMutex.RUnlock()
+
+		if alreadyTracking {
+			// Skip pods we're already tracking to avoid redundancy with CreatePod
+			p.logger.Debug("Skipping pod already tracked by controller",
+				"pod", pod.Name,
+				"namespace", pod.Namespace)
+			continue
+		}
+
+		// Store in our tracking map since we're not tracking it yet
+		p.podsMutex.Lock()
+		p.pods[podKey] = pod.DeepCopy()
+
+		// Check if pod already has a RunPod ID annotation
+		podID, hasRunpodID := pod.Annotations[RunpodPodIDAnnotation]
+
+		if hasRunpodID {
+			// Pod already has RunPod ID - check if it exists in RunPod
+			if instance, exists := runpodInstanceMap[podID]; exists {
+				// Pod exists in RunPod - update status
+				p.logger.Info("Found existing RunPod instance for pod",
+					"pod", pod.Name,
+					"namespace", pod.Namespace,
+					"runpodID", podID)
+
+				// Map CurrentStatus to our internal status
+				podStatus := string(PodRunning)
+				if instance.CurrentStatus == "EXITED" {
+					podStatus = string(PodExited)
+				} else if instance.CurrentStatus == "STARTING" {
+					podStatus = string(PodStarting)
+				} else if instance.CurrentStatus == "TERMINATING" {
+					podStatus = string(PodTerminating)
+				}
+
+				// Update pod status
+				p.podStatus[podKey] = &RunPodInfo{
+					ID:           podID,
+					PodName:      pod.Name,
+					Namespace:    pod.Namespace,
+					Status:       podStatus,
+					CostPerHr:    instance.CostPerHr,
+					CreationTime: pod.CreationTimestamp.Time,
+				}
+			} else {
+				// Pod has ID but instance not found in RunPod - mark for retry
+				p.logger.Warn("Pod has RunPod ID but instance not found in RunPod API",
+					"pod", pod.Name,
+					"namespace", pod.Namespace,
+					"runpodID", podID)
+
+				p.podStatus[podKey] = &RunPodInfo{
+					ID:           podID,
+					PodName:      pod.Name,
+					Namespace:    pod.Namespace,
+					Status:       string(PodNotFound),
+					CreationTime: pod.CreationTimestamp.Time,
+				}
+			}
+		} else {
+			// Pod doesn't have RunPod ID - add to tracking as pending
+			// The periodic pod processor will handle deployment
+			p.logger.Info("Found pod with no RunPod ID - marking as pending",
+				"pod", pod.Name,
+				"namespace", pod.Namespace)
+
+			// Mark as pending deployment
+			p.podStatus[podKey] = &RunPodInfo{
+				PodName:      pod.Name,
+				Namespace:    pod.Namespace,
+				Status:       string(PodStarting),
+				CreationTime: pod.CreationTimestamp.Time,
+			}
+
+			// Don't try to deploy here - let the existing periodic processor handle it
+			// This avoids redundancy with CreatePod
+		}
+		p.podsMutex.Unlock()
+	}
+
+	// Step 5: Find RunPod instances not represented in Kubernetes
 	existingRunPodMap := p.mapExistingRunPodInstances()
+	for _, runpodInstance := range append(runningPods, exitedPods...) {
+		if _, exists := existingRunPodMap[runpodInstance.ID]; !exists {
+			// This RunPod instance has no representation in K8s
+			p.logger.Info("Found RunPod instance with no Kubernetes pod",
+				"runpodID", runpodInstance.ID,
+				"name", runpodInstance.Name)
 
-	// Process each pod from RunPod API
-	for _, runpodInstance := range allPods {
-		p.processRunPodInstance(runpodInstance, existingRunPodMap)
+			// Create virtual pod for this RunPod instance
+			p.CreateVirtualPod(runpodInstance)
+		}
 	}
 }
 
