@@ -12,7 +12,6 @@ import (
 	"io"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
-	"k8s.io/client-go/tools/cache"
 	"log"
 	"log/slog"
 	"net/http"
@@ -267,42 +266,48 @@ func main() {
 	eventRecorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: nodeName})
 
 	// Create informer factory for the default namespace or specified namespace
-	informerFactory := informers.NewSharedInformerFactoryWithOptions(
+	informerFactory := informers.NewSharedInformerFactory(
 		k8sClient,
 		time.Duration(reconcileInterval)*time.Second,
 	)
 
-	// Start the informer factory
-	informerFactory.Start(ctx.Done())
-
-	// Wait for caches to sync
-	syncCtx, syncCancel := context.WithTimeout(ctx, 30*time.Second)
-	defer syncCancel()
-
-	_, err = k8sClient.CoreV1().Namespaces().Get(ctx, "kube-system", metav1.GetOptions{})
-	if err != nil {
-		logger.Error("Failed to connect to Kubernetes API", "error", err)
-		os.Exit(1)
-	}
-	logger.Info("Successfully connected to Kubernetes API")
-
-	// Create pod controller with the informer
+	// Create the essential informers
 	podInformer := informerFactory.Core().V1().Pods()
 	configMapInformer := informerFactory.Core().V1().ConfigMaps()
 	secretInformer := informerFactory.Core().V1().Secrets()
 	serviceInformer := informerFactory.Core().V1().Services()
 
-	// Wait for caches to sync with a timeout
-	logger.Info("Waiting for informer caches to sync")
-	if !cache.WaitForNamedCacheSync("RunPodController", syncCtx.Done(), podInformer.Informer().HasSynced) {
-		logger.Error("Failed to sync pod informer cache within timeout")
-		// Consider continuing anyway or exiting
-		// os.Exit(1)
+	// Start the informer factory
+	informerFactory.Start(ctx.Done())
 
-		// For debugging, log a warning but continue
-		logger.Warn("Continuing without fully synced cache")
+	syncCtx, syncCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer syncCancel()
+
+	logger.Info("Waiting for informer caches to sync")
+	syncResult := informerFactory.WaitForCacheSync(syncCtx.Done())
+
+	// Check results for each informer
+	for informerType, synced := range syncResult {
+		if !synced {
+			logger.Error("Cache failed to sync", "informerType", fmt.Sprintf("%v", informerType))
+		} else {
+			logger.Info("Cache synced successfully", "informerType", fmt.Sprintf("%v", informerType))
+		}
+	}
+
+	// a simple check to see if all caches synced
+	allSynced := true
+	for _, synced := range syncResult {
+		if !synced {
+			allSynced = false
+			break
+		}
+	}
+
+	if allSynced {
+		logger.Info("All informer caches synced successfully")
 	} else {
-		logger.Info("Informer caches synced successfully")
+		logger.Error("Not all informer caches synced successfully")
 	}
 	// Then when creating the pod controller, include all informers:
 	podController, err := node.NewPodController(node.PodControllerConfig{
