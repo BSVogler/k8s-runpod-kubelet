@@ -11,6 +11,7 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"log/slog"
 	"net/http"
@@ -468,10 +469,10 @@ func (p *Provider) updateAllPodStatuses() {
 	for _, podKey := range podKeys {
 		p.podsMutex.RLock()
 		pod := p.pods[podKey]
-		runPodInfo := p.podStatus[podKey]
+		podInfo := p.podStatus[podKey]
 		p.podsMutex.RUnlock()
 
-		if pod == nil || runPodInfo == nil {
+		if pod == nil || podInfo == nil {
 			continue
 		}
 
@@ -492,68 +493,98 @@ func (p *Provider) updateAllPodStatuses() {
 			p.logger.Error("Failed to get pod status from RunPod API",
 				"pod", pod.Name, "namespace", pod.Namespace,
 				"runpodID", podID, "error", err)
+
+			// Skip this update cycle for this pod - don't set to NotFound immediately
 			continue
 		}
 
 		// Update pod info if status changed
-		if string(status) != runPodInfo.Status {
-			// Update status in our tracking map first
+		if string(status) != podInfo.Status {
+			// Update status in our tracking map
 			p.podsMutex.Lock()
-			runPodInfo.Status = string(status)
-			p.podStatus[podKey] = runPodInfo
+			oldStatus := podInfo.Status
+			podInfo.Status = string(status)
+			p.podStatus[podKey] = podInfo
 			p.podsMutex.Unlock()
 
-			// Log the status change with actual status values (not the entire struct)
+			// Create the new Kubernetes PodStatus with proper error handling
+			newStatus := p.translateRunPodStatus(string(status), podInfo.StatusMessage)
+
+			// Keep existing container state if possible
+			if len(pod.Status.ContainerStatuses) > 0 && newStatus != nil {
+				// Make sure we don't lose any existing container information
+				p.mergeContainerStatus(newStatus, pod.Status.ContainerStatuses[0])
+			}
+
 			p.logger.Info("Pod status changed",
 				"pod", pod.Name,
 				"namespace", pod.Namespace,
-				"prevStatus", runPodInfo.Status,
-				"newStatus", string(status),
-				"resultingPhase", translateRunPodStatusToPhase(string(status)))
+				"prevStatus", oldStatus,
+				"newStatus", string(status))
 
 			// Handle pod completion if needed
 			if status == PodExited {
-				p.handlePodCompletion(pod, runPodInfo)
+				p.handlePodCompletion(pod, podInfo)
 			}
 
-			// Create the new Kubernetes PodStatus
-			newStatus := p.translateRunPodStatus(string(status), runPodInfo.StatusMessage)
+			// Try to update the pod status directly in the Kubernetes API first
+			// This is more reliable than using the notifyFunc
+			err := p.updatePodStatusInK8s(pod, newStatus)
+			if err != nil {
+				p.logger.Error("Failed to update pod status in Kubernetes API",
+					"pod", pod.Name,
+					"namespace", pod.Namespace,
+					"error", err)
 
-			// Deep copy the pod and update status
-			updatedPod := pod.DeepCopy()
-			updatedPod.Status = *newStatus
+				// Fall back to traditional notification method
+				updatedPod := pod.DeepCopy()
+				updatedPod.Status = *newStatus
 
-			// Update our local tracking with the updated pod
-			p.podsMutex.Lock()
-			p.pods[podKey] = updatedPod
-			p.podsMutex.Unlock()
+				// Update our local tracking with the updated pod
+				p.podsMutex.Lock()
+				p.pods[podKey] = updatedPod
+				p.podsMutex.Unlock()
 
-			// Notify status change if a notify function is registered
-			p.notifyMutex.RLock()
-			notifyFunc := p.notifyFunc
-			p.notifyMutex.RUnlock()
+				// Notify status change if a notify function is registered
+				p.notifyMutex.RLock()
+				notifyFunc := p.notifyFunc
+				p.notifyMutex.RUnlock()
 
-			if notifyFunc != nil {
-				// Try-catch equivalent to prevent panic from notifyFunc
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							p.logger.Error("Panic in notifyFunc recovered",
-								"pod", pod.Name,
-								"namespace", pod.Namespace,
-								"panic", r)
-						}
+				if notifyFunc != nil {
+					// Use defer-recover to prevent panic
+					func() {
+						defer func() {
+							if r := recover(); r != nil {
+								p.logger.Error("Panic in notifyFunc recovered",
+									"pod", pod.Name,
+									"namespace", pod.Namespace,
+									"panic", r)
+							}
+						}()
+
+						p.logger.Debug("Calling notifyFunc for pod status update",
+							"pod", updatedPod.Name,
+							"namespace", updatedPod.Namespace,
+							"status", updatedPod.Status.Phase)
+
+						notifyFunc(updatedPod)
 					}()
-
-					p.logger.Debug("Calling notifyFunc for pod status update",
-						"pod", updatedPod.Name,
-						"namespace", updatedPod.Namespace,
-						"status", updatedPod.Status.Phase)
-
-					notifyFunc(updatedPod)
-				}()
+				} else {
+					p.logger.Warn("No notifyFunc registered for pod status updates")
+				}
 			} else {
-				p.logger.Warn("No notifyFunc registered for pod status updates")
+				// Update was successful through API, update our local cache
+				// Get the latest pod state to stay in sync
+				latestPod, err := p.clientset.CoreV1().Pods(pod.Namespace).Get(
+					context.Background(),
+					pod.Name,
+					metav1.GetOptions{},
+				)
+				if err == nil {
+					p.podsMutex.Lock()
+					p.pods[podKey] = latestPod
+					p.podsMutex.Unlock()
+				}
 			}
 		}
 	}
@@ -1047,7 +1078,7 @@ func (p *Provider) LoadRunning() {
 					"namespace", pod.Namespace,
 					"runpodID", podID)
 
-				// Map CurrentStatus to our internal status
+				// Map CurrentStatus from API to our internal status
 				podStatus := string(PodRunning)
 				if instance.CurrentStatus == "EXITED" {
 					podStatus = string(PodExited)
@@ -1057,7 +1088,7 @@ func (p *Provider) LoadRunning() {
 					podStatus = string(PodTerminating)
 				}
 
-				// Update pod status
+				// Update pod status in cache
 				p.podStatus[podKey] = &RunPodInfo{
 					ID:           podID,
 					PodName:      pod.Name,
@@ -1343,179 +1374,213 @@ func (p *Provider) ForceDeletePod(namespace, name string) error {
 	return nil
 }
 
+func (p *Provider) mergeContainerStatus(newStatus *v1.PodStatus, existingContainerStatus v1.ContainerStatus) {
+	if newStatus == nil || len(newStatus.ContainerStatuses) == 0 {
+		return
+	}
+
+	// Keep certain fields from existing container status
+	if existingContainerStatus.ContainerID != "" {
+		newStatus.ContainerStatuses[0].ContainerID = existingContainerStatus.ContainerID
+	}
+
+	if existingContainerStatus.ImageID != "" {
+		newStatus.ContainerStatuses[0].ImageID = existingContainerStatus.ImageID
+	}
+
+	// If the container was previously started, keep that information
+	if existingContainerStatus.Started != nil && *existingContainerStatus.Started {
+		trueVal := true
+		newStatus.ContainerStatuses[0].Started = &trueVal
+	}
+
+	// Preserve restart count
+	newStatus.ContainerStatuses[0].RestartCount = existingContainerStatus.RestartCount
+}
+
+func (p *Provider) updatePodStatusInK8s(pod *v1.Pod, newStatus *v1.PodStatus) error {
+	// Create a patch to update just the status
+	patchBytes, err := json.Marshal(map[string]interface{}{
+		"status": newStatus,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal status patch: %w", err)
+	}
+
+	// Try to patch the pod status
+	_, err = p.clientset.CoreV1().Pods(pod.Namespace).Patch(
+		context.Background(),
+		pod.Name,
+		types.StrategicMergePatchType,
+		patchBytes,
+		metav1.PatchOptions{},
+		"status",
+	)
+	if err != nil {
+		return fmt.Errorf("failed to patch pod status: %w", err)
+	}
+
+	return nil
+}
+
 // translateRunPodStatus converts a RunPod status string to a Kubernetes PodStatus
 func (p *Provider) translateRunPodStatus(runpodStatus string, statusMessage string) *v1.PodStatus {
 	now := metav1.NewTime(time.Now())
+	startTime := metav1.NewTime(now.Add(-1 * time.Hour)) // Default start time
 
-	// Initialize the container status
+	// Initialize the container status with default values
 	containerStatus := v1.ContainerStatus{
-		Name:         "runpod-container", // Default container name
+		Name:         "runpod-container",
 		RestartCount: 0,
-		Ready:        runpodStatus == string(PodRunning),
-		Image:        "runpod-image", // This should be replaced with actual image if available
+		Ready:        false,
+		Image:        "runpod-image",
 		ImageID:      "",
-		ContainerID:  "",
+		ContainerID:  "runpod://",
 	}
 
-	// Set the pod phase and container state based on RunPod status
-	var phase v1.PodPhase
-	var containerState v1.ContainerState
+	// Default to Unknown phase
+	phase := v1.PodUnknown
 
+	// Set container state and phase based on RunPod status
 	switch runpodStatus {
 	case string(PodRunning):
 		phase = v1.PodRunning
-		containerState = v1.ContainerState{
+		containerStatus.State = v1.ContainerState{
 			Running: &v1.ContainerStateRunning{
-				StartedAt: now,
+				StartedAt: startTime,
 			},
 		}
 		containerStatus.Ready = true
-		containerStatus.Started = &[]bool{true}[0] // Set Started to true for running containers
+		trueVal := true
+		containerStatus.Started = &trueVal
+
 	case string(PodStarting):
 		phase = v1.PodPending
-		containerState = v1.ContainerState{
+		containerStatus.State = v1.ContainerState{
 			Waiting: &v1.ContainerStateWaiting{
-				Reason:  "Starting",
+				Reason:  "ContainerCreating",
 				Message: statusMessage,
 			},
 		}
-		containerStatus.Ready = false
-		containerStatus.Started = &[]bool{false}[0]
+		falseVal := false
+		containerStatus.Started = &falseVal
+
 	case string(PodExited):
-		// For exited pods, we need to check if it was successful or not
-		// This is typically determined by the exit code which would be set by handlePodCompletion
-		if strings.Contains(statusMessage, "Completed") || strings.Contains(statusMessage, "Success") {
-			phase = v1.PodSucceeded
-			containerState = v1.ContainerState{
-				Terminated: &v1.ContainerStateTerminated{
-					ExitCode:   0, // Default to 0 for success
-					Reason:     "Completed",
-					Message:    statusMessage,
-					FinishedAt: now,
-					StartedAt:  now, // We may not know actual start time
-				},
-			}
-		} else {
+		exitCode := 0
+		reason := "Completed"
+
+		if strings.Contains(strings.ToLower(statusMessage), "error") ||
+			strings.Contains(strings.ToLower(statusMessage), "fail") {
+			exitCode = 1
+			reason = "Error"
 			phase = v1.PodFailed
-			containerState = v1.ContainerState{
-				Terminated: &v1.ContainerStateTerminated{
-					ExitCode:   1, // Default to 1 for error
-					Reason:     "Error",
-					Message:    statusMessage,
-					FinishedAt: now,
-					StartedAt:  now, // We may not know actual start time
-				},
-			}
+		} else {
+			phase = v1.PodSucceeded
 		}
-		containerStatus.Ready = false
-		containerStatus.Started = &[]bool{false}[0]
+
+		containerStatus.State = v1.ContainerState{
+			Terminated: &v1.ContainerStateTerminated{
+				ExitCode:   int32(exitCode),
+				Reason:     reason,
+				Message:    statusMessage,
+				StartedAt:  startTime,
+				FinishedAt: now,
+			},
+		}
+		falseVal := false
+		containerStatus.Started = &falseVal
+
 	case string(PodTerminating):
 		phase = v1.PodRunning
-		containerState = v1.ContainerState{
+		containerStatus.State = v1.ContainerState{
 			Running: &v1.ContainerStateRunning{
-				StartedAt: now,
+				StartedAt: startTime,
 			},
 		}
 		containerStatus.Ready = true
-		containerStatus.Started = &[]bool{true}[0]
+		trueVal := true
+		containerStatus.Started = &trueVal
+
 	case string(PodTerminated):
-		phase = v1.PodSucceeded // Assume success for clean termination
-		containerState = v1.ContainerState{
+		phase = v1.PodSucceeded
+		containerStatus.State = v1.ContainerState{
 			Terminated: &v1.ContainerStateTerminated{
 				ExitCode:   0,
 				Reason:     "Terminated",
 				Message:    statusMessage,
+				StartedAt:  startTime,
 				FinishedAt: now,
-				StartedAt:  now, // We may not know actual start time
 			},
 		}
-		containerStatus.Ready = false
-		containerStatus.Started = &[]bool{false}[0]
+		falseVal := false
+		containerStatus.Started = &falseVal
+
 	case string(PodNotFound):
 		phase = v1.PodUnknown
-		containerState = v1.ContainerState{
+		containerStatus.State = v1.ContainerState{
 			Waiting: &v1.ContainerStateWaiting{
-				Reason:  "NotFound",
+				Reason:  "ContainerStatusUnknown",
 				Message: "Pod not found in RunPod API",
 			},
 		}
-		containerStatus.Ready = false
-		containerStatus.Started = &[]bool{false}[0]
+		falseVal := false
+		containerStatus.Started = &falseVal
+
 	default:
-		phase = v1.PodUnknown
-		containerState = v1.ContainerState{
+		containerStatus.State = v1.ContainerState{
 			Waiting: &v1.ContainerStateWaiting{
-				Reason:  "Unknown",
+				Reason:  "ContainerStatusUnknown",
 				Message: fmt.Sprintf("Unknown RunPod status: %s", runpodStatus),
 			},
 		}
-		containerStatus.Ready = false
-		containerStatus.Started = &[]bool{false}[0]
+		falseVal := false
+		containerStatus.Started = &falseVal
 	}
 
-	// Set the container state
-	containerStatus.State = containerState
+	// Create pod conditions
+	readyCondition := v1.ConditionFalse
+	if phase == v1.PodRunning {
+		readyCondition = v1.ConditionTrue
+	}
+
+	podConditions := []v1.PodCondition{
+		{
+			Type:               v1.PodScheduled,
+			Status:             v1.ConditionTrue,
+			LastTransitionTime: now,
+			LastProbeTime:      now,
+		},
+		{
+			Type:               v1.PodInitialized,
+			Status:             v1.ConditionTrue,
+			LastTransitionTime: now,
+			LastProbeTime:      now,
+		},
+		{
+			Type:               v1.PodReady,
+			Status:             readyCondition,
+			LastTransitionTime: now,
+			LastProbeTime:      now,
+		},
+		{
+			Type:               v1.ContainersReady,
+			Status:             readyCondition,
+			LastTransitionTime: now,
+			LastProbeTime:      now,
+		},
+	}
 
 	// Create the pod status
 	podStatus := &v1.PodStatus{
 		Phase:             phase,
-		Conditions:        []v1.PodCondition{},
+		Conditions:        podConditions,
 		Message:           statusMessage,
-		Reason:            "",
-		HostIP:            "10.0.0.1", // Add a placeholder IP
-		PodIP:             "10.0.0.2", // Add a placeholder IP
-		StartTime:         &now,
-		QOSClass:          v1.PodQOSGuaranteed, // Default to guaranteed QoS
+		HostIP:            "10.0.0.1", // Placeholder
+		PodIP:             "10.0.0.2", // Placeholder
 		ContainerStatuses: []v1.ContainerStatus{containerStatus},
+		StartTime:         &startTime,
+		//qosClass is immutable
 	}
-
-	// Set pod conditions based on the phase
-	podStatus.Conditions = append(podStatus.Conditions, v1.PodCondition{
-		Type:               v1.PodInitialized,
-		Status:             v1.ConditionTrue,
-		LastTransitionTime: now,
-		LastProbeTime:      now,
-		Reason:             "",
-		Message:            "",
-	})
-
-	readyConditionStatus := v1.ConditionFalse
-	if phase == v1.PodRunning {
-		readyConditionStatus = v1.ConditionTrue
-	}
-
-	podStatus.Conditions = append(podStatus.Conditions, v1.PodCondition{
-		Type:               v1.PodReady,
-		Status:             readyConditionStatus,
-		LastTransitionTime: now,
-		LastProbeTime:      now,
-		Reason:             "",
-		Message:            "",
-	})
-
-	scheduledConditionStatus := v1.ConditionTrue
-	if phase == v1.PodPending {
-		scheduledConditionStatus = v1.ConditionFalse
-	}
-
-	podStatus.Conditions = append(podStatus.Conditions, v1.PodCondition{
-		Type:               v1.PodScheduled,
-		Status:             scheduledConditionStatus,
-		LastTransitionTime: now,
-		LastProbeTime:      now,
-		Reason:             "",
-		Message:            "",
-	})
-
-	// Add the ContainersReady condition
-	podStatus.Conditions = append(podStatus.Conditions, v1.PodCondition{
-		Type:               v1.ContainersReady,
-		Status:             readyConditionStatus,
-		LastTransitionTime: now,
-		LastProbeTime:      now,
-		Reason:             "",
-		Message:            "",
-	})
 
 	return podStatus
 }
