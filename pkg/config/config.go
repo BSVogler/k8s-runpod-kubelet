@@ -20,4 +20,7 @@ type Config struct {
 
 	// HealthServerAddress is the address where the health server listens
 	HealthServerAddress string
+
+	// DatacenterIDs is a comma-separated list of preferred datacenter IDs for pod placement
+	DatacenterIDs string
 }
