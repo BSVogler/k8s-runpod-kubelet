@@ -38,7 +38,7 @@ const (
 	RunpodTemplateIdAnnotation            = "runpod.io/templateId"
 	GpuMemoryAnnotation                   = "runpod.io/required-gpu-memory"
 	RunpodContainerRegistryAuthAnnotation = "runpod.io/container-registry-auth-id"
-	RunpodDatacenterAnnotation           = "runpod.io/datacenter-id"
+	RunpodDatacenterAnnotation            = "runpod.io/datacenter-id"
 	// DefaultMaxPrice for GPU
 	DefaultMaxPrice = 0.5
 
@@ -473,7 +473,7 @@ func (c *Client) GetGPUTypes(minRAMPerGPU int, maxPrice float64, cloudType strin
 }
 
 func (c *Client) DeployPodREST(params map[string]interface{}) (string, float64, error) {
-	// https://rest.io/v1/docs#tag/pods/POST/pods
+	// https://rest.runpod.io/v1/docs#tag/pods/POST/pods
 	reqBody, err := json.Marshal(params)
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to marshal request: %w", err)
