@@ -247,6 +247,9 @@ func main() {
 	}
 
 	// Create the RunPod provider
+	// Update config with command line flags
+	providerConfig.DatacenterIDs = datacenterIDs
+
 	provider, err := runpod.NewProvider(
 		ctx,
 		nodeName,

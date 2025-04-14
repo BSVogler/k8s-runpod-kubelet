@@ -171,14 +171,14 @@ func (p *Provider) UpdatePod(ctx context.Context, pod *v1.Pod) error {
 
 // DeployPodToRunPod handles the deployment of a Kubernetes pod to RunPod
 func (p *Provider) DeployPodToRunPod(pod *v1.Pod) error {
-	// Add datacenter ID annotation if globally configured
-	if datacenterIDs != "" && pod.Annotations[RunpodDatacenterAnnotation] == "" {
+	// Add datacenter IDs annotation if globally configured
+	if p.config.DatacenterIDs != "" && pod.Annotations[RunpodDatacenterAnnotation] == "" {
 		// Copy pod to add annotation
 		podCopy := pod.DeepCopy()
 		if podCopy.Annotations == nil {
 			podCopy.Annotations = make(map[string]string)
 		}
-		podCopy.Annotations[RunpodDatacenterAnnotation] = datacenterIDs
+		podCopy.Annotations[RunpodDatacenterAnnotation] = p.config.DatacenterIDs
 
 		// Update pod with annotation
 		_, err := p.clientset.CoreV1().Pods(pod.Namespace).Update(
