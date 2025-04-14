@@ -72,9 +72,9 @@ func TestRunPodIntegration(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: fmt.Sprintf("runpod-test-pod-%d", time.Now().Unix()),
 			Annotations: map[string]string{
-				runpod.RunpodCloudTypeAnnotation:  "STANDARD",
-				runpod.GpuMemoryAnnotation:        "2",
-				runpod.RunpodTemplateIdAnnotation: "8pjdlrsfmx",
+				runpod.CloudTypeAnnotation:  "STANDARD",
+				runpod.GpuMemoryAnnotation:  "2",
+				runpod.TemplateIdAnnotation: "8pjdlrsfmx",
 			},
 		},
 		Spec: v1.PodSpec{
@@ -101,7 +101,7 @@ func TestRunPodIntegration(t *testing.T) {
 	var params map[string]interface{}
 	var createdPod *v1.Pod
 	var lastStatus runpod.PodStatus
-	var detailedStatus *runpod.RunPodDetailedStatus
+	var detailedStatus *runpod.DetailedStatus
 	var terminatedID string
 
 	// Ensure resources are cleaned up at the end
@@ -210,8 +210,8 @@ func TestRunPodIntegration(t *testing.T) {
 		}
 
 		patch := fmt.Sprintf(`{"metadata":{"annotations":{"%s":"%s","%s":"%g"}}}`,
-			runpod.RunpodPodIDAnnotation, runpodID,
-			runpod.RunpodCostAnnotation, costPerHr)
+			runpod.PodIDAnnotation, runpodID,
+			runpod.CostAnnotation, costPerHr)
 
 		_, err = clientset.CoreV1().Pods(ns.Name).Patch(
 			context.Background(),

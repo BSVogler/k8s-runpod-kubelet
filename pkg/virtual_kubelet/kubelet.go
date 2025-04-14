@@ -35,11 +35,11 @@ type Provider struct {
 	deletedPodsMutex   sync.Mutex
 
 	// For pod tracking (replaces resourceManager)
-	pods        map[string]*v1.Pod     // Map of podKey -> Pod
-	podStatus   map[string]*RunPodInfo // Map of podKey -> RunPodInfo
-	podsMutex   sync.RWMutex           // Mutex for thread-safe access to pods maps
-	notifyFunc  func(*v1.Pod)          // Function called when pod status changes
-	notifyMutex sync.RWMutex           // Mutex for thread-safe access to notify function
+	pods        map[string]*v1.Pod       // Map of podKey -> Pod
+	podStatus   map[string]*InstanceInfo // Map of podKey -> InstanceInfo
+	podsMutex   sync.RWMutex             // Mutex for thread-safe access to pods maps
+	notifyFunc  func(*v1.Pod)            // Function called when pod status changes
+	notifyMutex sync.RWMutex             // Mutex for thread-safe access to notify function
 }
 
 // startPeriodicStatusUpdates polls the RunPod API to keep pod statuses up to date
@@ -104,7 +104,7 @@ func NewProvider(ctx context.Context, nodeName, operatingSystem string, internal
 		deletedPods:        make(map[string]string),
 		deletedPodsMutex:   sync.Mutex{},
 		pods:               make(map[string]*v1.Pod),
-		podStatus:          make(map[string]*RunPodInfo),
+		podStatus:          make(map[string]*InstanceInfo),
 		podsMutex:          sync.RWMutex{},
 	}
 
@@ -130,7 +130,7 @@ func (p *Provider) CreatePod(ctx context.Context, pod *v1.Pod) error {
 	podKey := fmt.Sprintf("%s-%s", pod.Namespace, pod.Name)
 	p.podsMutex.Lock()
 	p.pods[podKey] = pod.DeepCopy()
-	p.podStatus[podKey] = &RunPodInfo{
+	p.podStatus[podKey] = &InstanceInfo{
 		PodName:      pod.Name,
 		Namespace:    pod.Namespace,
 		Status:       string(PodStarting),
@@ -172,13 +172,13 @@ func (p *Provider) UpdatePod(ctx context.Context, pod *v1.Pod) error {
 // DeployPodToRunPod handles the deployment of a Kubernetes pod to RunPod
 func (p *Provider) DeployPodToRunPod(pod *v1.Pod) error {
 	// Add datacenter IDs annotation if globally configured
-	if p.config.DatacenterIDs != "" && pod.Annotations[RunpodDatacenterAnnotation] == "" {
+	if p.config.DatacenterIDs != "" && pod.Annotations[DatacenterAnnotation] == "" {
 		// Copy pod to add annotation
 		podCopy := pod.DeepCopy()
 		if podCopy.Annotations == nil {
 			podCopy.Annotations = make(map[string]string)
 		}
-		podCopy.Annotations[RunpodDatacenterAnnotation] = p.config.DatacenterIDs
+		podCopy.Annotations[DatacenterAnnotation] = p.config.DatacenterIDs
 
 		// Update pod with annotation
 		_, err := p.clientset.CoreV1().Pods(pod.Namespace).Update(
@@ -243,8 +243,8 @@ func (p *Provider) updatePodWithRunPodInfo(pod *v1.Pod, podID string, costPerHr 
 	if podCopy.Annotations == nil {
 		podCopy.Annotations = make(map[string]string)
 	}
-	podCopy.Annotations[RunpodPodIDAnnotation] = podID
-	podCopy.Annotations[RunpodCostAnnotation] = fmt.Sprintf("%f", costPerHr)
+	podCopy.Annotations[PodIDAnnotation] = podID
+	podCopy.Annotations[CostAnnotation] = fmt.Sprintf("%f", costPerHr)
 
 	// Update the pod
 	_, err = p.clientset.CoreV1().Pods(podCopy.Namespace).Update(
@@ -266,7 +266,7 @@ func (p *Provider) updatePodWithRunPodInfo(pod *v1.Pod, podID string, costPerHr 
 		podInfo.Status = string(PodStarting)
 		p.podStatus[podKey] = podInfo
 	} else {
-		p.podStatus[podKey] = &RunPodInfo{
+		p.podStatus[podKey] = &InstanceInfo{
 			ID:           podID,
 			CostPerHr:    costPerHr,
 			PodName:      pod.Name,
@@ -298,7 +298,7 @@ func (p *Provider) DeletePod(ctx context.Context, pod *v1.Pod) error {
 	p.logger.Info("Deleting pod", "pod", pod.Name, "namespace", pod.Namespace)
 
 	// Check if this pod is backed by a RunPod instance
-	podID := pod.Annotations[RunpodPodIDAnnotation]
+	podID := pod.Annotations[PodIDAnnotation]
 	if podID != "" {
 		// Track the deleted pod for cleanup
 		podKey := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
@@ -429,7 +429,7 @@ func (p *Provider) processPendingPods() {
 		}
 
 		// Check if pod already has a RunPod ID - if so, skip it
-		if podID := pod.Annotations[RunpodPodIDAnnotation]; podID != "" {
+		if podID := pod.Annotations[PodIDAnnotation]; podID != "" {
 			p.logger.Debug("Skipping deployment of pod with existing RunPod ID",
 				"pod", pod.Name,
 				"namespace", pod.Namespace,
@@ -502,7 +502,7 @@ func (p *Provider) updateAllPodStatuses() {
 		}
 
 		// Get the RunPod ID from annotations
-		podID := pod.Annotations[RunpodPodIDAnnotation]
+		podID := pod.Annotations[PodIDAnnotation]
 		if podID == "" {
 			continue
 		}
@@ -535,8 +535,8 @@ func (p *Provider) updateAllPodStatuses() {
 
 				// Remove the RunPod annotations
 				if podCopy.Annotations != nil {
-					delete(podCopy.Annotations, RunpodPodIDAnnotation)
-					delete(podCopy.Annotations, RunpodCostAnnotation)
+					delete(podCopy.Annotations, PodIDAnnotation)
+					delete(podCopy.Annotations, CostAnnotation)
 
 					// Update the pod
 					_, updateErr := p.clientset.CoreV1().Pods(podCopy.Namespace).Update(
@@ -678,9 +678,9 @@ func translateRunPodStatusToPhase(runpodStatus string) string {
 }
 
 // handlePodCompletion processes a pod that has completed execution
-func (p *Provider) handlePodCompletion(pod *v1.Pod, podInfo *RunPodInfo) {
+func (p *Provider) handlePodCompletion(pod *v1.Pod, podInfo *InstanceInfo) {
 	// Get the RunPod ID from annotations
-	podID := pod.Annotations[RunpodPodIDAnnotation]
+	podID := pod.Annotations[PodIDAnnotation]
 	if podID == "" {
 		return
 	}
@@ -932,7 +932,7 @@ func (p *Provider) cleanupStuckTerminatingPods() {
 			terminatingCount++
 
 			// Get the RunPod ID from annotations
-			podID := pod.Annotations[RunpodPodIDAnnotation]
+			podID := pod.Annotations[PodIDAnnotation]
 			if podID == "" {
 				// Pod has no RunPod ID - it was never deployed to RunPod
 				// We should force delete it as it has nothing to clean up remotely
@@ -1133,7 +1133,7 @@ func (p *Provider) LoadRunning() {
 		p.pods[podKey] = pod.DeepCopy()
 
 		// Check if pod already has a RunPod ID annotation
-		podID, hasRunpodID := pod.Annotations[RunpodPodIDAnnotation]
+		podID, hasRunpodID := pod.Annotations[PodIDAnnotation]
 
 		if hasRunpodID {
 			// Pod already has RunPod ID - check if it exists in RunPod
@@ -1155,7 +1155,7 @@ func (p *Provider) LoadRunning() {
 				}
 
 				// Update pod status in cache
-				p.podStatus[podKey] = &RunPodInfo{
+				p.podStatus[podKey] = &InstanceInfo{
 					ID:           podID,
 					PodName:      pod.Name,
 					Namespace:    pod.Namespace,
@@ -1182,8 +1182,8 @@ func (p *Provider) LoadRunning() {
 
 					// Remove the RunPod annotations
 					if podCopy.Annotations != nil {
-						delete(podCopy.Annotations, RunpodPodIDAnnotation)
-						delete(podCopy.Annotations, RunpodCostAnnotation)
+						delete(podCopy.Annotations, PodIDAnnotation)
+						delete(podCopy.Annotations, CostAnnotation)
 
 						// Update the pod
 						_, updateErr := p.clientset.CoreV1().Pods(podCopy.Namespace).Update(
@@ -1205,7 +1205,7 @@ func (p *Provider) LoadRunning() {
 				}
 
 				// Update local tracking with removed annotation
-				p.podStatus[podKey] = &RunPodInfo{
+				p.podStatus[podKey] = &InstanceInfo{
 					ID:           "", // Clear the ID
 					PodName:      pod.Name,
 					Namespace:    pod.Namespace,
@@ -1221,7 +1221,7 @@ func (p *Provider) LoadRunning() {
 				"namespace", pod.Namespace)
 
 			// Mark as pending deployment
-			p.podStatus[podKey] = &RunPodInfo{
+			p.podStatus[podKey] = &InstanceInfo{
 				PodName:      pod.Name,
 				Namespace:    pod.Namespace,
 				Status:       string(PodStarting),
@@ -1265,7 +1265,7 @@ func (p *Provider) fetchRunPodInstances() (running []RunPodInstance, exited []Ru
 }
 
 // processRunPodInstance processes a single RunPod instance
-func (p *Provider) processRunPodInstance(runpodInstance RunPodInstance, existingRunPodMap map[string]RunPodInfo) {
+func (p *Provider) processRunPodInstance(runpodInstance RunPodInstance, existingRunPodMap map[string]InstanceInfo) {
 	// Skip if this RunPod instance is already represented in the cluster
 	if _, exists := existingRunPodMap[runpodInstance.ID]; exists {
 		return
@@ -1286,12 +1286,12 @@ func (p *Provider) CreateVirtualPod(runpodInstance RunPodInstance) error {
 
 	// Create labels to link Pod to Job
 	podLabels := make(map[string]string)
-	podLabels[RunpodPodIDAnnotation] = runpodInstance.ID
+	podLabels[PodIDAnnotation] = runpodInstance.ID
 
 	// Create annotations for the Pod
 	podAnnotations := make(map[string]string)
-	podAnnotations[RunpodPodIDAnnotation] = runpodInstance.ID
-	podAnnotations[RunpodCostAnnotation] = fmt.Sprintf("%f", runpodInstance.CostPerHr)
+	podAnnotations[PodIDAnnotation] = runpodInstance.ID
+	podAnnotations[CostAnnotation] = fmt.Sprintf("%f", runpodInstance.CostPerHr)
 	podAnnotations["runpod.io/external"] = "true"
 
 	// Create Pod object
@@ -1390,7 +1390,7 @@ func (p *Provider) fetchRunPodInstancesByStatus(status string) ([]RunPodInstance
 }
 
 // mapExistingRunPodInstances maps existing RunPod instances in the cluster
-func (p *Provider) mapExistingRunPodInstances() map[string]RunPodInfo {
+func (p *Provider) mapExistingRunPodInstances() map[string]InstanceInfo {
 	// Get existing pods in the cluster assigned to this virtual node
 	existingPods, err := p.clientset.CoreV1().Pods("").List(
 		context.Background(),
@@ -1400,14 +1400,14 @@ func (p *Provider) mapExistingRunPodInstances() map[string]RunPodInfo {
 	)
 	if err != nil {
 		p.logger.Error("Failed to list existing pods", "err", err)
-		return make(map[string]RunPodInfo)
+		return make(map[string]InstanceInfo)
 	}
 
 	// Create a map of existing RunPod IDs to pod info
-	existingRunPodMap := make(map[string]RunPodInfo)
+	existingRunPodMap := make(map[string]InstanceInfo)
 	for _, pod := range existingPods.Items {
-		if podID, exists := pod.Annotations[RunpodPodIDAnnotation]; exists {
-			existingRunPodMap[podID] = RunPodInfo{
+		if podID, exists := pod.Annotations[PodIDAnnotation]; exists {
+			existingRunPodMap[podID] = InstanceInfo{
 				PodName:   pod.Name,
 				Namespace: pod.Namespace,
 			}
@@ -1676,7 +1676,7 @@ func (p *Provider) GetContainerLogs(ctx context.Context, namespace, podName, con
 		return nil, fmt.Errorf("error getting pod for logs: %w", err)
 	}
 
-	podID := pod.Annotations[RunpodPodIDAnnotation]
+	podID := pod.Annotations[PodIDAnnotation]
 	if podID == "" {
 		return nil, fmt.Errorf("pod %s/%s has no RunPod ID annotation", namespace, podName)
 	}

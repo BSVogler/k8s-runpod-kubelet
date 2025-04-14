@@ -31,14 +31,14 @@ type Client struct {
 
 // Constants for RunPod integration
 const (
-	RunpodPodIDAnnotation = "runpod.io/pod-id"
-	RunpodCostAnnotation  = "runpod.io/cost-per-hr"
-	//RunpodCloudTypeAnnotation should in THEORY support COMMUNITY and STANDARD but in tests only STANDARD lead to results when using the API. Therefore, defaults to STANDARD.
-	RunpodCloudTypeAnnotation             = "runpod.io/cloud-type"
-	RunpodTemplateIdAnnotation            = "runpod.io/templateId"
-	GpuMemoryAnnotation                   = "runpod.io/required-gpu-memory"
-	RunpodContainerRegistryAuthAnnotation = "runpod.io/container-registry-auth-id"
-	RunpodDatacenterAnnotation            = "runpod.io/datacenter-ids" // Comma-separated list preferred
+	PodIDAnnotation = "runpod.io/pod-id"
+	CostAnnotation  = "runpod.io/cost-per-hr"
+	//CloudTypeAnnotation should in THEORY support COMMUNITY and STANDARD but in tests only STANDARD lead to results when using the API. Therefore, defaults to STANDARD.
+	CloudTypeAnnotation             = "runpod.io/cloud-type"
+	TemplateIdAnnotation            = "runpod.io/templateId"
+	GpuMemoryAnnotation             = "runpod.io/required-gpu-memory"
+	ContainerRegistryAuthAnnotation = "runpod.io/container-registry-auth-id"
+	DatacenterAnnotation            = "runpod.io/datacenter-ids" // Comma-separated list preferred
 	// DefaultMaxPrice for GPU
 	DefaultMaxPrice = 0.5
 
@@ -89,8 +89,8 @@ type GPUType struct {
 	Price    float64
 }
 
-// RunPodInfo stores information about a RunPod instance in the cluster
-type RunPodInfo struct {
+// InstanceInfo stores information about a RunPod instance in the cluster
+type InstanceInfo struct {
 	ID            string
 	CostPerHr     float64
 	PodName       string
@@ -101,7 +101,7 @@ type RunPodInfo struct {
 	CreationTime  time.Time
 }
 
-type RunPodDetailedStatus struct {
+type DetailedStatus struct {
 	ID            string            `json:"id"`
 	Name          string            `json:"name"`
 	DesiredStatus string            `json:"desiredStatus"`
@@ -345,7 +345,7 @@ func (c *Client) GetPodStatusREST(podID string) (PodStatus, error) {
 			}
 		}
 
-		// If we can't parse the JSON or it doesn't match our expected error format,
+		// If we can't parse the JSON, or it doesn't match our expected error format,
 		// log it but still return PodNotFound since a 404 generally indicates the pod doesn't exist
 		c.logger.Warn("Received unexpected 404 response format",
 			"podID", podID,
@@ -698,7 +698,7 @@ func (c *Client) makeRESTRequest(method, endpoint string, body io.Reader) (*http
 }
 
 // GetDetailedPodStatus gets detailed information about a RunPod instance
-func (c *Client) GetDetailedPodStatus(podID string) (*RunPodDetailedStatus, error) {
+func (c *Client) GetDetailedPodStatus(podID string) (*DetailedStatus, error) {
 	endpoint := fmt.Sprintf("pods/%s", podID)
 
 	//example response
@@ -710,7 +710,7 @@ func (c *Client) GetDetailedPodStatus(podID string) (*RunPodDetailedStatus, erro
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return &RunPodDetailedStatus{
+		return &DetailedStatus{
 			ID:            podID,
 			DesiredStatus: string(PodNotFound),
 		}, nil
@@ -733,7 +733,7 @@ func (c *Client) GetDetailedPodStatus(podID string) (*RunPodDetailedStatus, erro
 	}
 
 	// Parse the response
-	var status RunPodDetailedStatus
+	var status DetailedStatus
 	if err := json.Unmarshal(body, &status); err != nil {
 		return nil, fmt.Errorf("failed to parse pod status: %w", err)
 	}
@@ -742,7 +742,7 @@ func (c *Client) GetDetailedPodStatus(podID string) (*RunPodDetailedStatus, erro
 }
 
 // IsSuccessfulCompletion determines if a RunPod instance exited successfully
-func IsSuccessfulCompletion(status *RunPodDetailedStatus) bool {
+func IsSuccessfulCompletion(status *DetailedStatus) bool {
 	// If we don't have runtime information, we can't determine
 	if status.Runtime == nil {
 		return false
@@ -957,7 +957,7 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 		}
 		return defaultValue
 	}
-	if cloudTypeVal := getAnnotation(RunpodCloudTypeAnnotation, ""); cloudTypeVal != "" {
+	if cloudTypeVal := getAnnotation(CloudTypeAnnotation, ""); cloudTypeVal != "" {
 		// Validate and normalize the cloud type value
 		cloudTypeUpperCase := strings.ToUpper(cloudTypeVal)
 		if cloudTypeUpperCase == "SECURE" || cloudTypeUpperCase == "COMMUNITY" {
@@ -971,8 +971,8 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 		}
 	}
 
-	containerRegistryAuthId := getAnnotation(RunpodContainerRegistryAuthAnnotation, "")
-	templateId := getAnnotation(RunpodTemplateIdAnnotation, "")
+	containerRegistryAuthId := getAnnotation(ContainerRegistryAuthAnnotation, "")
+	templateId := getAnnotation(TemplateIdAnnotation, "")
 
 	// Determine minimum GPU memory required
 	minRAMPerGPU := 16 // Default minimum memory
@@ -1029,7 +1029,7 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 	}
 
 	// Add datacenter IDs if specified in pod annotations
-	if datacenterID := getAnnotation(RunpodDatacenterAnnotation, ""); datacenterID != "" {
+	if datacenterID := getAnnotation(DatacenterAnnotation, ""); datacenterID != "" {
 		params["dataCenterIds"] = []string{datacenterID}
 	}
 
