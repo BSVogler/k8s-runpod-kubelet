@@ -171,7 +171,7 @@ func (p *Provider) UpdatePod(ctx context.Context, pod *v1.Pod) error {
 
 // DeployPodToRunPod handles the deployment of a Kubernetes pod to RunPod
 func (p *Provider) DeployPodToRunPod(pod *v1.Pod) error {
-	// Skip deployment if datacenter ID is required but not set
+	// Add datacenter ID annotation if globally configured
 	if datacenterID != "" && pod.Annotations[RunpodDatacenterAnnotation] == "" {
 		// Copy pod to add annotation
 		podCopy := pod.DeepCopy()
