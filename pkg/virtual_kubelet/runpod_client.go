@@ -38,7 +38,7 @@ const (
 	RunpodTemplateIdAnnotation            = "runpod.io/templateId"
 	GpuMemoryAnnotation                   = "runpod.io/required-gpu-memory"
 	RunpodContainerRegistryAuthAnnotation = "runpod.io/container-registry-auth-id"
-	RunpodDatacenterAnnotation            = "runpod.io/datacenter-id"
+	RunpodDatacenterAnnotation            = "runpod.io/datacenter-ids" // Comma-separated list preferred
 	// DefaultMaxPrice for GPU
 	DefaultMaxPrice = 0.5
 
