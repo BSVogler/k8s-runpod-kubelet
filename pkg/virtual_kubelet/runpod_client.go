@@ -38,6 +38,7 @@ const (
 	RunpodTemplateIdAnnotation            = "runpod.io/templateId"
 	GpuMemoryAnnotation                   = "runpod.io/required-gpu-memory"
 	RunpodContainerRegistryAuthAnnotation = "runpod.io/container-registry-auth-id"
+	RunpodDatacenterAnnotation           = "runpod.io/datacenter-id"
 	// DefaultMaxPrice for GPU
 	DefaultMaxPrice = 0.5
 
@@ -1025,6 +1026,11 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 		"name":              runpodName,
 		"imageName":         imageName,
 		"env":               formattedEnvVars,
+	}
+
+	// Add datacenter ID if specified in pod annotations
+	if datacenterID := getAnnotation(RunpodDatacenterAnnotation, ""); datacenterID != "" {
+		params["dataCenterId"] = datacenterID
 	}
 
 	// Add templateId to params if it exists
