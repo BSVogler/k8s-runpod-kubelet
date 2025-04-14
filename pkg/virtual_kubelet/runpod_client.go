@@ -1028,9 +1028,9 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 		"env":               formattedEnvVars,
 	}
 
-	// Add datacenter ID if specified in pod annotations
+	// Add datacenter IDs if specified in pod annotations
 	if datacenterID := getAnnotation(RunpodDatacenterAnnotation, ""); datacenterID != "" {
-		params["dataCenterId"] = datacenterID
+		params["dataCenterIds"] = []string{datacenterID}
 	}
 
 	// Add templateId to params if it exists
