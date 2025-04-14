@@ -51,6 +51,7 @@ var (
 	maxGPUPrice         float64
 	healthServerAddress string
 	kubenamespace       string
+	datacenterID        string
 )
 
 // Log handlers are defined in a separate file
@@ -67,6 +68,7 @@ func init() {
 	flag.IntVar(&listenPort, "listen-port", 10250, "port to listen on")
 	flag.StringVar(&logLevel, "log-level", "info", "log level (debug, info, warn, error)")
 	flag.StringVar(&kubenamespace, "namespace", "kube-system", "kubernetes namespace")
+	flag.StringVar(&datacenterID, "datacenter-id", "", "RunPod datacenter ID to launch pods in")
 }
 
 // LoadConfig loads configuration from a YAML file
