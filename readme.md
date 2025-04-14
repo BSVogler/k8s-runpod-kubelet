@@ -101,6 +101,7 @@ Common configuration options:
 - `--max-gpu-price`: Maximum price per hour for GPU instances (default: 0.5)
 - `--reconcile-interval`: Frequency of status updates in seconds (default: 30)
 - `--log-level`: Logging verbosity (debug, info, warn, error)
+- `--datacenter-ids`: Comma-separated list of preferred datacenter IDs for pod placement
 
 ## 🔍 Usage
 
@@ -140,6 +141,7 @@ metadata:
   annotations:
     runpod.io/required-gpu-memory: "16" # Minimum GPU memory in GB
     runpod.io/templateId: "your-template-id"  # Use a specific RunPod template to use a preregistered authentication.
+    runpod.io/datacenter-ids: "datacenter1,datacenter2" # Comma-separated list of allowed datacenter IDs
 ```
 
 Experimental. Implemented here but not working with the API.
