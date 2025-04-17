@@ -314,7 +314,7 @@ func main() {
 	} else {
 		logger.Error("Not all informer caches synced successfully")
 	}
-	// Then when creating the pod controller, include all informers:
+	// The pod controller manages all informers to react to events
 	podController, err := node.NewPodController(node.PodControllerConfig{
 		PodClient:                         k8sClient.CoreV1(),
 		PodInformer:                       podInformer,
@@ -349,7 +349,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Set up basic handlers
+	// Set up basic handlers for the HTTP server. This lets k8s interact with the kubelet
 	podHandlerConfig := api.PodHandlerConfig{
 		RunInContainer: func(ctx context.Context, namespace, podName, containerName string, cmd []string, attach api.AttachIO) error {
 			return fmt.Errorf("running commands in container is not supported by RunPod")
@@ -372,10 +372,8 @@ func main() {
 
 	// Create HTTP server
 	mux := http.NewServeMux()
-	// Attach pod routes to the mux
+	// Attach pod routes to the mux (multiplexer)
 	api.AttachPodRoutes(podHandlerConfig, mux, false) // Set debug to false for production
-
-	// Create HTTP server
 	apiServer := &http.Server{
 		Addr:    fmt.Sprintf("%s:%d", internalIP, listenPort),
 		Handler: mux,
