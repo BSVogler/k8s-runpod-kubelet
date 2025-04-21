@@ -144,11 +144,12 @@ metadata:
     runpod.io/datacenter-ids: "datacenter1,datacenter2" # Comma-separated list of allowed datacenter IDs
 ```
 
-Experimental. Implemented here but not working with the API.
-``
+Experimental. Implemented here but not working with the RunPod API.
+
+```yaml
     runpod.io/cloud-type: "COMMUNITY"   # SECURE or COMMUNITY.should in THEORY support COMMUNITY and STANDARD but in tests only STANDARD lead to results when using the API. Therefore, defaults to STANDARD.
     runpod.io/container-registry-auth-id: "your-auth-id"  # For private registries. Should be supported in theory but only working solution so far found when using template id and preregistering.
-``
+```
 
 ### Monitoring
 
