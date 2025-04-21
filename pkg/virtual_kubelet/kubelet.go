@@ -123,6 +123,15 @@ func NewProvider(ctx context.Context, nodeName, operatingSystem string, internal
 
 // CreatePod takes a Kubernetes Pod and deploys it within the provider
 func (p *Provider) CreatePod(ctx context.Context, pod *v1.Pod) error {
+	//the controller gets all pods in the cluster and sends them to us via the node.syncPodFromKuberentesHandler, even though they are not intended for this node. So filter them.
+	if pod.Spec.NodeName != "" && pod.Spec.NodeName != p.nodeName {
+		p.logger.Debug("Skipping pod not assigned to this node",
+			"pod", pod.Name,
+			"namespace", pod.Namespace,
+			"podNodeName", pod.Spec.NodeName,
+			"thisNodeName", p.nodeName)
+		return nil
+	}
 	// Implementation for creating a pod
 	p.logger.Info("Creating pod", "pod", pod.Name, "namespace", pod.Namespace)
 
