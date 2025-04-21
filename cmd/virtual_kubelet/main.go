@@ -172,6 +172,12 @@ func main() {
 		logAuthInfo(k8sClient, logger)
 	}
 
+	// Check if RUNPOD_KEY is set
+	if os.Getenv("RUNPOD_KEY") == "" {
+		logger.Error("RUNPOD_KEY environment variable is not set")
+		os.Exit(1)
+	}
+
 	// Create the RunPod provider
 	// Update config with command line flags
 	providerConfig.DatacenterIDs = datacenterIDs
