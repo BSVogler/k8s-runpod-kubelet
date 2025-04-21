@@ -8,7 +8,6 @@ import (
 	runpod "github.com/bsvogler/k8s-runpod-kubelet/pkg/virtual_kubelet"
 	"github.com/getsentry/sentry-go"
 	sentryslog "github.com/getsentry/sentry-go/slog"
-	"github.com/google/uuid"
 	"io"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
@@ -36,7 +35,6 @@ import (
 )
 import (
 	authenticationv1 "k8s.io/api/authentication/v1"
-	authorizationv1 "k8s.io/api/authorization/v1"
 )
 
 var (
@@ -89,25 +87,6 @@ func LoadConfig(path string) (config.Config, error) {
 }
 
 func logAuthInfo(k8sClient *kubernetes.Clientset, logger *slog.Logger) {
-	// Get current user info
-	selfSubject, err := k8sClient.AuthorizationV1().SelfSubjectAccessReviews().Create(
-		context.Background(),
-		&authorizationv1.SelfSubjectAccessReview{
-			Spec: authorizationv1.SelfSubjectAccessReviewSpec{
-				ResourceAttributes: &authorizationv1.ResourceAttributes{
-					Verb:     "get",
-					Resource: "pods",
-				},
-			},
-		},
-		metav1.CreateOptions{},
-	)
-
-	if err != nil {
-		logger.Error("Failed to get authentication info", "error", err)
-		return
-	}
-
 	// Try to get user info from API server
 	userInfo, err := k8sClient.AuthenticationV1().SelfSubjectReviews().Create(
 		context.Background(),
@@ -123,59 +102,6 @@ func logAuthInfo(k8sClient *kubernetes.Clientset, logger *slog.Logger) {
 			"groups", userInfo.Status.UserInfo.Groups)
 		return
 	}
-
-	// If direct method fails, use a generic method that works for in-cluster and kubeconfig
-	// Create a pod with an annotation in a test namespace, then check who created it
-	testNs := "default"
-	testPodName := "auth-test-" + uuid.NewString()[:8]
-
-	// First check if we can create a pod
-	testPod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: testPodName,
-			Annotations: map[string]string{
-				"purpose": "auth-check",
-			},
-		},
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{
-				{
-					Name:  "pause",
-					Image: "k8s.gcr.io/pause:3.5",
-				},
-			},
-			RestartPolicy: corev1.RestartPolicyNever,
-		},
-	}
-
-	pod, err := k8sClient.CoreV1().Pods(testNs).Create(
-		context.Background(),
-		testPod,
-		metav1.CreateOptions{})
-
-	// Always clean up the test pod
-	defer func() {
-		if pod != nil {
-			err := k8sClient.CoreV1().Pods(testNs).Delete(
-				context.Background(),
-				testPodName,
-				metav1.DeleteOptions{})
-			if err != nil {
-				logger.Warn("Failed to clean up test pod", "error", err)
-			}
-		}
-	}()
-
-	if err != nil {
-		logger.Error("Failed to create test pod", "error", err)
-		logger.Info("Auth info", "authorized", selfSubject.Status.Allowed)
-		return
-	}
-
-	// Log the creator information
-	logger.Info("Authentication succeeded",
-		"createdBy", pod.ObjectMeta.CreationTimestamp,
-		"authorized", selfSubject.Status.Allowed)
 }
 
 func main() {
@@ -410,11 +336,11 @@ func main() {
 
 	go func() {
 		logger.Info("Starting pod controller")
-		// The second parameter (threadiness) is the number of workers
 		if err := podController.Run(ctx, 1); err != nil && ctx.Err() == nil {
 			logger.Error("Failed to run pod controller", "error", err)
 			cancel()
 		}
+		logger.Info("Pod controller started successfully") // This might not execute if Run doesn't return
 	}()
 
 	go func() {
