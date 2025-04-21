@@ -247,7 +247,7 @@ func main() {
 		logger.Error("Not all informer caches synced successfully")
 	}
 	// The pod controller manages all informers to react to events
-	podController, err := node.NewPodController(node.PodControllerConfig{
+	podControllerCfg := node.PodControllerConfig{
 		PodClient:                         k8sClient.CoreV1(),
 		PodInformer:                       podInformer,
 		ConfigMapInformer:                 configMapInformer,
@@ -261,6 +261,7 @@ func main() {
 		logger.Error("Failed to create pod controller", "error", err)
 		os.Exit(1)
 	}
+	podController, err := node.NewPodController(podControllerCfg)
 
 	// Create node controller
 	_, err = k8sClient.Discovery().ServerResourcesForGroupVersion("coordination.k8s.io/v1")
