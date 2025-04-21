@@ -72,13 +72,17 @@ The Virtual Kubelet acts as a bridge between Kubernetes and RunPod, providing a 
 
 ```bash
 # Create secret with RunPod API key
-kubectl create secret generic runpod-secret \
+kubectl create secret generic runpod-kubelet-secrets \
   --namespace kube-system \
   --from-literal=RUNPOD_KEY=<your-runpod-api-key>
 
 # Apply controller deployment
 kubectl apply -f https://raw.githubusercontent.com/bsvogler/k8s-runpod-kubelet/main/deploy/kubelet.yaml
 ```
+
+Env variables for configuration:
+- `RUNPOD_KEY`: RunPod API authentication key
+- `SENTRY_URL` for Sentry error tracking.
 
 ### Configuration
 
@@ -95,7 +99,6 @@ Configure using environment variables or command-line flags:
 
 Common configuration options:
 
-- `RUNPOD_KEY`: RunPod API authentication key
 - `--nodename`: Name of the virtual node (default: "virtual-runpod")
 - `--namespace`: Kubernetes namespace (default: "kube-system")
 - `--max-gpu-price`: Maximum price per hour for GPU instances (default: 0.5)
