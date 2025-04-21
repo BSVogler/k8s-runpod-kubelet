@@ -382,7 +382,7 @@ func createK8sClient(kubeconfig string) (*kubernetes.Clientset, error) {
 			// If no in-cluster clusterConfig, look for kubeconfig in default location
 			home := homeDir()
 			if home != "" {
-				kubeconfig = filepath.Join(home, ".kube", "clusterConfig")
+				kubeconfig = filepath.Join(home, ".kube", "config")
 			}
 		}
 	}
