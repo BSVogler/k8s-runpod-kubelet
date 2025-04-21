@@ -197,8 +197,9 @@ func main() {
 		os.Exit(1)
 	}
 	eventBroadcaster := record.NewBroadcaster()
+	//here we use a namespace agnostic event sink because the controller can manage pods in all namespaces
 	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{
-		Interface: k8sClient.CoreV1().Events(kubenamespace),
+		Interface: k8sClient.CoreV1().Events(""), // Empty string means "all namespaces"
 	})
 	eventRecorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: nodeName})
 
