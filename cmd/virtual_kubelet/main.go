@@ -214,38 +214,6 @@ func main() {
 	secretInformer := informerFactory.Core().V1().Secrets()
 	serviceInformer := informerFactory.Core().V1().Services()
 
-	// Start the informer factory
-	informerFactory.Start(ctx.Done())
-
-	syncCtx, syncCancel := context.WithTimeout(ctx, 10*time.Second)
-	defer syncCancel()
-
-	logger.Info("Waiting for informer caches to sync")
-	syncResult := informerFactory.WaitForCacheSync(syncCtx.Done())
-
-	// Check results for each informer
-	for informerType, synced := range syncResult {
-		if !synced {
-			logger.Error("Cache failed to sync", "informerType", fmt.Sprintf("%v", informerType))
-		} else {
-			logger.Info("Cache synced successfully", "informerType", fmt.Sprintf("%v", informerType))
-		}
-	}
-
-	// a simple check to see if all caches synced
-	allSynced := true
-	for _, synced := range syncResult {
-		if !synced {
-			allSynced = false
-			break
-		}
-	}
-
-	if allSynced {
-		logger.Info("All informer caches synced successfully")
-	} else {
-		logger.Error("Not all informer caches synced successfully")
-	}
 	// The pod controller manages all informers to react to events
 	podControllerCfg := node.PodControllerConfig{
 		PodClient:                         k8sClient.CoreV1(),
@@ -256,12 +224,13 @@ func main() {
 		Provider:                          provider,
 		EventRecorder:                     eventRecorder,
 		SyncPodsFromKubernetesRateLimiter: nil,
-	})
-	if err != nil {
-		logger.Error("Failed to create pod controller", "error", err)
-		os.Exit(1)
 	}
 	podController, err := node.NewPodController(podControllerCfg)
+
+	// Start the informer factory
+	go informerFactory.Start(ctx.Done())
+
+	//syncInformers(ctx, logger, informerFactory)
 
 	// Create node controller
 	_, err = k8sClient.Discovery().ServerResourcesForGroupVersion("coordination.k8s.io/v1")
@@ -350,6 +319,15 @@ func main() {
 		logger.Info("Pod controller started successfully") // This might not execute if Run doesn't return
 	}()
 
+	// Wait for the pod controller to be ready or exit
+	select {
+	case <-podController.Ready():
+		logger.Info("Pod controller is ready")
+	case <-podController.Done():
+		logger.Error("Pod controller exited before becoming ready", "error", podController.Err())
+		os.Exit(1)
+	}
+
 	go func() {
 		logger.Info("Starting API server for K8S to use", "port", listenPort)
 		if err := apiServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -375,6 +353,36 @@ func main() {
 	// Wait for context cancellation
 	<-ctx.Done()
 	logger.Info("Shutting down virtual-kubelet")
+}
+
+func syncInformers(ctx context.Context, logger *slog.Logger, informerFactory informers.SharedInformerFactory) {
+	syncCtx, syncCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer syncCancel()
+
+	logger.Info("Waiting for informer caches to sync")
+	syncResult := informerFactory.WaitForCacheSync(syncCtx.Done())
+
+	//Check results for each informer
+	for informerType, synced := range syncResult {
+		if !synced {
+			logger.Error("Cache failed to sync", "informerType", fmt.Sprintf("%v", informerType))
+		} else {
+			logger.Info("Cache synced successfully", "informerType", fmt.Sprintf("%v", informerType))
+		}
+	}
+
+	//a simple check to see if all caches synced
+	allSynced := true
+	for _, synced := range syncResult {
+		if !synced {
+			allSynced = false
+			break
+		}
+	}
+	if !allSynced {
+		logger.Error("Not all caches synced")
+		os.Exit(1)
+	}
 }
 
 // createK8sClient creates a Kubernetes client
