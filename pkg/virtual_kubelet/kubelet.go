@@ -1216,7 +1216,7 @@ func (p *Provider) LoadRunning() {
 		} else {
 			// Pod doesn't have RunPod ID - add to tracking as pending
 			// The periodic pod processor will handle deployment
-			p.logger.Info("Found pod with no RunPod ID - marking as pending",
+			p.logger.Info("Found pod with no RunPod ID - marking internally as pending",
 				"pod", pod.Name,
 				"namespace", pod.Namespace)
 
