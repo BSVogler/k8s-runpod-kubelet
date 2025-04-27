@@ -45,7 +45,7 @@ metadata:
   name: runpod-kubelet
   namespace: kube-system
 spec:
-  replicas: 0
+  replicas: 1
   selector:
     matchLabels:
       app: runpod-kubelet
