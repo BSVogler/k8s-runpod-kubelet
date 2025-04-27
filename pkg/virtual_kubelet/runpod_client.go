@@ -797,12 +797,38 @@ func (c *Client) ExtractEnvVars(pod *v1.Pod) ([]RunPodEnv, error) {
 	})
 	var secretRefEnvs = make(map[string]bool)
 
+	// Define a function to check if a key is a Kubernetes auto-injected variable
+	isK8sAutoInjectedVar := func(key string) bool {
+		// Common prefixes for auto-injected variables
+		prefixes := []string{
+			"KUBERNETES_",
+			"_PORT_",
+			"_TCP_",
+			"_SERVICE_PORT_",
+			"_SERVICE_HOST",
+		}
+
+		// Check if the key matches any of the patterns
+		for _, prefix := range prefixes {
+			if strings.Contains(key, prefix) {
+				return true
+			}
+		}
+
+		return false
+	}
+
 	// First pass: collect all secrets we need to fetch
 	if len(pod.Spec.Containers) > 0 {
 		container := pod.Spec.Containers[0]
 
 		// Add regular environment variables
 		for _, env := range container.Env {
+			// Skip Kubernetes auto-injected variables
+			if isK8sAutoInjectedVar(env.Name) {
+				continue
+			}
+
 			// If this is a regular env var, add it directly
 			if env.Value != "" {
 				envVars = append(envVars, RunPodEnv{
@@ -895,6 +921,11 @@ func (c *Client) ExtractEnvVars(pod *v1.Pod) ([]RunPodEnv, error) {
 		if mappings, ok := secretEnvVars[secretName]; ok {
 			for _, mapping := range mappings {
 				if secretValue, ok := secret.Data[mapping.SecretKey]; ok {
+					// Skip if the mapped key is a Kubernetes auto-injected variable
+					if isK8sAutoInjectedVar(mapping.EnvKey) {
+						continue
+					}
+
 					// Add it as an environment variable with the correct name
 					envVars = append(envVars, RunPodEnv{
 						Key:   mapping.EnvKey,
@@ -912,6 +943,11 @@ func (c *Client) ExtractEnvVars(pod *v1.Pod) ([]RunPodEnv, error) {
 		// Handle envFrom that should import all keys from the secret
 		if secretRefEnvs[secretName] {
 			for key, value := range secret.Data {
+				// Skip Kubernetes auto-injected variables
+				if isK8sAutoInjectedVar(key) {
+					continue
+				}
+
 				envVars = append(envVars, RunPodEnv{
 					Key:   key,
 					Value: strings.ReplaceAll(string(value), "\n", "\\n"),
