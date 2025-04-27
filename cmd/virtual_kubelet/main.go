@@ -10,6 +10,7 @@ import (
 	sentryslog "github.com/getsentry/sentry-go/slog"
 	"io"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/informers"
 	"log"
 	"log/slog"
@@ -203,17 +204,28 @@ func main() {
 	})
 	eventRecorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: nodeName})
 
-	// Create informer factory for the default namespace or specified namespace
-	informerFactory := informers.NewSharedInformerFactory(
+	// Create a separate informer factory just for pods with field selector
+	podInformerFactory := informers.NewSharedInformerFactoryWithOptions(
+		k8sClient,
+		time.Duration(reconcileInterval)*time.Second,
+		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+			options.FieldSelector = fields.OneTermEqualSelector("spec.nodeName", nodeName).String()
+		}),
+	)
+
+	// Use the pod-specific factory for pod informer
+	podInformer := podInformerFactory.Core().V1().Pods()
+
+	// Create a standard informer factory for other resources
+	standardInformerFactory := informers.NewSharedInformerFactory(
 		k8sClient,
 		time.Duration(reconcileInterval)*time.Second,
 	)
 
-	// Create the essential informers
-	podInformer := informerFactory.Core().V1().Pods()
-	configMapInformer := informerFactory.Core().V1().ConfigMaps()
-	secretInformer := informerFactory.Core().V1().Secrets()
-	serviceInformer := informerFactory.Core().V1().Services()
+	// Get other informers from the standard factory
+	configMapInformer := standardInformerFactory.Core().V1().ConfigMaps()
+	secretInformer := standardInformerFactory.Core().V1().Secrets()
+	serviceInformer := standardInformerFactory.Core().V1().Services()
 
 	// The pod controller manages all informers to react to events
 	podControllerCfg := node.PodControllerConfig{
@@ -228,8 +240,9 @@ func main() {
 	}
 	podController, err := node.NewPodController(podControllerCfg)
 
-	// Start the informer factory
-	go informerFactory.Start(ctx.Done())
+	// Start both informer factories
+	go podInformerFactory.Start(ctx.Done())
+	go standardInformerFactory.Start(ctx.Done())
 
 	//syncInformers(ctx, logger, informerFactory)
 
