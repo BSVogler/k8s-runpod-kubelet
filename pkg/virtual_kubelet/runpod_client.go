@@ -787,7 +787,7 @@ func FormatEnvVarsForREST(envVars []RunPodEnv) map[string]string {
 	return formatted
 }
 
-// ExtractEnvVars extracts environment variables from a pod
+// ExtractEnvVars extracts environment variables from a pod, filters auto-injected variables as they are only relevant for pods running inside the cluster and not for RunPod, reduce attack surface
 func (c *Client) ExtractEnvVars(pod *v1.Pod) ([]RunPodEnv, error) {
 	var envVars []RunPodEnv
 	var secretsToFetch = make(map[string]bool)
@@ -799,13 +799,13 @@ func (c *Client) ExtractEnvVars(pod *v1.Pod) ([]RunPodEnv, error) {
 
 	// Define a function to check if a key is a Kubernetes auto-injected variable
 	isK8sAutoInjectedVar := func(key string) bool {
-		// Common prefixes for auto-injected variables
+		// Common prefixes for auto-injected variables.
 		prefixes := []string{
 			"KUBERNETES_",
-			"_PORT_",
-			"_TCP_",
-			"_SERVICE_PORT_",
-			"_SERVICE_HOST",
+			"_PORT_",         //this might lead to false positive for unaware users
+			"_TCP_",          //this might lead to false positive for unaware users
+			"_SERVICE_PORT_", //k8s adds services as env vars (https://kubernetes.io/docs/concepts/containers/container-environment/#cluster-information)
+			"_SERVICE_HOST",  //auto added services
 		}
 
 		// Check if the key matches any of the patterns
