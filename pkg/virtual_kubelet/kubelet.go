@@ -518,50 +518,10 @@ func (p *Provider) updateAllPodStatuses() {
 			continue
 		}
 
-		// If status is NOT_FOUND, remove annotations immediately
+		// If status is NOT_FOUND, use shared handler
 		if status == PodNotFound {
-			p.logger.Info("RunPod instance not found, removing RunPod annotations",
-				"pod", pod.Name, "namespace", pod.Namespace, "runpodID", podID)
-
-			// Get current version of the pod
-			currentPod, err := p.clientset.CoreV1().Pods(pod.Namespace).Get(
-				context.Background(),
-				pod.Name,
-				metav1.GetOptions{},
-			)
-			if err == nil {
-				// Make a deep copy to avoid modifying the cache
-				podCopy := currentPod.DeepCopy()
-
-				// Remove the RunPod annotations
-				if podCopy.Annotations != nil {
-					delete(podCopy.Annotations, PodIDAnnotation)
-					delete(podCopy.Annotations, CostAnnotation)
-
-					// Update the pod
-					_, updateErr := p.clientset.CoreV1().Pods(podCopy.Namespace).Update(
-						context.Background(),
-						podCopy,
-						metav1.UpdateOptions{},
-					)
-					if updateErr != nil {
-						p.logger.Error("Failed to remove RunPod annotations from pod",
-							"pod", pod.Name, "namespace", pod.Namespace, "error", updateErr)
-					} else {
-						p.logger.Info("Removed RunPod annotations from pod",
-							"pod", pod.Name, "namespace", pod.Namespace)
-
-						// Update our local cache as well
-						p.podsMutex.Lock()
-						p.pods[podKey] = podCopy
-						if pInfo, exists := p.podStatus[podKey]; exists {
-							pInfo.ID = "" // Clear the RunPod ID
-							p.podStatus[podKey] = pInfo
-						}
-						p.podsMutex.Unlock()
-					}
-				}
-			}
+			p.handleMissingRunPodInstance(pod, podKey, podID)
+			continue // Skip the rest of the status update logic
 		}
 
 		// Update pod info if status changed
@@ -1164,54 +1124,8 @@ func (p *Provider) LoadRunning() {
 					CreationTime: pod.CreationTimestamp.Time,
 				}
 			} else {
-				// Pod has ID but instance not found in RunPod - remove annotation and mark for retry
-				p.logger.Warn("Pod has RunPod ID but instance not found in RunPod API. Removing annotation and marking for retry.",
-					"pod", pod.Name,
-					"namespace", pod.Namespace,
-					"runpodID", podID)
-
-				// Get current version of the pod and update it
-				currentPod, err := p.clientset.CoreV1().Pods(pod.Namespace).Get(
-					context.Background(),
-					pod.Name,
-					metav1.GetOptions{},
-				)
-				if err == nil {
-					// Make a deep copy to avoid modifying the cache
-					podCopy := currentPod.DeepCopy()
-
-					// Remove the RunPod annotations
-					if podCopy.Annotations != nil {
-						delete(podCopy.Annotations, PodIDAnnotation)
-						delete(podCopy.Annotations, CostAnnotation)
-
-						// Update the pod
-						_, updateErr := p.clientset.CoreV1().Pods(podCopy.Namespace).Update(
-							context.Background(),
-							podCopy,
-							metav1.UpdateOptions{},
-						)
-						if updateErr != nil {
-							p.logger.Error("Failed to remove RunPod annotations from pod",
-								"pod", pod.Name,
-								"namespace", pod.Namespace,
-								"error", updateErr)
-						} else {
-							p.logger.Info("Successfully removed RunPod annotations from pod",
-								"pod", pod.Name,
-								"namespace", pod.Namespace)
-						}
-					}
-				}
-
-				// Update local tracking with removed annotation
-				p.podStatus[podKey] = &InstanceInfo{
-					ID:           "", // Clear the ID
-					PodName:      pod.Name,
-					Namespace:    pod.Namespace,
-					Status:       string(PodStarting), // Mark as starting so it will be redeployed
-					CreationTime: pod.CreationTimestamp.Time,
-				}
+				// Pod has ID but instance not found in RunPod - use shared handler
+				p.handleMissingRunPodInstance(&pod, podKey, podID)
 			}
 		} else {
 			// Pod doesn't have RunPod ID - add to tracking as pending
@@ -1415,6 +1329,76 @@ func (p *Provider) mapExistingRunPodInstances() map[string]InstanceInfo {
 	}
 
 	return existingRunPodMap
+}
+
+// handleMissingRunPodInstance handles the case where a pod has a RunPod ID annotation
+// but the instance is not found in the RunPod API. This is used both during startup
+// and periodic reconciliation to ensure consistent behavior.
+func (p *Provider) handleMissingRunPodInstance(pod *v1.Pod, podKey string, runpodID string) {
+	p.logger.Warn("Pod has RunPod ID but instance not found in RunPod API",
+		"pod", pod.Name,
+		"namespace", pod.Namespace,
+		"runpodID", runpodID)
+
+	// Get current version of the pod and update it
+	currentPod, err := p.clientset.CoreV1().Pods(pod.Namespace).Get(
+		context.Background(),
+		pod.Name,
+		metav1.GetOptions{},
+	)
+	if err == nil {
+		// Make a deep copy to avoid modifying the cache
+		podCopy := currentPod.DeepCopy()
+
+		// Remove the RunPod annotations
+		if podCopy.Annotations != nil {
+			delete(podCopy.Annotations, PodIDAnnotation)
+			delete(podCopy.Annotations, CostAnnotation)
+
+			// Update the pod
+			_, updateErr := p.clientset.CoreV1().Pods(podCopy.Namespace).Update(
+				context.Background(),
+				podCopy,
+				metav1.UpdateOptions{},
+			)
+			if updateErr != nil {
+				p.logger.Error("Failed to remove RunPod annotations from pod",
+					"pod", pod.Name,
+					"namespace", pod.Namespace,
+					"error", updateErr)
+			} else {
+				p.logger.Info("Removed RunPod annotations from pod",
+					"pod", pod.Name,
+					"namespace", pod.Namespace)
+
+				// Update our local cache as well
+				p.podsMutex.Lock()
+				p.pods[podKey] = podCopy
+				if pInfo, exists := p.podStatus[podKey]; exists {
+					pInfo.ID = "" // Clear the RunPod ID
+					pInfo.Status = string(PodExited)
+					pInfo.StatusMessage = "RunPod instance not found"
+					p.podStatus[podKey] = pInfo
+				}
+				p.podsMutex.Unlock()
+			}
+		}
+	} else {
+		p.logger.Error("Failed to get current pod state",
+			"pod", pod.Name,
+			"namespace", pod.Namespace,
+			"error", err)
+	}
+
+	// Update pod status to Failed to prevent redeployment
+	failedStatus := p.translateRunPodStatus(string(PodNotFound), "RunPod instance was deleted")
+	err = p.updatePodStatusInK8s(currentPod, failedStatus)
+	if err != nil {
+		p.logger.Error("Failed to update pod status to Failed",
+			"pod", pod.Name,
+			"namespace", pod.Namespace,
+			"error", err)
+	}
 }
 
 // ForceDeletePod forcefully removes a pod from the Kubernetes API
