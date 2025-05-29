@@ -28,4 +28,5 @@ jobs:
       - name: Push to GHCR
         run: |
           CHART_VERSION=$(grep '^version:' ./helm/runpod-kubelet/Chart.yaml | awk '{print $2}')
-          helm push runpod-kubelet-${CHART_VERSION}.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
+          REPO_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          helm push runpod-kubelet-${CHART_VERSION}.tgz oci://ghcr.io/${REPO_OWNER}/charts
