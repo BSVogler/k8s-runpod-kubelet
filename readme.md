@@ -2,7 +2,7 @@
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/bsvogler/k8s-runpod-kubelet)](https://goreportcard.com/report/github.com/bsvogler/k8s-runpod-kubelet)
 [![License](https://img.shields.io/github/license/bsvogler/k8s-runpod-kubelet)](LICENSE)
-[![Helm Chart](https://img.shields.io/badge/helm-ghcr.io-blue)](https://github.com/bsvogler/charts/pkgs/container/charts%2Frunpod-kubelet)
+[![Helm Chart](https://img.shields.io/badge/helm-ghcr.io-blue)](https://github.com/users/bsvogler/packages/container/package/charts%2Frunpod-kubelet)
 [![Container Image](https://img.shields.io/badge/container-ghcr.io-blue)](https://github.com/bsvogler/k8s-runpod-kubelet/pkgs/container/gpu-runpod-kubelet)
 [![Release](https://img.shields.io/github/v/release/bsvogler/k8s-runpod-kubelet)](https://github.com/bsvogler/k8s-runpod-kubelet/releases)
 
