@@ -1,4 +1,4 @@
-name: Publish Helm Chart
+the urlname: Publish Helm Chart
 
 on:
   push:
@@ -8,6 +8,10 @@ on:
       - 'helm/**'
   release:
     types: [created]
+
+permissions:
+  contents: read
+  packages: write
 
 jobs:
   publish:
