@@ -69,7 +69,7 @@ spec:
         - name: regcred
       containers:
         - name: kubelet
-          image: ghcr.io/bsvogler/gpu-runpod-kubelet:latest
+          image: ghcr.io/bsvogler/runpod-kubelet:latest
           args:
             - "--reconcile-interval=30"
             - "--max-gpu-price=0.5"

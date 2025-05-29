@@ -28,10 +28,10 @@ jobs:
         TAG=$(date +%s)
         echo "TAG=$TAG" >> $GITHUB_ENV
         REPO_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-        docker build . --file Dockerfile --tag bsvogler/gpu-runpod-kubelet:$TAG --tag ghcr.io/$REPO_OWNER/gpu-runpod-kubelet:$TAG --tag ghcr.io/$REPO_OWNER/gpu-runpod-kubelet:latest
+        docker build . --file Dockerfile --tag bsvogler/runpod-kubelet:$TAG --tag ghcr.io/$REPO_OWNER/runpod-kubelet:$TAG --tag ghcr.io/$REPO_OWNER/runpod-kubelet:latest
         
     - name: Push to GitHub Container Registry
       run: |
         REPO_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-        docker push ghcr.io/$REPO_OWNER/gpu-runpod-kubelet:${{ env.TAG }}
-        docker push ghcr.io/$REPO_OWNER/gpu-runpod-kubelet:latest
+        docker push ghcr.io/$REPO_OWNER/runpod-kubelet:${{ env.TAG }}
+        docker push ghcr.io/$REPO_OWNER/runpod-kubelet:latest

@@ -13,9 +13,9 @@ echo "Packaging Helm chart version $CHART_VERSION..."
 helm package ./helm/runpod-kubelet
 
 # Push to GHCR
-echo "Pushing chart to ghcr.io/${GITHUB_OWNER}/charts/runpod-kubelet..."
-helm push runpod-kubelet-${CHART_VERSION}.tgz oci://ghcr.io/${GITHUB_OWNER}/charts
+echo "Pushing chart to ghcr.io/${GITHUB_OWNER}/helm/runpod-kubelet..."
+helm push runpod-kubelet-${CHART_VERSION}.tgz oci://ghcr.io/${GITHUB_OWNER}/helm
 
 echo "Chart published successfully!"
 echo "Users can install it with:"
-echo "helm install runpod-kubelet oci://ghcr.io/${GITHUB_OWNER}/charts/runpod-kubelet --version ${CHART_VERSION}"
+echo "helm install runpod-kubelet oci://ghcr.io/${GITHUB_OWNER}/helm/runpod-kubelet --version ${CHART_VERSION}"

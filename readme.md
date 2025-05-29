@@ -3,7 +3,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/bsvogler/k8s-runpod-kubelet)](https://goreportcard.com/report/github.com/bsvogler/k8s-runpod-kubelet)
 [![License](https://img.shields.io/github/license/bsvogler/k8s-runpod-kubelet)](LICENSE)
 [![Helm Chart](https://img.shields.io/badge/helm-ghcr.io-blue)](https://github.com/users/bsvogler/packages/container/package/charts%2Frunpod-kubelet)
-[![Container Image](https://img.shields.io/badge/container-ghcr.io-blue)](https://github.com/bsvogler/k8s-runpod-kubelet/pkgs/container/gpu-runpod-kubelet)
+[![Container Image](https://img.shields.io/badge/container-ghcr.io-blue)](https://github.com/bsvogler/k8s-runpod-kubelet/pkgs/container/runpod-kubelet)
 [![Release](https://img.shields.io/github/v/release/bsvogler/k8s-runpod-kubelet)](https://github.com/bsvogler/k8s-runpod-kubelet/releases)
 
 This Virtual Kubelet implementation provides seamless integration between Kubernetes and RunPod, enabling dynamic,
@@ -73,7 +73,7 @@ The Virtual Kubelet acts as a bridge between Kubernetes and RunPod, providing a 
 
 ```bash
 # Install from GitHub Container Registry
-helm install runpod-kubelet oci://ghcr.io/bsvogler/charts/runpod-kubelet \
+helm install runpod-kubelet oci://ghcr.io/bsvogler/helm/runpod-kubelet \
   --namespace kube-system \
   --create-namespace \
   --set runpod.apiKey=<your-runpod-api-key>

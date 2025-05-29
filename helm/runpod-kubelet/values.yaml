@@ -1,7 +1,7 @@
 replicaCount: 1
 
 image:
-  repository: ghcr.io/bsvogler/gpu-runpod-kubelet
+  repository: ghcr.io/bsvogler/runpod-kubelet
   pullPolicy: IfNotPresent
   tag: "latest"
 

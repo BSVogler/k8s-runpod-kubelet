@@ -42,7 +42,7 @@ jobs:
           CHART_NAME="runpod-kubelet"
           
           echo "Chart version: ${CHART_VERSION}"
-          echo "Repository: ghcr.io/${REPO_OWNER}/${CHART_NAME}"
+          echo "Repository: oci://ghcr.io/${REPO_OWNER}/helm/runpod-kubelet"
           
-          # Push the chart
-          helm push ${CHART_NAME}-${CHART_VERSION}.tgz oci://ghcr.io/${REPO_OWNER}
+          # Create a charts subdirectory to organize helm charts
+          helm push ${CHART_NAME}-${CHART_VERSION}.tgz oci://ghcr.io/${REPO_OWNER}/helm

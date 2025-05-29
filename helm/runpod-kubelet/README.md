@@ -47,7 +47,7 @@ The following table lists the configurable parameters and their default values:
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `replicaCount` | Number of replicas | `1` |
-| `image.repository` | Image repository | `ghcr.io/bsvogler/gpu-runpod-kubelet` |
+| `image.repository` | Image repository | `ghcr.io/bsvogler/runpod-kubelet` |
 | `image.tag` | Image tag | `latest` |
 | `image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `imagePullSecrets` | Image pull secrets | `[{name: regcred}]` |
