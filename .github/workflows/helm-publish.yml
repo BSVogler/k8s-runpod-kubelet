@@ -18,25 +18,31 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    container:
-      image: alpine/helm:latest
     steps:
       - uses: actions/checkout@v3
+      
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: 'latest'
         
       - name: Package Helm chart
         run: |
           helm package ./helm/runpod-kubelet
+          ls -la *.tgz
           
       - name: Login to GitHub Container Registry
         run: |
-          echo ${{ secrets.GITHUB_TOKEN }} | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
           
-      - name: Push to GHCR
+      - name: Push Helm chart using OCI
         run: |
           CHART_VERSION=$(grep '^version:' ./helm/runpod-kubelet/Chart.yaml | awk '{print $2}')
           REPO_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          echo "Pushing chart version ${CHART_VERSION} to ghcr.io/${REPO_OWNER}/charts"
+          CHART_NAME="runpod-kubelet"
           
-          # Try pushing with explicit experimental OCI support
-          export HELM_EXPERIMENTAL_OCI=1
-          helm push runpod-kubelet-${CHART_VERSION}.tgz oci://ghcr.io/${REPO_OWNER}/charts
+          echo "Chart version: ${CHART_VERSION}"
+          echo "Repository: ghcr.io/${REPO_OWNER}/${CHART_NAME}"
+          
+          # Push the chart
+          helm push ${CHART_NAME}-${CHART_VERSION}.tgz oci://ghcr.io/${REPO_OWNER}
