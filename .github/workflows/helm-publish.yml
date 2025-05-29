@@ -1,4 +1,4 @@
-the urlname: Publish Helm Chart
+name: Publish Helm Chart
 
 on:
   push:
@@ -33,4 +33,8 @@ jobs:
         run: |
           CHART_VERSION=$(grep '^version:' ./helm/runpod-kubelet/Chart.yaml | awk '{print $2}')
           REPO_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "Pushing chart version ${CHART_VERSION} to ghcr.io/${REPO_OWNER}/charts"
+          
+          # Try pushing with explicit experimental OCI support
+          export HELM_EXPERIMENTAL_OCI=1
           helm push runpod-kubelet-${CHART_VERSION}.tgz oci://ghcr.io/${REPO_OWNER}/charts
