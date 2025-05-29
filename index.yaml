@@ -1,0 +1,24 @@
+apiVersion: v1
+entries:
+  runpod-kubelet:
+  - apiVersion: v2
+    appVersion: latest
+    created: "2025-05-29T20:04:52.48593+02:00"
+    description: A Helm chart for deploying RunPod Virtual Kubelet
+    digest: 50ee3fa217c66e25fe2ff98aa6ced402d1a33039129f321607db1b4c599df3b7
+    home: https://github.com/bsvogler/k8s-runpod-kubelet
+    keywords:
+    - runpod
+    - virtual-kubelet
+    - gpu
+    - kubernetes
+    maintainers:
+    - name: bsvogler
+    name: runpod-kubelet
+    sources:
+    - https://github.com/bsvogler/k8s-runpod-kubelet
+    type: application
+    urls:
+    - https://bsvogler.github.io/k8s-runpod-kubelet/runpod-kubelet-0.1.0.tgz
+    version: 0.1.0
+generated: "2025-05-29T20:04:52.484784+02:00"
