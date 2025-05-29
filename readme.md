@@ -2,7 +2,8 @@
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/bsvogler/k8s-runpod-kubelet)](https://goreportcard.com/report/github.com/bsvogler/k8s-runpod-kubelet)
 [![License](https://img.shields.io/github/license/bsvogler/k8s-runpod-kubelet)](LICENSE)
-[![Container Registry](https://img.shields.io/badge/container-ghcr.io-blue)](https://github.com/bsvogler/k8s-runpod-kubelet/pkgs/container/k8s-runpod-kubelet)
+[![Helm Chart](https://img.shields.io/badge/helm-ghcr.io-blue)](https://github.com/bsvogler/charts/pkgs/container/charts%2Frunpod-kubelet)
+[![Container Image](https://img.shields.io/badge/container-ghcr.io-blue)](https://github.com/bsvogler/k8s-runpod-kubelet/pkgs/container/gpu-runpod-kubelet)
 [![Release](https://img.shields.io/github/v/release/bsvogler/k8s-runpod-kubelet)](https://github.com/bsvogler/k8s-runpod-kubelet/releases)
 
 This Virtual Kubelet implementation provides seamless integration between Kubernetes and RunPod, enabling dynamic,
@@ -68,25 +69,74 @@ The Virtual Kubelet acts as a bridge between Kubernetes and RunPod, providing a 
 
 ## 🚀 Installation
 
+### Using Helm (Recommended)
+
+```bash
+# Install from GitHub Container Registry
+helm install runpod-kubelet oci://ghcr.io/bsvogler/charts/runpod-kubelet \
+  --namespace kube-system \
+  --create-namespace \
+  --set runpod.apiKey=<your-runpod-api-key>
+```
+
+#### Using an existing secret
+
+```bash
+# Create secret with RunPod API key
+kubectl create secret generic runpod-api-secret \
+  --namespace kube-system \
+  --from-literal=RUNPOD_API_KEY=<your-runpod-api-key>
+
+# Install with existing secret
+helm install runpod-kubelet oci://ghcr.io/bsvogler/charts/runpod-kubelet \
+  --namespace kube-system \
+  --set runpod.existingSecret=runpod-api-secret
+```
+
 ### Using kubectl
 
 ```bash
 # Create secret with RunPod API key
 kubectl create secret generic runpod-kubelet-secrets \
   --namespace kube-system \
-  --from-literal=RUNPOD_KEY=<your-runpod-api-key>
+  --from-literal=RUNPOD_API_KEY=<your-runpod-api-key>
 
 # Apply controller deployment
 kubectl apply -f https://raw.githubusercontent.com/bsvogler/k8s-runpod-kubelet/main/deploy/kubelet.yaml
 ```
 
-Env variables for configuration:
-- `RUNPOD_KEY`: RunPod API authentication key
-- `SENTRY_URL` for Sentry error tracking.
-
 ### Configuration
 
-Configure using environment variables or command-line flags:
+#### Helm Configuration
+
+Customize your deployment by creating a `values.yaml` file:
+
+```yaml
+kubelet:
+  reconcileInterval: 30
+  maxGpuPrice: 0.5
+  namespace: kube-system
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+```
+
+Then install with:
+
+```bash
+helm install runpod-kubelet oci://ghcr.io/bsvogler/charts/runpod-kubelet \
+  --namespace kube-system \
+  --values values.yaml
+```
+
+#### Command-line Configuration
+
+When running the binary directly, configure using flags:
 
 ```bash
 ./k8s-runpod-kubelet \
@@ -159,13 +209,20 @@ Experimental. Implemented here but not working with the RunPod API.
 Monitor the controller using Kubernetes tools:
 
 ```bash
-# Check logs
-kubectl logs -n kube-system deployment/runpod-virtual-kubelet
+# Check logs (Helm installation)
+kubectl logs -n kube-system -l app.kubernetes.io/name=runpod-kubelet
+
+# Check logs (kubectl installation)
+kubectl logs -n kube-system deployment/runpod-kubelet
 
 # Health checks
-kubectl port-forward -n kube-system deployment/runpod-virtual-kubelet 8080:8080
+kubectl port-forward -n kube-system deployment/runpod-kubelet 8080:8080
 curl http://localhost:8080/healthz  # Liveness probe
 curl http://localhost:8080/readyz   # Readiness probe
+
+# Check virtual node status
+kubectl get nodes
+kubectl describe node runpod-node
 ```
 
 ## 🛠️ Development
@@ -189,7 +246,7 @@ go build -o k8s-runpod-kubelet ./cmd/main.go
 The project includes integration tests that deploy actual resources to RunPod. To run the integration tests:
 
 ```bash
-export RUNPOD_KEY=<your-runpod-api-key>
+export RUNPOD_API_KEY=<your-runpod-api-key>
 export KUBECONFIG=<path-to-kubeconfig>
 go test -tags=integration ./...
 ```
