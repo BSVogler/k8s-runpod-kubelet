@@ -6,8 +6,10 @@ on:
       - master
     paths:
       - 'helm/**'
+      - '.github/workflows/helm-publish.yml'
   release:
     types: [created]
+  workflow_dispatch:
 
 permissions:
   contents: read
