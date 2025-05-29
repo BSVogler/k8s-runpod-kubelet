@@ -1,0 +1,31 @@
+name: Publish Helm Chart
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'helm/**'
+  release:
+    types: [created]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    container:
+      image: alpine/helm:latest
+    steps:
+      - uses: actions/checkout@v3
+        
+      - name: Package Helm chart
+        run: |
+          helm package ./helm/runpod-kubelet
+          
+      - name: Login to GitHub Container Registry
+        run: |
+          echo ${{ secrets.GITHUB_TOKEN }} | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+          
+      - name: Push to GHCR
+        run: |
+          CHART_VERSION=$(grep '^version:' ./helm/runpod-kubelet/Chart.yaml | awk '{print $2}')
+          helm push runpod-kubelet-${CHART_VERSION}.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
