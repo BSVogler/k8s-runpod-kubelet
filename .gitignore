@@ -30,3 +30,4 @@ go.work
 !go.mod
 !go.sum
 .run/go build github.com_bsvogler_k8s-runpod-kubelet_cmd_virtual_kubelet.run.xml
+*.tgz

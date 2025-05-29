@@ -1,0 +1,66 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/bsvogler/gpu-runpod-kubelet
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+imagePullSecrets:
+  - name: regcred
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext: {}
+
+securityContext: {}
+
+resources:
+  limits:
+    cpu: 200m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+kubelet:
+  reconcileInterval: 30
+  maxGpuPrice: 0.5
+  healthServerAddress: ":8080"
+  namespace: kube-system
+  
+runpod:
+  apiKey: ""
+  existingSecret: "runpod-kubelet-secrets"
+  
+health:
+  port: 8080
+  livenessProbe:
+    enabled: true
+    httpGet:
+      path: /healthz
+      port: 8080
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 5
+  readinessProbe:
+    enabled: true
+    httpGet:
+      path: /readyz
+      port: 8080
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3

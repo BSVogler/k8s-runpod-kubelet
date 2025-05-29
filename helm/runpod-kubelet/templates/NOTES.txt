@@ -1,0 +1,32 @@
+1. Get the application status by running these commands:
+   kubectl --namespace {{ .Values.kubelet.namespace }} get pods -l "app.kubernetes.io/name={{ include "runpod-kubelet.name" . }},app.kubernetes.io/instance={{ .Release.Name }}"
+
+2. Check the virtual node status:
+   kubectl get nodes
+
+3. Monitor the kubelet logs:
+   kubectl --namespace {{ .Values.kubelet.namespace }} logs -l "app.kubernetes.io/name={{ include "runpod-kubelet.name" . }},app.kubernetes.io/instance={{ .Release.Name }}" -f
+
+{{- if not .Values.runpod.existingSecret }}
+{{- if not .Values.runpod.apiKey }}
+
+WARNING: You have not set a RunPod API key!
+
+Please set the RunPod API key by either:
+1. Setting .Values.runpod.apiKey in your values file
+2. Creating a secret manually and setting .Values.runpod.existingSecret
+3. Upgrading the release with --set runpod.apiKey=YOUR_API_KEY
+
+The kubelet will not function properly without a valid RunPod API key.
+{{- end }}
+{{- end }}
+
+To schedule pods on the virtual RunPod node, use:
+  nodeSelector:
+    kubernetes.io/hostname: runpod-node
+
+Or use tolerations for GPU workloads:
+  tolerations:
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule
