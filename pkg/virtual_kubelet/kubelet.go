@@ -75,7 +75,7 @@ func (p *Provider) checkRunPodAPIHealth() {
 	// Skip check if no API key
 	if p.runpodClient.apiKey == "" {
 		p.runpodAvailable = false
-		p.logger.Warn("runpod key (via RUNPOD_KEY environment variable) not set, skipping API health check")
+		p.logger.Warn("runpod key (via RUNPOD_API_KEY environment variable) not set, skipping API health check")
 		return
 	}
 

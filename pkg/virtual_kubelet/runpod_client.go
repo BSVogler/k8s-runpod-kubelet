@@ -131,9 +131,9 @@ type MachineInfo struct {
 
 // NewRunPodClient creates a new RunPod API client
 func NewRunPodClient(logger *slog.Logger, clientset *kubernetes.Clientset) *Client {
-	apiKey := os.Getenv("RUNPOD_KEY")
+	apiKey := os.Getenv("RUNPOD_API_KEY")
 	if apiKey == "" {
-		logger.Error("RUNPOD_KEY environment variable is not set")
+		logger.Error("RUNPOD_API_KEY environment variable is not set")
 	}
 
 	return &Client{
@@ -172,7 +172,11 @@ func (c *Client) ExecuteGraphQL(query string, variables map[string]interface{}, 
 	if err != nil {
 		return fmt.Errorf("API request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			c.logger.Warn("Error closing response body", "error", err)
+		}
+	}()
 
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
@@ -250,119 +254,151 @@ func (c *Client) GetPodStatusGraphql(podID string) (PodStatus, error) {
 	return PodStatus(response.Data.Pod.DesiredStatus), nil
 }
 
-func (c *Client) GetPodStatusREST(podID string) (PodStatus, error) {
-	endpoint := fmt.Sprintf("pods/%s", podID)
+type retryState struct {
+	lastError        error
+	lastStatusCode   int
+	lastResponseBody string
+}
 
+// performRetryableRequest performs a request with retries
+func (c *Client) performRetryableRequest(endpoint string, podID string) (*http.Response, *retryState, error) {
 	// Add retries for temporary errors
-	var resp *http.Response
-	retryCount := 0
 	maxRetries := 3
-	var lastError error
-	var lastStatusCode int
-	var lastResponseBody string
+	state := &retryState{}
 
-	for retryCount < maxRetries {
-		var err error
-		resp, err = c.makeRESTRequest("GET", endpoint, nil)
+	for retryCount := 0; retryCount < maxRetries; retryCount++ {
+		resp, err := c.makeRESTRequest("GET", endpoint, nil)
 
 		// Both 200 OK and 404 Not Found are considered valid responses for our purpose
 		if err == nil && resp != nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound) {
-			break
+			return resp, state, nil
 		}
 
 		// Store the error details for better reporting
-		lastError = err
+		state.lastError = err
 		if resp != nil {
-			lastStatusCode = resp.StatusCode
+			state.lastStatusCode = resp.StatusCode
 			// Try to read the response body for error details
-			if resp.Body != nil {
-				bodyBytes, readErr := io.ReadAll(resp.Body)
-				if readErr == nil {
-					lastResponseBody = string(bodyBytes)
-				}
-				c.logger.Error("Failed getting pod status", "error", lastResponseBody)
-				bodyErr := resp.Body.Close()
-				if bodyErr != nil {
-					c.logger.Warn("Error closing response body", "error", bodyErr)
-				}
-			}
+			c.captureResponseBody(resp, state)
 		}
 
-		retryCount++
-
-		c.logger.Info("Retrying pod status check after error",
-			"podID", podID,
-			"retry", retryCount,
-			"error", err,
-			"statusCode", lastStatusCode)
-
-		time.Sleep(time.Duration(retryCount) * 500 * time.Millisecond)
+		if retryCount < maxRetries-1 {
+			c.logger.Info("Retrying pod status check after error",
+				"podID", podID,
+				"retry", retryCount+1,
+				"error", err,
+				"statusCode", state.lastStatusCode)
+			time.Sleep(time.Duration(retryCount+1) * 500 * time.Millisecond)
+		}
 	}
 
-	if resp == nil {
-		errorMsg := fmt.Sprintf("API request failed after %d attempts", maxRetries)
-		if lastError != nil {
-			errorMsg = fmt.Sprintf("%s, last error: %v", errorMsg, lastError)
+	return nil, state, fmt.Errorf("failed after %d attempts", maxRetries)
+}
+
+// captureResponseBody reads and stores response body for error reporting
+func (c *Client) captureResponseBody(resp *http.Response, state *retryState) {
+	if resp.Body == nil {
+		return
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err == nil {
+		state.lastResponseBody = string(bodyBytes)
+		c.logger.Error("Failed getting pod status", "error", state.lastResponseBody)
+	}
+
+	if err := resp.Body.Close(); err != nil {
+		c.logger.Warn("Error closing response body", "error", err)
+	}
+}
+
+// buildErrorMessage builds a detailed error message from retry state
+func buildErrorMessage(baseMsg string, state *retryState) string {
+	if state.lastError != nil {
+		baseMsg = fmt.Sprintf("%s, last error: %v", baseMsg, state.lastError)
+	}
+	if state.lastStatusCode > 0 {
+		baseMsg = fmt.Sprintf("%s, last status code: %d", baseMsg, state.lastStatusCode)
+	}
+	if state.lastResponseBody != "" {
+		body := state.lastResponseBody
+		// Truncate very long response bodies
+		if len(body) > 200 {
+			body = body[:200] + "..."
 		}
-		if lastStatusCode > 0 {
-			errorMsg = fmt.Sprintf("%s, last status code: %d", errorMsg, lastStatusCode)
+		baseMsg = fmt.Sprintf("%s, last response: %s", baseMsg, body)
+	}
+	return baseMsg
+}
+
+// handle404Response processes 404 responses
+func (c *Client) handle404Response(resp *http.Response, podID string) (PodStatus, error) {
+	// Read the response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return PodNotFound, fmt.Errorf("error reading 404 response body: %w", err)
+	}
+
+	// Check if this is the specific "pod not found" message we expect
+	var errorResponse struct {
+		Error  string `json:"error"`
+		Status int    `json:"status"`
+	}
+
+	if err := json.Unmarshal(body, &errorResponse); err == nil {
+		if errorResponse.Error == "pod not found" && errorResponse.Status == 404 {
+			// This is the expected "pod not found" response, return PodNotFound status
+			return PodNotFound, nil
 		}
-		if lastResponseBody != "" {
-			// Truncate very long response bodies
-			if len(lastResponseBody) > 200 {
-				lastResponseBody = lastResponseBody[:200] + "..."
-			}
-			errorMsg = fmt.Sprintf("%s, last response: %s", errorMsg, lastResponseBody)
-		}
+	}
+
+	// If we can't parse the JSON, or it doesn't match our expected error format,
+	// log it but still return PodNotFound since a 404 generally indicates the pod doesn't exist
+	c.logger.Warn("Received unexpected 404 response format",
+		"podID", podID,
+		"body", string(body))
+	return PodNotFound, nil
+}
+
+// handleNonOKResponse processes non-200 responses
+func handleNonOKResponse(resp *http.Response) (PodStatus, error) {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return PodNotFound, fmt.Errorf("RunPod API error with status %d and error reading body: %w",
+			resp.StatusCode, err)
+	}
+	return PodNotFound, fmt.Errorf("RunPod API error: status %d, body: %s",
+		resp.StatusCode, string(body))
+}
+
+// GetPodStatusREST gets pod status from RunPod REST API
+func (c *Client) GetPodStatusREST(podID string) (PodStatus, error) {
+	endpoint := fmt.Sprintf("pods/%s", podID)
+
+	resp, state, err := c.performRetryableRequest(endpoint, podID)
+	if err != nil {
+		errorMsg := buildErrorMessage("API request failed after 3 attempts", state)
 		return PodNotFound, fmt.Errorf("%s", errorMsg)
 	}
 
 	defer func() {
-		bodyErr := resp.Body.Close()
-		if bodyErr != nil {
-			c.logger.Warn("Error closing response body", "error", bodyErr)
+		if err := resp.Body.Close(); err != nil {
+			c.logger.Warn("Error closing response body", "error", err)
 		}
 	}()
 
-	// Handle 404 Not Found responses
-	if resp.StatusCode == http.StatusNotFound {
-		// Read the response body
-		body, readErr := io.ReadAll(resp.Body)
-		if readErr != nil {
-			return PodNotFound, fmt.Errorf("Error reading 404 response body: %w", readErr)
-		}
-
-		// Check if this is the specific "pod not found" message we expect
-		var errorResponse struct {
-			Error  string `json:"error"`
-			Status int    `json:"status"`
-		}
-
-		if err := json.Unmarshal(body, &errorResponse); err == nil {
-			if errorResponse.Error == "pod not found" && errorResponse.Status == 404 {
-				// This is the expected "pod not found" response, return PodNotFound status
-				return PodNotFound, nil
-			}
-		}
-
-		// If we can't parse the JSON, or it doesn't match our expected error format,
-		// log it but still return PodNotFound since a 404 generally indicates the pod doesn't exist
-		c.logger.Warn("Received unexpected 404 response format",
-			"podID", podID,
-			"body", string(body))
-		return PodNotFound, nil
+	// Handle different response codes
+	switch resp.StatusCode {
+	case http.StatusNotFound:
+		// Handle 404 Not Found responses
+		return c.handle404Response(resp, podID)
+	case http.StatusOK:
+		// Continue to decode response
+	default:
+		return handleNonOKResponse(resp)
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		body, readErr := io.ReadAll(resp.Body)
-		if readErr != nil {
-			return PodNotFound, fmt.Errorf("RunPod API error with status %d and error reading body: %w",
-				resp.StatusCode, readErr)
-		}
-		return PodNotFound, fmt.Errorf("RunPod API error: status %d, body: %s",
-			resp.StatusCode, string(body))
-	}
-
+	// Decode successful response
 	var response struct {
 		ID            string `json:"id"`
 		DesiredStatus string `json:"desiredStatus"`
@@ -489,7 +525,11 @@ func (c *Client) DeployPodREST(params map[string]interface{}) (string, float64, 
 		return "", 0, fmt.Errorf("received nil response from makeRESTRequest")
 	}
 
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			c.logger.Warn("Error closing response body", "error", err)
+		}
+	}()
 
 	// Read the full response body
 	body, readErr := io.ReadAll(resp.Body)
@@ -648,7 +688,11 @@ func (c *Client) TerminatePod(podID string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			c.logger.Warn("Error closing response body", "error", err)
+		}
+	}()
 
 	if resp.StatusCode == http.StatusUnauthorized {
 		return fmt.Errorf("unauthorized: invalid API key")
@@ -707,7 +751,11 @@ func (c *Client) GetDetailedPodStatus(podID string) (*DetailedStatus, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to get pod details: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			c.logger.Warn("Error closing response body", "error", err)
+		}
+	}()
 
 	if resp.StatusCode == http.StatusNotFound {
 		return &DetailedStatus{
@@ -787,123 +835,177 @@ func FormatEnvVarsForREST(envVars []RunPodEnv) map[string]string {
 	return formatted
 }
 
-// ExtractEnvVars extracts environment variables from a pod, filters auto-injected variables as they are only relevant for pods running inside the cluster and not for RunPod, reduce attack surface
-func (c *Client) ExtractEnvVars(pod *v1.Pod) ([]RunPodEnv, error) {
-	var envVars []RunPodEnv
-	var secretsToFetch = make(map[string]bool)
-	var secretEnvVars = make(map[string][]struct {
-		SecretKey string
-		EnvKey    string
-	})
-	var secretRefEnvs = make(map[string]bool)
+type secretMapping struct {
+	SecretKey string
+	EnvKey    string
+}
 
-	// Define a function to check if a key is a Kubernetes auto-injected variable
-	isK8sAutoInjectedVar := func(key string) bool {
-		// Common prefixes for auto-injected variables.
-		prefixes := []string{
-			"KUBERNETES_",
-			"_PORT_",         //this might lead to false positive for unaware users
-			"_TCP_",          //this might lead to false positive for unaware users
-			"_SERVICE_PORT_", //k8s adds services as env vars (https://kubernetes.io/docs/concepts/containers/container-environment/#cluster-information)
-			"_SERVICE_HOST",  //auto added services
-		}
+type secretCollector struct {
+	secretsToFetch map[string]bool
+	secretEnvVars  map[string][]secretMapping
+	secretRefEnvs  map[string]bool
+}
 
-		// Check if the key matches any of the patterns
-		for _, prefix := range prefixes {
-			if strings.Contains(key, prefix) {
-				return true
-			}
-		}
+func newSecretCollector() *secretCollector {
+	return &secretCollector{
+		secretsToFetch: make(map[string]bool),
+		secretEnvVars:  make(map[string][]secretMapping),
+		secretRefEnvs:  make(map[string]bool),
+	}
+}
 
-		return false
+// isK8sAutoInjectedVar checks if a key is a Kubernetes auto-injected variable
+func isK8sAutoInjectedVar(key string) bool {
+	// Common prefixes for auto-injected variables.
+	prefixes := []string{
+		"KUBERNETES_",
+		"_PORT_",         //this might lead to false positive for unaware users
+		"_TCP_",          //this might lead to false positive for unaware users
+		"_SERVICE_PORT_", //k8s adds services as env vars (https://kubernetes.io/docs/concepts/containers/container-environment/#cluster-information)
+		"_SERVICE_HOST",  //auto added services
 	}
 
-	// First pass: collect all secrets we need to fetch
-	if len(pod.Spec.Containers) > 0 {
-		container := pod.Spec.Containers[0]
+	// Check if the key matches any of the patterns
+	for _, prefix := range prefixes {
+		if strings.Contains(key, prefix) {
+			return true
+		}
+	}
 
-		// Add regular environment variables
-		for _, env := range container.Env {
+	return false
+}
+
+// processContainerEnv processes environment variables from container
+func (c *Client) processContainerEnv(container v1.Container, envVars *[]RunPodEnv, collector *secretCollector) {
+	// Add regular environment variables
+	for _, env := range container.Env {
+		// Skip Kubernetes auto-injected variables
+		if isK8sAutoInjectedVar(env.Name) {
+			continue
+		}
+
+		// If this is a regular env var, add it directly
+		if env.Value != "" {
+			*envVars = append(*envVars, RunPodEnv{
+				Key:   env.Name,
+				Value: env.Value,
+			})
+		} else if env.ValueFrom != nil && env.ValueFrom.SecretKeyRef != nil {
+			// This is a secret reference, track it for fetching
+			secretName := env.ValueFrom.SecretKeyRef.Name
+			collector.secretsToFetch[secretName] = true
+
+			if _, ok := collector.secretEnvVars[secretName]; !ok {
+				collector.secretEnvVars[secretName] = []secretMapping{}
+			}
+
+			// Store the mapping between secret key and env var name
+			collector.secretEnvVars[secretName] = append(collector.secretEnvVars[secretName], secretMapping{
+				SecretKey: env.ValueFrom.SecretKeyRef.Key,
+				EnvKey:    env.Name,
+			})
+		}
+	}
+
+	// Handle envFrom references
+	for _, envFrom := range container.EnvFrom {
+		if envFrom.SecretRef != nil {
+			secretName := envFrom.SecretRef.Name
+			collector.secretsToFetch[secretName] = true
+			collector.secretRefEnvs[secretName] = true
+		}
+	}
+}
+
+// processVolumeSecrets processes secrets from volume mounts
+func (c *Client) processVolumeSecrets(volumes []v1.Volume, collector *secretCollector) {
+	// Also check for secrets mounted as volumes that should be included as env vars
+	for _, volume := range volumes {
+		if volume.Secret == nil {
+			continue
+		}
+
+		secretName := volume.Secret.SecretName
+		collector.secretsToFetch[secretName] = true
+
+		// For volume mounts with specific items
+		if items := volume.Secret.Items; len(items) > 0 {
+			if _, ok := collector.secretEnvVars[secretName]; !ok {
+				collector.secretEnvVars[secretName] = []secretMapping{}
+			}
+
+			for _, item := range items {
+				// When mounted as a volume item, use the path as env var name if not specified
+				envKey := item.Path
+				if envKey == "" {
+					envKey = item.Key
+				}
+
+				collector.secretEnvVars[secretName] = append(collector.secretEnvVars[secretName], secretMapping{
+					SecretKey: item.Key,
+					EnvKey:    envKey,
+				})
+			}
+		}
+	}
+}
+
+// processSecretData processes data from a fetched secret
+func (c *Client) processSecretData(secret *v1.Secret, secretName string, collector *secretCollector, envVars *[]RunPodEnv) {
+	// Handle specific secret keys mapped to env vars
+	if mappings, ok := collector.secretEnvVars[secretName]; ok {
+		for _, mapping := range mappings {
+			if secretValue, ok := secret.Data[mapping.SecretKey]; ok {
+				// Skip if the mapped key is a Kubernetes auto-injected variable
+				if isK8sAutoInjectedVar(mapping.EnvKey) {
+					continue
+				}
+
+				// Add it as an environment variable with the correct name
+				*envVars = append(*envVars, RunPodEnv{
+					Key:   mapping.EnvKey,
+					Value: strings.ReplaceAll(string(secretValue), "\n", "\\n"),
+				})
+			} else {
+				c.logger.Warn("Secret key not found",
+					"namespace", secret.Namespace,
+					"secret", secretName,
+					"key", mapping.SecretKey)
+			}
+		}
+	}
+
+	// Handle envFrom that should import all keys from the secret
+	if collector.secretRefEnvs[secretName] {
+		for key, value := range secret.Data {
 			// Skip Kubernetes auto-injected variables
-			if isK8sAutoInjectedVar(env.Name) {
+			if isK8sAutoInjectedVar(key) {
 				continue
 			}
 
-			// If this is a regular env var, add it directly
-			if env.Value != "" {
-				envVars = append(envVars, RunPodEnv{
-					Key:   env.Name,
-					Value: env.Value,
-				})
-			} else if env.ValueFrom != nil && env.ValueFrom.SecretKeyRef != nil {
-				// This is a secret reference, track it for fetching
-				secretName := env.ValueFrom.SecretKeyRef.Name
-				secretsToFetch[secretName] = true
-
-				if _, ok := secretEnvVars[secretName]; !ok {
-					secretEnvVars[secretName] = []struct {
-						SecretKey string
-						EnvKey    string
-					}{}
-				}
-
-				// Store the mapping between secret key and env var name
-				secretEnvVars[secretName] = append(secretEnvVars[secretName], struct {
-					SecretKey string
-					EnvKey    string
-				}{
-					SecretKey: env.ValueFrom.SecretKeyRef.Key,
-					EnvKey:    env.Name,
-				})
-			}
-		}
-
-		// Handle envFrom references
-		for _, envFrom := range container.EnvFrom {
-			if envFrom.SecretRef != nil {
-				secretName := envFrom.SecretRef.Name
-				secretsToFetch[secretName] = true
-				secretRefEnvs[secretName] = true
-			}
+			*envVars = append(*envVars, RunPodEnv{
+				Key:   key,
+				Value: strings.ReplaceAll(string(value), "\n", "\\n"),
+			})
 		}
 	}
+}
 
-	// Also check for secrets mounted as volumes that should be included as env vars
-	for _, volume := range pod.Spec.Volumes {
-		if volume.Secret != nil {
-			secretName := volume.Secret.SecretName
-			secretsToFetch[secretName] = true
+// ExtractEnvVars extracts environment variables from a pod, filters auto-injected variables as they are only relevant for pods running inside the cluster and not for RunPod, reduce attack surface
+func (c *Client) ExtractEnvVars(pod *v1.Pod) ([]RunPodEnv, error) {
+	var envVars []RunPodEnv
+	collector := newSecretCollector()
 
-			// For volume mounts with specific items
-			if items := volume.Secret.Items; len(items) > 0 {
-				if _, ok := secretEnvVars[secretName]; !ok {
-					secretEnvVars[secretName] = []struct {
-						SecretKey string
-						EnvKey    string
-					}{}
-				}
-
-				for _, item := range items {
-					// When mounted as a volume item, use the path as env var name if not specified
-					envKey := item.Path
-					if envKey == "" {
-						envKey = item.Key
-					}
-
-					secretEnvVars[secretName] = append(secretEnvVars[secretName], struct {
-						SecretKey string
-						EnvKey    string
-					}{
-						SecretKey: item.Key,
-						EnvKey:    envKey,
-					})
-				}
-			}
-		}
+	// First pass: collect all secrets we need to fetch
+	if len(pod.Spec.Containers) > 0 {
+		c.processContainerEnv(pod.Spec.Containers[0], &envVars, collector)
 	}
+
+	// Process volume secrets
+	c.processVolumeSecrets(pod.Spec.Volumes, collector)
 
 	// Second pass: fetch all needed secrets and extract values
-	for secretName := range secretsToFetch {
+	for secretName := range collector.secretsToFetch {
 		// Use the clientset from the Client struct
 		secret, err := c.clientset.CoreV1().Secrets(pod.Namespace).Get(
 			context.Background(),
@@ -917,106 +1019,100 @@ func (c *Client) ExtractEnvVars(pod *v1.Pod) ([]RunPodEnv, error) {
 			continue
 		}
 
-		// Handle specific secret keys mapped to env vars
-		if mappings, ok := secretEnvVars[secretName]; ok {
-			for _, mapping := range mappings {
-				if secretValue, ok := secret.Data[mapping.SecretKey]; ok {
-					// Skip if the mapped key is a Kubernetes auto-injected variable
-					if isK8sAutoInjectedVar(mapping.EnvKey) {
-						continue
-					}
-
-					// Add it as an environment variable with the correct name
-					envVars = append(envVars, RunPodEnv{
-						Key:   mapping.EnvKey,
-						Value: strings.ReplaceAll(string(secretValue), "\n", "\\n"),
-					})
-				} else {
-					c.logger.Warn("Secret key not found",
-						"namespace", pod.Namespace,
-						"secret", secretName,
-						"key", mapping.SecretKey)
-				}
-			}
-		}
-
-		// Handle envFrom that should import all keys from the secret
-		if secretRefEnvs[secretName] {
-			for key, value := range secret.Data {
-				// Skip Kubernetes auto-injected variables
-				if isK8sAutoInjectedVar(key) {
-					continue
-				}
-
-				envVars = append(envVars, RunPodEnv{
-					Key:   key,
-					Value: strings.ReplaceAll(string(value), "\n", "\\n"),
-				})
-			}
-		}
+		c.processSecretData(secret, secretName, collector, &envVars)
 	}
 
 	return envVars, nil
 }
 
-// PrepareRunPodParameters prepares parameters for RunPod deployment
-// Update PrepareRunPodParameters to use the clientset from the Client struct
-func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]interface{}, error) {
-	// Check if pod is owned by a job and use job annotations if available
-	var ownerJob *batchv1.Job
+// getOwnerJob retrieves the owner job of a pod if it exists
+func (c *Client) getOwnerJob(pod *v1.Pod) *batchv1.Job {
 	for _, owner := range pod.OwnerReferences {
 		if owner.Kind == "Job" {
-			// Fetch the job to access its annotations using the clientset
 			job, err := c.clientset.BatchV1().Jobs(pod.Namespace).Get(
 				context.Background(),
 				owner.Name,
 				metav1.GetOptions{},
 			)
 			if err == nil {
-				ownerJob = job
-				break
+				return job
 			}
 		}
 	}
+	return nil
+}
 
-	// Determine cloud type - default to SECURE but allow override via annotation
-	cloudType := "SECURE"
-	// Helper function to get annotation value with fallback to job annotations
-	getAnnotation := func(annotationKey string, defaultValue string) string {
-		if val, exists := pod.Annotations[annotationKey]; exists && val != "" {
+// getAnnotationWithFallback gets annotation value with fallback to job annotations
+func getAnnotationWithFallback(pod *v1.Pod, ownerJob *batchv1.Job, annotationKey string, defaultValue string) string {
+	if val, exists := pod.Annotations[annotationKey]; exists && val != "" {
+		return val
+	}
+	if ownerJob != nil && ownerJob.Annotations != nil {
+		if val, exists := ownerJob.Annotations[annotationKey]; exists && val != "" {
 			return val
 		}
-		if ownerJob != nil && ownerJob.Annotations != nil {
-			if val, exists := ownerJob.Annotations[annotationKey]; exists && val != "" {
-				return val
-			}
-		}
-		return defaultValue
 	}
-	if cloudTypeVal := getAnnotation(CloudTypeAnnotation, ""); cloudTypeVal != "" {
-		// Validate and normalize the cloud type value
-		cloudTypeUpperCase := strings.ToUpper(cloudTypeVal)
-		if cloudTypeUpperCase == "SECURE" || cloudTypeUpperCase == "COMMUNITY" {
-			cloudType = cloudTypeUpperCase
-		} else {
-			c.logger.Warn("Invalid cloud type specified, using default",
-				"pod", pod.Name,
-				"namespace", pod.Namespace,
-				"specifiedValue", cloudTypeVal,
-				"defaultValue", cloudType)
-		}
+	return defaultValue
+}
+
+// validateCloudType validates and normalizes the cloud type value
+func (c *Client) validateCloudType(cloudTypeVal string, pod *v1.Pod) string {
+	// Determine cloud type - default to SECURE but allow override via annotation
+	defaultCloudType := "SECURE"
+	if cloudTypeVal == "" {
+		return defaultCloudType
 	}
 
+	// Validate and normalize the cloud type value
+	cloudTypeUpperCase := strings.ToUpper(cloudTypeVal)
+	if cloudTypeUpperCase == "SECURE" || cloudTypeUpperCase == "COMMUNITY" {
+		return cloudTypeUpperCase
+	}
+
+	c.logger.Warn("Invalid cloud type specified, using default",
+		"pod", pod.Name,
+		"namespace", pod.Namespace,
+		"specifiedValue", cloudTypeVal,
+		"defaultValue", defaultCloudType)
+	return defaultCloudType
+}
+
+// extractGPUMemory extracts GPU memory from annotations
+func extractGPUMemory(memStr string) int {
+	defaultMemory := 16 // Default minimum memory
+	if memStr == "" {
+		return defaultMemory
+	}
+
+	if mem, err := strconv.Atoi(memStr); err == nil {
+		return mem
+	}
+	return defaultMemory
+}
+
+// PrepareRunPodParameters prepares parameters for RunPod deployment
+// Update PrepareRunPodParameters to use the clientset from the Client struct
+func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]interface{}, error) {
+	// Check if pod is owned by a job and use job annotations if available
+	ownerJob := c.getOwnerJob(pod)
+
+	// Helper function for getting annotations
+	getAnnotation := func(annotationKey string, defaultValue string) string {
+		return getAnnotationWithFallback(pod, ownerJob, annotationKey, defaultValue)
+	}
+
+	// Get and validate cloud type
+	cloudTypeVal := getAnnotation(CloudTypeAnnotation, "")
+	cloudType := c.validateCloudType(cloudTypeVal, pod)
+
+	// Get other annotations
 	containerRegistryAuthId := getAnnotation(ContainerRegistryAuthAnnotation, "")
 	templateId := getAnnotation(TemplateIdAnnotation, "")
+	datacenterID := getAnnotation(DatacenterAnnotation, "")
 
 	// Determine minimum GPU memory required
-	minRAMPerGPU := 16 // Default minimum memory
-	if memStr := getAnnotation(GpuMemoryAnnotation, ""); memStr != "" {
-		if mem, err := strconv.Atoi(memStr); err == nil {
-			minRAMPerGPU = mem
-		}
-	}
+	memStr := getAnnotation(GpuMemoryAnnotation, "")
+	minRAMPerGPU := extractGPUMemory(memStr)
 
 	// Get GPU types - pass the cloud type to filter correctly
 	gpuTypes, err := c.GetGPUTypes(minRAMPerGPU, DefaultMaxPrice, cloudType)
@@ -1030,6 +1126,7 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 		return nil, fmt.Errorf("failed to extract environment variables: %w", err)
 	}
 
+	// Format environment variables
 	var formattedEnvVars interface{}
 	if graphql {
 		formattedEnvVars = FormatEnvVarsForGraphQL(envVars)
@@ -1038,12 +1135,10 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 	}
 
 	// Determine image name from pod
-	var imageName string
-	if len(pod.Spec.Containers) > 0 {
-		imageName = pod.Spec.Containers[0].Image
-	} else {
+	if len(pod.Spec.Containers) == 0 {
 		return nil, fmt.Errorf("pod has no containers")
 	}
+	imageName := pod.Spec.Containers[0].Image
 
 	// Use the pod name as the RunPod name
 	runpodName := pod.Name
@@ -1065,7 +1160,7 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 	}
 
 	// Add datacenter IDs if specified in pod annotations
-	if datacenterID := getAnnotation(DatacenterAnnotation, ""); datacenterID != "" {
+	if datacenterID != "" {
 		params["dataCenterIds"] = []string{datacenterID}
 	}
 

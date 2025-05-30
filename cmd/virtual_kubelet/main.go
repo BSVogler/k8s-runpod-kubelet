@@ -105,105 +105,44 @@ func logAuthInfo(k8sClient *kubernetes.Clientset, logger *slog.Logger) {
 	}
 }
 
-func main() {
+// initializeLogger sets up the logger with optional Sentry integration
+func initializeLogger() (*slog.Logger, func()) {
 	sentryUrl := os.Getenv("SENTRY_URL")
-	var logger *slog.Logger
-	if sentryUrl != "" {
-		environment := os.Getenv("environment")
-		if environment == "" {
-			environment = "development"
-		}
-		err := sentry.Init(sentry.ClientOptions{
-			Dsn:           sentryUrl,
-			EnableTracing: false,
-			Environment:   environment,
-		})
-		if err != nil {
-			log.Fatalf("sentry.Init: %s", err)
-		}
-
-		// Create both a Sentry handler and a text handler for stdout
-		sentryHandler := sentryslog.Option{Level: slog.LevelInfo}.NewSentryHandler()
-		stdoutHandler := slog.NewTextHandler(os.Stdout, nil)
-
-		// Create a custom multi handler that sends logs to both
-		multiHandler := newMultiHandler(sentryHandler, stdoutHandler)
-
-		// Configure `slog` to use the multi handler
-		logger = slog.New(multiHandler)
-		//logger = logger.With("release", "v1.0.1")
-		defer sentry.Flush(2 * time.Second) //send errors after a crash
-	} else { // Use a default logger (stdout) when Sentry is not initialized
-		logger = slog.New(slog.NewTextHandler(os.Stdout, nil))
+	if sentryUrl == "" {
+		return slog.New(slog.NewTextHandler(os.Stdout, nil)), func() {}
 	}
 
-	flag.Parse()
-
-	// Create a context with cancellation
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Handle termination signals
-	signalCh := make(chan os.Signal, 1)
-	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-signalCh
-		logger.Info("Received termination signal")
-		cancel()
-	}()
-
-	// Load provider config
-	var providerConfig config.Config
-	if providerConfigPath != "" {
-		var err error
-		providerConfig, err = LoadConfig(providerConfigPath)
-		if err != nil {
-			logger.Error("Failed to load provider config", "error", err)
-			os.Exit(1)
-		}
+	environment := os.Getenv("environment")
+	if environment == "" {
+		environment = "development"
 	}
 
-	// Create Kubernetes client
-	k8sClient, err := createK8sClient(kubeconfig)
-	if err != nil {
-		logger.Error("Failed to create Kubernetes client", "error", err)
-		os.Exit(1)
-	}
-	if k8sClient != nil {
-		logAuthInfo(k8sClient, logger)
-	}
-
-	// Check if RUNPOD_KEY is set
-	if os.Getenv("RUNPOD_KEY") == "" {
-		logger.Error("RUNPOD_KEY environment variable is not set")
-		os.Exit(1)
-	}
-
-	// Create the RunPod provider
-	// Update config with command line flags
-	providerConfig.DatacenterIDs = datacenterIDs
-
-	provider, err := runpod.NewProvider(
-		ctx,
-		nodeName,
-		operatingSystem,
-		internalIP,
-		listenPort,
-		providerConfig,
-		k8sClient,
-		logger,
-	)
-	if err != nil {
-		logger.Error("Failed to create RunPod provider", "error", err)
-		os.Exit(1)
-	}
-	eventBroadcaster := record.NewBroadcaster()
-	//here we use a namespace agnostic event sink because the controller can manage pods in all namespaces
-	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{
-		Interface: k8sClient.CoreV1().Events(""), // Empty string means "all namespaces"
+	err := sentry.Init(sentry.ClientOptions{
+		Dsn:           sentryUrl,
+		EnableTracing: false,
+		Environment:   environment,
 	})
-	eventRecorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: nodeName})
+	if err != nil {
+		log.Fatalf("sentry.Init: %s", err)
+	}
 
+	// Create both a Sentry handler and a text handler for stdout
+	sentryHandler := sentryslog.Option{Level: slog.LevelInfo}.NewSentryHandler()
+	stdoutHandler := slog.NewTextHandler(os.Stdout, nil)
+
+	// Create a custom multi handler that sends logs to both
+	multiHandler := newMultiHandler(sentryHandler, stdoutHandler)
+
+	logger := slog.New(multiHandler)
+	cleanup := func() {
+		sentry.Flush(2 * time.Second)
+	}
+
+	return logger, cleanup
+}
+
+// setupInformers creates and configures the Kubernetes informers
+func setupInformers(k8sClient *kubernetes.Clientset, nodeName string, reconcileInterval int) (informers.SharedInformerFactory, informers.SharedInformerFactory) {
 	// Create a separate informer factory just for pods with field selector
 	podInformerFactory := informers.NewSharedInformerFactoryWithOptions(
 		k8sClient,
@@ -213,38 +152,43 @@ func main() {
 		}),
 	)
 
-	// Use the pod-specific factory for pod informer
-	podInformer := podInformerFactory.Core().V1().Pods()
-
 	// Create a standard informer factory for other resources
 	standardInformerFactory := informers.NewSharedInformerFactory(
 		k8sClient,
 		time.Duration(reconcileInterval)*time.Second,
 	)
 
-	// Get other informers from the standard factory
-	configMapInformer := standardInformerFactory.Core().V1().ConfigMaps()
-	secretInformer := standardInformerFactory.Core().V1().Secrets()
-	serviceInformer := standardInformerFactory.Core().V1().Services()
+	return podInformerFactory, standardInformerFactory
+}
+
+// createControllers sets up the pod and node controllers
+func createControllers(ctx context.Context, provider *runpod.Provider, k8sClient *kubernetes.Clientset,
+	podInformer informers.SharedInformerFactory, standardInformer informers.SharedInformerFactory,
+	nodeName string, kubenamespace string, logger *slog.Logger) (*node.PodController, *node.NodeController, error) {
+
+	// Create event recorder
+	eventBroadcaster := record.NewBroadcaster()
+	// here we use a namespace agnostic event sink because the controller can manage pods in all namespaces
+	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{
+		Interface: k8sClient.CoreV1().Events(""), // Empty string means "all namespaces"
+	})
+	eventRecorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: nodeName})
 
 	// The pod controller manages all informers to react to events
 	podControllerCfg := node.PodControllerConfig{
 		PodClient:                         k8sClient.CoreV1(),
-		PodInformer:                       podInformer,
-		ConfigMapInformer:                 configMapInformer,
-		SecretInformer:                    secretInformer,
-		ServiceInformer:                   serviceInformer,
+		PodInformer:                       podInformer.Core().V1().Pods(),
+		ConfigMapInformer:                 standardInformer.Core().V1().ConfigMaps(),
+		SecretInformer:                    standardInformer.Core().V1().Secrets(),
+		ServiceInformer:                   standardInformer.Core().V1().Services(),
 		Provider:                          provider,
 		EventRecorder:                     eventRecorder,
 		SyncPodsFromKubernetesRateLimiter: nil,
 	}
 	podController, err := node.NewPodController(podControllerCfg)
-
-	// Start both informer factories
-	go podInformerFactory.Start(ctx.Done())
-	go standardInformerFactory.Start(ctx.Done())
-
-	//syncInformers(ctx, logger, informerFactory)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create pod controller: %w", err)
+	}
 
 	// Create node controller
 	_, err = k8sClient.Discovery().ServerResourcesForGroupVersion("coordination.k8s.io/v1")
@@ -261,10 +205,14 @@ func main() {
 		nodeControllerOpts...,
 	)
 	if err != nil {
-		logger.Error("Failed to create node controller", "error", err)
-		os.Exit(1)
+		return nil, nil, fmt.Errorf("failed to create node controller: %w", err)
 	}
 
+	return podController, nodeController, nil
+}
+
+// createAPIServer sets up the HTTP API server
+func createAPIServer(provider *runpod.Provider, internalIP string, listenPort int) *http.Server {
 	// Set up basic handlers for the HTTP server. This lets k8s interact with the kubelet
 	podHandlerConfig := api.PodHandlerConfig{
 		RunInContainer: func(ctx context.Context, namespace, podName, containerName string, cmd []string, attach api.AttachIO) error {
@@ -290,10 +238,156 @@ func main() {
 	mux := http.NewServeMux()
 	// Attach pod routes to the mux (multiplexer)
 	api.AttachPodRoutes(podHandlerConfig, mux, false) // Set debug to false for production
-	apiServer := &http.Server{
+
+	return &http.Server{
 		Addr:    fmt.Sprintf("%s:%d", internalIP, listenPort),
 		Handler: mux,
 	}
+}
+
+// startControllers starts the pod and node controllers
+func startControllers(ctx context.Context, podController *node.PodController, nodeController *node.NodeController, logger *slog.Logger) error {
+	// Start node controller
+	go func() {
+		logger.Info("Starting node controller")
+		if err := nodeController.Run(ctx); err != nil && ctx.Err() == nil {
+			logger.Error("Failed to run node controller", "error", err)
+		}
+	}()
+
+	// Start pod controller
+	go func() {
+		logger.Info("Starting pod controller")
+		if err := podController.Run(ctx, 1); err != nil && ctx.Err() == nil {
+			logger.Error("Failed to run pod controller", "error", err)
+		}
+	}()
+
+	// Wait for pod controller to be ready
+	select {
+	case <-podController.Ready():
+		logger.Info("Pod controller is ready")
+		return nil
+	case <-podController.Done():
+		return fmt.Errorf("pod controller exited before becoming ready: %w", podController.Err())
+	}
+}
+
+// loadConfiguration loads provider config from file if specified
+func loadConfiguration(logger *slog.Logger) config.Config {
+	var providerConfig config.Config
+	if providerConfigPath != "" {
+		var err error
+		providerConfig, err = LoadConfig(providerConfigPath)
+		if err != nil {
+			logger.Error("Failed to load provider config", "error", err)
+			os.Exit(1)
+		}
+	}
+	return providerConfig
+}
+
+// createAndValidateK8sClient creates and validates the Kubernetes client
+func createAndValidateK8sClient(logger *slog.Logger) *kubernetes.Clientset {
+	k8sClient, err := createK8sClient(kubeconfig)
+	if err != nil {
+		logger.Error("Failed to create Kubernetes client", "error", err)
+		os.Exit(1)
+	}
+	if k8sClient != nil {
+		logAuthInfo(k8sClient, logger)
+	}
+	return k8sClient
+}
+
+// validateEnvironment checks required environment variables
+func validateEnvironment(logger *slog.Logger) {
+	if os.Getenv("RUNPOD_API_KEY") == "" {
+		logger.Error("RUNPOD_API_KEY environment variable is not set")
+		os.Exit(1)
+	}
+}
+
+// setupShutdownHandlers sets up graceful shutdown handlers
+func setupShutdownHandlers(ctx context.Context, apiServer *http.Server, healthServer *runpod.HealthServer, logger *slog.Logger) {
+	go func() {
+		<-ctx.Done()
+		if err := healthServer.Stop(); err != nil {
+			logger.Error("Health server shutdown error", "error", err)
+		}
+	}()
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
+		if err := apiServer.Shutdown(shutdownCtx); err != nil {
+			logger.Error("API server shutdown error", "error", err)
+		}
+	}()
+}
+
+func main() {
+	logger, cleanup := initializeLogger()
+	defer cleanup()
+
+	flag.Parse()
+
+	// Create a context with cancellation
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Handle termination signals
+	signalCh := make(chan os.Signal, 1)
+	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-signalCh
+		logger.Info("Received termination signal")
+		cancel()
+	}()
+
+	// Load configuration and validate environment
+	providerConfig := loadConfiguration(logger)
+	k8sClient := createAndValidateK8sClient(logger)
+	validateEnvironment(logger)
+
+	// Create the RunPod provider
+	// Update config with command line flags
+	providerConfig.DatacenterIDs = datacenterIDs
+	provider, err := runpod.NewProvider(
+		ctx,
+		nodeName,
+		operatingSystem,
+		internalIP,
+		listenPort,
+		providerConfig,
+		k8sClient,
+		logger,
+	)
+	if err != nil {
+		logger.Error("Failed to create RunPod provider", "error", err)
+		os.Exit(1)
+	}
+
+	// Setup informers
+	podInformerFactory, standardInformerFactory := setupInformers(k8sClient, nodeName, reconcileInterval)
+
+	// Create controllers
+	podController, nodeController, err := createControllers(ctx, provider, k8sClient,
+		podInformerFactory, standardInformerFactory, nodeName, kubenamespace, logger)
+	if err != nil {
+		logger.Error("Failed to create controllers", "error", err)
+		os.Exit(1)
+	}
+
+	// Start informer factories
+	go podInformerFactory.Start(ctx.Done())
+	go standardInformerFactory.Start(ctx.Done())
+
+	// Create and start API server
+	apiServer := createAPIServer(provider, internalIP, listenPort)
+
+	// Create and start health server
 	healthServer := runpod.NewHealthServer(
 		healthServerAddress, // Using the flag value you already defined
 		func() bool {
@@ -302,61 +396,24 @@ func main() {
 			return provider.Ping(context.Background()) == nil
 		},
 	)
-
-	// Start the health check server
 	logger.Info("Starting health check server", "address", healthServerAddress)
 	healthServer.Start()
 
-	// Ensure shutdown on context cancellation
-	go func() {
-		<-ctx.Done()
-		if err := healthServer.Stop(); err != nil {
-			logger.Error("Health server shutdown error", "error", err)
-		}
-	}()
+	// Ensure proper shutdown
+	setupShutdownHandlers(ctx, apiServer, healthServer, logger)
 
-	// Start controllers and API server
-	go func() {
-		logger.Info("Starting node controller")
-		if err := nodeController.Run(ctx); err != nil && ctx.Err() == nil {
-			logger.Error("Failed to run node controller", "error", err)
-			cancel()
-		}
-	}()
-
-	go func() {
-		logger.Info("Starting pod controller")
-		if err := podController.Run(ctx, 1); err != nil && ctx.Err() == nil {
-			logger.Error("Failed to run pod controller", "error", err)
-			cancel()
-		}
-		logger.Info("Pod controller started successfully") // This might not execute if Run doesn't return
-	}()
-
-	// Wait for the pod controller to be ready or exit
-	select {
-	case <-podController.Ready():
-		logger.Info("Pod controller is ready")
-	case <-podController.Done():
-		logger.Error("Pod controller exited before becoming ready", "error", podController.Err())
+	// Start controllers
+	if err := startControllers(ctx, podController, nodeController, logger); err != nil {
+		logger.Error("Failed to start controllers", "error", err)
 		os.Exit(1)
 	}
 
+	// Start API server
 	go func() {
 		logger.Info("Starting API server for K8S to use", "port", listenPort)
 		if err := apiServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("Failed to run API server", "error", err)
 			cancel()
-		}
-	}()
-
-	// Ensure server shutdown on context cancellation
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer shutdownCancel()
-		if err := apiServer.Shutdown(shutdownCtx); err != nil {
-			logger.Error("API server shutdown error", "error", err)
 		}
 	}()
 
