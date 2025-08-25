@@ -1225,15 +1225,27 @@ func (p *Provider) LoadRunning() {
 
 	// Step 5: Find RunPod instances not represented in Kubernetes
 	existingRunPodMap := p.mapExistingRunPodInstances()
-	for _, runpodInstance := range append(runningPods, exitedPods...) {
+	// Only check running pods - we don't want to create K8s pods for stopped/exited RunPod instances
+	for _, runpodInstance := range runningPods {
 		if _, exists := existingRunPodMap[runpodInstance.ID]; !exists {
 			// This RunPod instance has no representation in K8s
-			p.logger.Info("Found RunPod instance with no Kubernetes pod",
+			p.logger.Info("Found running RunPod instance with no Kubernetes pod",
 				"runpodID", runpodInstance.ID,
-				"name", runpodInstance.Name)
+				"name", runpodInstance.Name,
+				"status", runpodInstance.CurrentStatus)
 
 			// Create virtual pod for this RunPod instance
 			p.CreateVirtualPod(runpodInstance)
+		}
+	}
+	
+	// Log exited pods for visibility but don't create K8s pods for them
+	for _, runpodInstance := range exitedPods {
+		if _, exists := existingRunPodMap[runpodInstance.ID]; !exists {
+			p.logger.Debug("Found exited RunPod instance with no Kubernetes pod (ignoring)",
+				"runpodID", runpodInstance.ID,
+				"name", runpodInstance.Name,
+				"status", runpodInstance.CurrentStatus)
 		}
 	}
 }
