@@ -13,7 +13,7 @@ This Helm chart deploys the RunPod Virtual Kubelet to your Kubernetes cluster, a
 ### Option 1: Install from GitHub Container Registry
 
 ```bash
-helm install runpod-kubelet oci://ghcr.io/bsvogler/charts/runpod-kubelet \
+helm install runpod-kubelet oci://ghcr.io/bsvogler/helm/runpod-kubelet \
   --namespace kube-system \
   --set runpod.apiKey=YOUR_RUNPOD_API_KEY
 ```
