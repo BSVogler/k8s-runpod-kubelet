@@ -128,13 +128,18 @@ func (p *Provider) CreatePod(ctx context.Context, pod *v1.Pod) error {
 
 	// Store the pod in our tracking map
 	podKey := fmt.Sprintf("%s-%s", pod.Namespace, pod.Name)
+	
+	// Get the requested ports for this pod
+	requestedPorts := p.runpodClient.GetRequestedPorts(pod)
+	
 	p.podsMutex.Lock()
 	p.pods[podKey] = pod.DeepCopy()
 	p.podStatus[podKey] = &InstanceInfo{
-		PodName:      pod.Name,
-		Namespace:    pod.Namespace,
-		Status:       string(PodStarting),
-		CreationTime: time.Now(),
+		PodName:        pod.Name,
+		Namespace:      pod.Namespace,
+		Status:         string(PodStarting),
+		CreationTime:   time.Now(),
+		RequestedPorts: requestedPorts,
 	}
 	p.podsMutex.Unlock()
 
@@ -266,18 +271,60 @@ func (p *Provider) updatePodWithRunPodInfo(pod *v1.Pod, podID string, costPerHr 
 		podInfo.Status = string(PodStarting)
 		p.podStatus[podKey] = podInfo
 	} else {
+		// Get requested ports for new InstanceInfo
+		requestedPorts := p.runpodClient.GetRequestedPorts(pod)
 		p.podStatus[podKey] = &InstanceInfo{
-			ID:           podID,
-			CostPerHr:    costPerHr,
-			PodName:      pod.Name,
-			Namespace:    pod.Namespace,
-			Status:       string(PodStarting),
-			CreationTime: time.Now(),
+			ID:             podID,
+			CostPerHr:      costPerHr,
+			PodName:        pod.Name,
+			Namespace:      pod.Namespace,
+			Status:         string(PodStarting),
+			CreationTime:   time.Now(),
+			RequestedPorts: requestedPorts,
 		}
 	}
 	p.podsMutex.Unlock()
 
 	return nil
+}
+
+// checkPortsExposed checks if the requested ports are actually exposed by comparing
+// with RunPod's port mappings
+func (p *Provider) checkPortsExposed(portMappings []map[string]interface{}, requestedPorts []string) bool {
+	// If no ports were requested, consider it ready (no port requirement)
+	if len(requestedPorts) == 0 {
+		return true
+	}
+	
+	// If no ports are exposed by RunPod, but ports were requested, not ready
+	if len(portMappings) == 0 {
+		return false
+	}
+	
+	// Extract the exposed ports from RunPod's port mappings
+	exposedPorts := make(map[string]bool)
+	for _, mapping := range portMappings {
+		if internalPort, ok := mapping["internalPort"]; ok {
+			if portNum, ok := internalPort.(float64); ok {
+				// RunPod typically exposes all ports as TCP or HTTP
+				// Check both possibilities
+				exposedPorts[fmt.Sprintf("%.0f/tcp", portNum)] = true
+				exposedPorts[fmt.Sprintf("%.0f/http", portNum)] = true
+			}
+		}
+	}
+	
+	// Check if all requested ports are exposed
+	for _, requestedPort := range requestedPorts {
+		if !exposedPorts[requestedPort] {
+			p.logger.Debug("Requested port not yet exposed",
+				"requestedPort", requestedPort,
+				"exposedPorts", exposedPorts)
+			return false
+		}
+	}
+	
+	return true
 }
 
 // Resize implements the api.AttachIO interface for terminal resizing
@@ -349,14 +396,26 @@ func (p *Provider) GetPodStatus(ctx context.Context, namespace, name string) (*v
 
 	p.podsMutex.RLock()
 	podInfo, exists := p.podStatus[podKey]
+	pod := p.pods[podKey]
 	p.podsMutex.RUnlock()
 
 	if !exists {
 		return nil, fmt.Errorf("pod status not found for %s", podKey)
 	}
 
+	// For GetPodStatus, we should check current port exposure if the pod is running
+	hasExposedPorts := true // Default to true for non-running states
+	if podInfo.Status == string(PodRunning) && len(podInfo.RequestedPorts) > 0 && pod != nil {
+		// Get current port exposure status from RunPod
+		if podID := pod.Annotations[PodIDAnnotation]; podID != "" {
+			if detailedStatus, err := p.runpodClient.GetDetailedPodStatus(podID); err == nil {
+				hasExposedPorts = p.checkPortsExposed(detailedStatus.PortMappings, podInfo.RequestedPorts)
+			}
+		}
+	}
+
 	// Translate RunPod status to Kubernetes PodStatus
-	return p.translateRunPodStatus(podInfo.Status, podInfo.StatusMessage), nil
+	return p.translateRunPodStatus(podInfo.Status, podInfo.StatusMessage, hasExposedPorts), nil
 }
 
 // GetPods retrieves a list of all pods running on the provider
@@ -507,10 +566,10 @@ func (p *Provider) updateAllPodStatuses() {
 			continue
 		}
 
-		// Check current status from RunPod API
-		status, err := p.runpodClient.GetPodStatusREST(podID)
+		// Get detailed status from RunPod API (includes port mappings)
+		detailedStatus, err := p.runpodClient.GetDetailedPodStatus(podID)
 		if err != nil {
-			p.logger.Error("Failed to get pod status from RunPod API",
+			p.logger.Error("Failed to get detailed pod status from RunPod API",
 				"pod", pod.Name, "namespace", pod.Namespace,
 				"runpodID", podID, "error", err)
 
@@ -518,14 +577,22 @@ func (p *Provider) updateAllPodStatuses() {
 			continue
 		}
 
+		// Convert detailed status to our PodStatus enum
+		status := PodStatus(detailedStatus.DesiredStatus)
+
 		// If status is NOT_FOUND, use shared handler
 		if status == PodNotFound {
 			p.handleMissingRunPodInstance(pod, podKey, podID)
 			continue // Skip the rest of the status update logic
 		}
 
-		// Update pod info if status changed
-		if string(status) != podInfo.Status {
+		// Check if the requested ports are exposed
+		hasExposedPorts := p.checkPortsExposed(detailedStatus.PortMappings, podInfo.RequestedPorts)
+
+		// Update pod info if status changed OR port exposure changed
+		statusChanged := string(status) != podInfo.Status
+		
+		if statusChanged || hasExposedPorts {
 			// Update status in our tracking map
 			p.podsMutex.Lock()
 			oldStatus := podInfo.Status
@@ -533,8 +600,8 @@ func (p *Provider) updateAllPodStatuses() {
 			p.podStatus[podKey] = podInfo
 			p.podsMutex.Unlock()
 
-			// Create the new Kubernetes PodStatus with proper error handling
-			newStatus := p.translateRunPodStatus(string(status), podInfo.StatusMessage)
+			// Create the new Kubernetes PodStatus with port exposure information
+			newStatus := p.translateRunPodStatus(string(status), podInfo.StatusMessage, hasExposedPorts)
 
 			// Keep existing container state if possible
 			if len(pod.Status.ContainerStatuses) > 0 && newStatus != nil {
@@ -542,11 +609,22 @@ func (p *Provider) updateAllPodStatuses() {
 				p.mergeContainerStatus(newStatus, pod.Status.ContainerStatuses[0])
 			}
 
-			p.logger.Info("Pod status changed",
-				"pod", pod.Name,
-				"namespace", pod.Namespace,
-				"prevStatus", oldStatus,
-				"newStatus", string(status))
+			if statusChanged {
+				p.logger.Info("Pod status changed",
+					"pod", pod.Name,
+					"namespace", pod.Namespace,
+					"prevStatus", oldStatus,
+					"newStatus", string(status),
+					"portsExposed", hasExposedPorts,
+					"requestedPorts", podInfo.RequestedPorts)
+			} else {
+				p.logger.Info("Port exposure changed",
+					"pod", pod.Name,
+					"namespace", pod.Namespace,
+					"status", string(status),
+					"portsExposed", hasExposedPorts,
+					"requestedPorts", podInfo.RequestedPorts)
+			}
 
 			// Handle pod completion if needed
 			if status == PodExited {
@@ -673,8 +751,8 @@ func (p *Provider) handlePodCompletion(pod *v1.Pod, podInfo *InstanceInfo) {
 	// Determine if success or failure
 	isSuccess := IsSuccessfulCompletion(status)
 
-	// Update pod status
-	podStatus := p.translateRunPodStatus(string(PodExited), exitMessage)
+	// Update pod status - for exited pods, port exposure is not relevant
+	podStatus := p.translateRunPodStatus(string(PodExited), exitMessage, true)
 	if isSuccess {
 		podStatus.Phase = v1.PodSucceeded
 		if len(podStatus.ContainerStatuses) > 0 && podStatus.ContainerStatuses[0].State.Terminated != nil {
@@ -1390,8 +1468,8 @@ func (p *Provider) handleMissingRunPodInstance(pod *v1.Pod, podKey string, runpo
 			"error", err)
 	}
 
-	// Update pod status to Failed to prevent redeployment
-	failedStatus := p.translateRunPodStatus(string(PodNotFound), "RunPod instance was deleted")
+	// Update pod status to Failed to prevent redeployment - port exposure is not relevant for failed pods
+	failedStatus := p.translateRunPodStatus(string(PodNotFound), "RunPod instance was deleted", true)
 	err = p.updatePodStatusInK8s(currentPod, failedStatus)
 	if err != nil {
 		p.logger.Error("Failed to update pod status to Failed",
@@ -1474,7 +1552,7 @@ func (p *Provider) updatePodStatusInK8s(pod *v1.Pod, newStatus *v1.PodStatus) er
 }
 
 // translateRunPodStatus converts a RunPod status string to a Kubernetes PodStatus
-func (p *Provider) translateRunPodStatus(runpodStatus string, statusMessage string) *v1.PodStatus {
+func (p *Provider) translateRunPodStatus(runpodStatus string, statusMessage string, hasExposedPorts bool) *v1.PodStatus {
 	now := metav1.NewTime(time.Now())
 	startTime := metav1.NewTime(now.Add(-1 * time.Hour)) // Default start time
 
@@ -1491,18 +1569,32 @@ func (p *Provider) translateRunPodStatus(runpodStatus string, statusMessage stri
 	// Default to Unknown phase
 	phase := v1.PodUnknown
 
-	// Set container state and phase based on RunPod status
+	// Set container state and phase based on RunPod status and port exposure
 	switch runpodStatus {
 	case string(PodRunning):
-		phase = v1.PodRunning
-		containerStatus.State = v1.ContainerState{
-			Running: &v1.ContainerStateRunning{
-				StartedAt: startTime,
-			},
+		if hasExposedPorts {
+			// Container is truly running and ready
+			phase = v1.PodRunning
+			containerStatus.State = v1.ContainerState{
+				Running: &v1.ContainerStateRunning{
+					StartedAt: startTime,
+				},
+			}
+			containerStatus.Ready = true
+			trueVal := true
+			containerStatus.Started = &trueVal
+		} else {
+			// RunPod reports RUNNING but ports not yet exposed - keep in pending state
+			phase = v1.PodPending
+			containerStatus.State = v1.ContainerState{
+				Waiting: &v1.ContainerStateWaiting{
+					Reason:  "ContainerCreating",
+					Message: "Container reported as running but ports not yet exposed",
+				},
+			}
+			falseVal := false
+			containerStatus.Started = &falseVal
 		}
-		containerStatus.Ready = true
-		trueVal := true
-		containerStatus.Started = &trueVal
 
 	case string(PodStarting):
 		phase = v1.PodPending

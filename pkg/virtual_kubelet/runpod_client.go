@@ -39,6 +39,7 @@ const (
 	GpuMemoryAnnotation             = "runpod.io/required-gpu-memory"
 	ContainerRegistryAuthAnnotation = "runpod.io/container-registry-auth-id"
 	DatacenterAnnotation            = "runpod.io/datacenter-ids" // Comma-separated list preferred
+	PortsAnnotation                 = "runpod.io/ports"          // Manual override for port specifications
 	// DefaultMaxPrice for GPU
 	DefaultMaxPrice = 0.5
 
@@ -99,20 +100,22 @@ type InstanceInfo struct {
 	StatusMessage string
 	ExitCode      int
 	CreationTime  time.Time
+	RequestedPorts []string  // Ports that were requested for this pod
 }
 
 type DetailedStatus struct {
-	ID            string            `json:"id"`
-	Name          string            `json:"name"`
-	DesiredStatus string            `json:"desiredStatus"`
-	CurrentStatus string            `json:"currentStatus,omitempty"`
-	CostPerHr     float64           `json:"costPerHr"`
-	Image         string            `json:"image"`
-	Env           map[string]string `json:"env"`
-	MachineID     string            `json:"machineId"`
-	Runtime       *RuntimeInfo      `json:"runtime,omitempty"`
-	Machine       *MachineInfo      `json:"machine,omitempty"`
-	LastError     string            `json:"lastError,omitempty"`
+	ID            string                   `json:"id"`
+	Name          string                   `json:"name"`
+	DesiredStatus string                   `json:"desiredStatus"`
+	CurrentStatus string                   `json:"currentStatus,omitempty"`
+	CostPerHr     float64                  `json:"costPerHr"`
+	Image         string                   `json:"image"`
+	Env           map[string]string        `json:"env"`
+	MachineID     string                   `json:"machineId"`
+	PortMappings  []map[string]interface{} `json:"portMappings"`
+	Runtime       *RuntimeInfo             `json:"runtime,omitempty"`
+	Machine       *MachineInfo             `json:"machine,omitempty"`
+	LastError     string                   `json:"lastError,omitempty"`
 }
 
 type RuntimeInfo struct {
@@ -1090,6 +1093,61 @@ func extractGPUMemory(memStr string) int {
 	return defaultMemory
 }
 
+// extractPortsFromPod extracts port specifications from a Kubernetes pod
+// and converts them to RunPod format (e.g., "8080/http", "5432/tcp")
+func (c *Client) extractPortsFromPod(pod *v1.Pod) []string {
+	var ports []string
+	
+	// Common HTTP ports that should default to HTTP protocol
+	httpPorts := map[int32]bool{
+		80:   true,
+		443:  true,
+		8080: true,
+		8000: true,
+		3000: true,
+		5000: true,
+		8888: true,
+		9000: true,
+	}
+	
+	// Process all containers in the pod
+	for _, container := range pod.Spec.Containers {
+		for _, port := range container.Ports {
+			// Skip unsupported protocols (RunPod only supports TCP-based protocols)
+			if port.Protocol != "" && port.Protocol != v1.ProtocolTCP {
+				c.logger.Warn("Skipping unsupported protocol",
+					"pod", pod.Name,
+					"namespace", pod.Namespace,
+					"port", port.ContainerPort,
+					"protocol", port.Protocol)
+				continue
+			}
+			
+			// Determine protocol - default to TCP unless it's a common HTTP port
+			protocol := "tcp"
+			if httpPorts[port.ContainerPort] {
+				protocol = "http"
+				c.logger.Info("Auto-detecting HTTP protocol for common port",
+					"pod", pod.Name,
+					"namespace", pod.Namespace,
+					"port", port.ContainerPort,
+					"note", "Use annotation 'runpod.io/ports' to override if needed")
+			}
+			
+			// Format as RunPod expects: "port/protocol"
+			portSpec := fmt.Sprintf("%d/%s", port.ContainerPort, protocol)
+			ports = append(ports, portSpec)
+			
+			c.logger.Debug("Adding port to RunPod deployment",
+				"pod", pod.Name,
+				"namespace", pod.Namespace,
+				"portSpec", portSpec)
+		}
+	}
+	
+	return ports
+}
+
 // PrepareRunPodParameters prepares parameters for RunPod deployment
 // Update PrepareRunPodParameters to use the clientset from the Client struct
 func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]interface{}, error) {
@@ -1109,6 +1167,7 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 	containerRegistryAuthId := getAnnotation(ContainerRegistryAuthAnnotation, "")
 	templateId := getAnnotation(TemplateIdAnnotation, "")
 	datacenterID := getAnnotation(DatacenterAnnotation, "")
+	portsOverride := getAnnotation(PortsAnnotation, "")
 
 	// Determine minimum GPU memory required
 	memStr := getAnnotation(GpuMemoryAnnotation, "")
@@ -1143,6 +1202,26 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 	// Use the pod name as the RunPod name
 	runpodName := pod.Name
 
+	// Extract ports from pod specification
+	ports := c.extractPortsFromPod(pod)
+	
+	// Allow manual override via annotation
+	if portsOverride != "" {
+		// Parse the comma-separated list of ports
+		overridePorts := strings.Split(portsOverride, ",")
+		// Trim spaces from each port spec
+		for i, port := range overridePorts {
+			overridePorts[i] = strings.TrimSpace(port)
+		}
+		
+		c.logger.Info("Using manual port specification from annotation",
+			"pod", pod.Name,
+			"namespace", pod.Namespace,
+			"manualPorts", overridePorts,
+			"autoDetectedPorts", ports)
+		ports = overridePorts
+	}
+
 	// Default values
 	volumeInGb := 0
 	containerDiskInGb := 15
@@ -1157,6 +1236,15 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 		"name":              runpodName,
 		"imageName":         imageName,
 		"env":               formattedEnvVars,
+	}
+	
+	// Add ports to parameters if any were specified
+	if len(ports) > 0 {
+		params["ports"] = ports
+		c.logger.Info("Configuring RunPod deployment with ports",
+			"pod", pod.Name,
+			"namespace", pod.Namespace,
+			"ports", ports)
 	}
 
 	// Add datacenter IDs if specified in pod annotations
@@ -1173,5 +1261,23 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 		params["containerRegistryAuthId"] = containerRegistryAuthId
 	}
 
+	// Return both params and the ports that were requested
+	// We'll need to update the callers to handle the ports
 	return params, nil
+}
+
+// GetRequestedPorts extracts the ports that were configured for a pod deployment
+// This is a helper to get ports separately when needed
+func (c *Client) GetRequestedPorts(pod *v1.Pod) []string {
+	// Check for annotation override first
+	if portsOverride, exists := pod.Annotations[PortsAnnotation]; exists && portsOverride != "" {
+		overridePorts := strings.Split(portsOverride, ",")
+		for i, port := range overridePorts {
+			overridePorts[i] = strings.TrimSpace(port)
+		}
+		return overridePorts
+	}
+	
+	// Otherwise extract from pod spec
+	return c.extractPortsFromPod(pod)
 }
