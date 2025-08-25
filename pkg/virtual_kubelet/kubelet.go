@@ -140,6 +140,7 @@ func (p *Provider) CreatePod(ctx context.Context, pod *v1.Pod) error {
 		Status:         string(PodStarting),
 		CreationTime:   time.Now(),
 		RequestedPorts: requestedPorts,
+		PortsExposed:   false,
 	}
 	p.podsMutex.Unlock()
 
@@ -281,6 +282,7 @@ func (p *Provider) updatePodWithRunPodInfo(pod *v1.Pod, podID string, costPerHr 
 			Status:         string(PodStarting),
 			CreationTime:   time.Now(),
 			RequestedPorts: requestedPorts,
+			PortsExposed:   false,
 		}
 	}
 	p.podsMutex.Unlock()
@@ -595,12 +597,14 @@ func (p *Provider) updateAllPodStatuses() {
 
 		// Update pod info if status changed OR port exposure changed
 		statusChanged := string(status) != podInfo.Status
+		portsExposureChanged := hasExposedPorts != podInfo.PortsExposed
 		
-		if statusChanged || hasExposedPorts {
+		if statusChanged || portsExposureChanged {
 			// Update status in our tracking map
 			p.podsMutex.Lock()
 			oldStatus := podInfo.Status
 			podInfo.Status = string(status)
+			podInfo.PortsExposed = hasExposedPorts
 			p.podStatus[podKey] = podInfo
 			p.podsMutex.Unlock()
 
@@ -621,7 +625,7 @@ func (p *Provider) updateAllPodStatuses() {
 					"newStatus", string(status),
 					"portsExposed", hasExposedPorts,
 					"requestedPorts", podInfo.RequestedPorts)
-			} else {
+			} else if portsExposureChanged {
 				p.logger.Info("Port exposure changed",
 					"pod", pod.Name,
 					"namespace", pod.Namespace,
@@ -1204,6 +1208,7 @@ func (p *Provider) LoadRunning() {
 					Status:       podStatus,
 					CostPerHr:    instance.CostPerHr,
 					CreationTime: pod.CreationTimestamp.Time,
+					PortsExposed: false,
 				}
 			} else {
 				// Pod has ID but instance not found in RunPod - use shared handler
@@ -1222,6 +1227,7 @@ func (p *Provider) LoadRunning() {
 				Namespace:    pod.Namespace,
 				Status:       string(PodStarting),
 				CreationTime: pod.CreationTimestamp.Time,
+				PortsExposed: false,
 			}
 
 			// Don't try to deploy here - let the existing periodic processor handle it
