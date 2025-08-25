@@ -232,6 +232,15 @@ metadata:
     runpod.io/ports: "8080/tcp,9000/http"  # Override auto-detection
 ```
 
+#### RunPod Port Behavior
+
+RunPod handles HTTP and TCP ports differently, which affects readiness detection:
+
+- **HTTP ports** (`/http`): Exposed through RunPod's web proxy system and do not appear in the API's `portMappings` field. The kubelet assumes these are ready when the pod is running.
+- **TCP ports** (`/tcp`): Exposed with direct port mappings and appear in the API's `portMappings` field. The kubelet waits for these to be explicitly mapped before marking the pod as ready.
+
+This means pods with HTTP ports will transition to ready state faster, while pods with TCP ports (like SSH, databases) will wait for the actual port mapping to be established.
+
 ## 🛠️ Development
 
 ### Building from source
