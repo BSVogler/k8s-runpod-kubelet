@@ -290,7 +290,7 @@ func (p *Provider) updatePodWithRunPodInfo(pod *v1.Pod, podID string, costPerHr 
 
 // checkPortsExposed checks if the requested ports are actually exposed by comparing
 // with RunPod's port mappings
-func (p *Provider) checkPortsExposed(portMappings []map[string]interface{}, requestedPorts []string) bool {
+func (p *Provider) checkPortsExposed(portMappings map[string]int, requestedPorts []string) bool {
 	// If no ports were requested, consider it ready (no port requirement)
 	if len(requestedPorts) == 0 {
 		return true
@@ -302,16 +302,13 @@ func (p *Provider) checkPortsExposed(portMappings []map[string]interface{}, requ
 	}
 	
 	// Extract the exposed ports from RunPod's port mappings
+	// The map key is the internal port (as a string), value is the external port
 	exposedPorts := make(map[string]bool)
-	for _, mapping := range portMappings {
-		if internalPort, ok := mapping["internalPort"]; ok {
-			if portNum, ok := internalPort.(float64); ok {
-				// RunPod typically exposes all ports as TCP or HTTP
-				// Check both possibilities
-				exposedPorts[fmt.Sprintf("%.0f/tcp", portNum)] = true
-				exposedPorts[fmt.Sprintf("%.0f/http", portNum)] = true
-			}
-		}
+	for internalPort := range portMappings {
+		// RunPod returns the internal port as a string key
+		// We need to match it with the requested format "port/protocol"
+		exposedPorts[internalPort+"/tcp"] = true
+		exposedPorts[internalPort+"/http"] = true
 	}
 	
 	// Check if all requested ports are exposed

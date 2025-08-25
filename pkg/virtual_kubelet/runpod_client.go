@@ -104,18 +104,18 @@ type InstanceInfo struct {
 }
 
 type DetailedStatus struct {
-	ID            string                   `json:"id"`
-	Name          string                   `json:"name"`
-	DesiredStatus string                   `json:"desiredStatus"`
-	CurrentStatus string                   `json:"currentStatus,omitempty"`
-	CostPerHr     float64                  `json:"costPerHr"`
-	Image         string                   `json:"image"`
-	Env           map[string]string        `json:"env"`
-	MachineID     string                   `json:"machineId"`
-	PortMappings  []map[string]interface{} `json:"portMappings"`
-	Runtime       *RuntimeInfo             `json:"runtime,omitempty"`
-	Machine       *MachineInfo             `json:"machine,omitempty"`
-	LastError     string                   `json:"lastError,omitempty"`
+	ID            string            `json:"id"`
+	Name          string            `json:"name"`
+	DesiredStatus string            `json:"desiredStatus"`
+	CurrentStatus string            `json:"currentStatus,omitempty"`
+	CostPerHr     float64           `json:"costPerHr"`
+	Image         string            `json:"image"`
+	Env           map[string]string `json:"env"`
+	MachineID     string            `json:"machineId"`
+	PortMappings  map[string]int    `json:"portMappings"`
+	Runtime       *RuntimeInfo      `json:"runtime,omitempty"`
+	Machine       *MachineInfo      `json:"machine,omitempty"`
+	LastError     string            `json:"lastError,omitempty"`
 }
 
 type RuntimeInfo struct {
