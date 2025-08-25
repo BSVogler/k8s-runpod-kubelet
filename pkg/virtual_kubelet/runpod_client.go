@@ -101,6 +101,7 @@ type InstanceInfo struct {
 	ExitCode      int
 	CreationTime  time.Time
 	RequestedPorts []string  // Ports that were requested for this pod
+	PortsExposed  bool      // Tracks whether requested ports are currently exposed
 }
 
 type DetailedStatus struct {
