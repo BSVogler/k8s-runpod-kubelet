@@ -4,7 +4,7 @@ permissions:
   contents: read
 on:
   push:
-    branches: [ "master" ]
+    branches: [ "master", "develop" ]
   pull_request:
     branches: [ "master" ]
 jobs:
@@ -28,10 +28,18 @@ jobs:
         TAG=$(date +%s)
         echo "TAG=$TAG" >> $GITHUB_ENV
         REPO_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-        docker build . --file Dockerfile --tag bsvogler/runpod-kubelet:$TAG --tag ghcr.io/$REPO_OWNER/runpod-kubelet:$TAG --tag ghcr.io/$REPO_OWNER/runpod-kubelet:latest
+        if [ "${{ github.ref }}" = "refs/heads/master" ]; then
+          docker build . --file Dockerfile --tag bsvogler/runpod-kubelet:$TAG --tag ghcr.io/$REPO_OWNER/runpod-kubelet:$TAG --tag ghcr.io/$REPO_OWNER/runpod-kubelet:latest
+        else
+          docker build . --file Dockerfile --tag bsvogler/runpod-kubelet:$TAG --tag ghcr.io/$REPO_OWNER/runpod-kubelet:$TAG --tag ghcr.io/$REPO_OWNER/runpod-kubelet:${{ github.ref_name }}
+        fi
         
     - name: Push to GitHub Container Registry
       run: |
         REPO_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
         docker push ghcr.io/$REPO_OWNER/runpod-kubelet:${{ env.TAG }}
-        docker push ghcr.io/$REPO_OWNER/runpod-kubelet:latest
+        if [ "${{ github.ref }}" = "refs/heads/master" ]; then
+          docker push ghcr.io/$REPO_OWNER/runpod-kubelet:latest
+        else
+          docker push ghcr.io/$REPO_OWNER/runpod-kubelet:${{ github.ref_name }}
+        fi
