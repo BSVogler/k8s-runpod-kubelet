@@ -204,6 +204,35 @@ Experimental. Implemented here but not working with the RunPod API.
     runpod.io/container-registry-auth-id: "your-auth-id"  # For private registries. Should be supported in theory but only working solution so far found when using template id and preregistering.
 ```
 
+### Port Configuration
+
+The kubelet automatically handles port exposure from your standard Kubernetes pod specifications.
+
+```yaml
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: app
+    image: nginx:latest
+    ports:
+    - containerPort: 80    # Auto-detected as HTTP
+    - containerPort: 5432  # Auto-detected as TCP
+```
+
+**Auto-detected HTTP ports:** 80, 443, 8080, 8000, 3000, 5000, 8888, 9000  
+**Everything else:** TCP
+
+#### Manual Override
+
+Use the `runpod.io/ports` annotation to override auto-detection:
+
+```yaml
+metadata:
+  annotations:
+    runpod.io/ports: "8080/tcp,9000/http"  # Override auto-detection
+```
+
 ### Monitoring
 
 Monitor the controller using Kubernetes tools:
