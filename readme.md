@@ -1,4 +1,4 @@
-# 🚀 Virtual Kubelet for RunPod
+# Virtual Kubelet for RunPod
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/bsvogler/k8s-runpod-kubelet)](https://goreportcard.com/report/github.com/bsvogler/k8s-runpod-kubelet)
 [![License](https://img.shields.io/github/license/bsvogler/k8s-runpod-kubelet)](LICENSE)
@@ -79,7 +79,7 @@ helm install runpod-kubelet oci://ghcr.io/bsvogler/helm/runpod-kubelet \
   --set runpod.apiKey=<your-runpod-api-key>
 ```
 
-#### Using an existing secret
+#### Configure secret for the API key
 
 ```bash
 # Create secret with RunPod API key
@@ -93,7 +93,7 @@ helm install runpod-kubelet oci://ghcr.io/bsvogler/charts/runpod-kubelet \
   --set runpod.existingSecret=runpod-api-secret
 ```
 
-### Using kubectl
+### Installation using kubectl
 
 ```bash
 # Create secret with RunPod API key
@@ -105,7 +105,7 @@ kubectl create secret generic runpod-kubelet-secrets \
 kubectl apply -f https://raw.githubusercontent.com/bsvogler/k8s-runpod-kubelet/main/deploy/kubelet.yaml
 ```
 
-### Configuration
+### Virtual Node Configuration
 
 #### Helm Configuration
 
@@ -158,8 +158,7 @@ Common configuration options:
 
 ## 🔍 Usage
 
-Once installed, the controller will register a virtual node named `virtual-runpod` in your cluster. To schedule a pod to
-RunPod, add the appropriate node selector and tolerations:
+Once installed, the controller will register a virtual node named `virtual-runpod` in your cluster. It is tainted by default with (virtual-kubelet.io/provider=runpod:NoSchedule) to avoid costs. To allow scheduling a pod to RunPod, add the appropriate *tolerations* and if you want to force the usage of RunPod add a node selector for the virtual kubelet. Example:
 
 ```yaml
 apiVersion: v1
@@ -233,27 +232,6 @@ metadata:
     runpod.io/ports: "8080/tcp,9000/http"  # Override auto-detection
 ```
 
-### Monitoring
-
-Monitor the controller using Kubernetes tools:
-
-```bash
-# Check logs (Helm installation)
-kubectl logs -n kube-system -l app.kubernetes.io/name=runpod-kubelet
-
-# Check logs (kubectl installation)
-kubectl logs -n kube-system deployment/runpod-kubelet
-
-# Health checks
-kubectl port-forward -n kube-system deployment/runpod-kubelet 8080:8080
-curl http://localhost:8080/healthz  # Liveness probe
-curl http://localhost:8080/readyz   # Readiness probe
-
-# Check virtual node status
-kubectl get nodes
-kubectl describe node runpod-node
-```
-
 ## 🛠️ Development
 
 ### Building from source
@@ -297,6 +275,7 @@ The controller consists of several components:
 
 ## ⚠️ Limitations
 
+- Unofficial integration - awaiting potential RunPod collaboration
 - No direct container exec/attach support (RunPod doesn't provide this capability)
 - Container logs not directly supported by RunPod
 - Job-specific functionality is limited to what RunPod API exposes
@@ -314,4 +293,4 @@ This project is licensed under a Non-Commercial License - see the [LICENSE](LICE
 - **Required**: License and copyright notice
 
 For commercial licensing inquiries or to discuss custom development work as a freelancer, please contact me at
-engineering@benediktsvogler.com or via [benediktsvogler.com](https://benediktsvogler.com).
+engineering@benediktsvogler.com.
