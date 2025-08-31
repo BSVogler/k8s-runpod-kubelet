@@ -210,8 +210,19 @@ func (p *Provider) DeployPodToRunPod(pod *v1.Pod) error {
 		return err
 	}
 
-	// Log the parameters being sent to RunPod
-	paramsJSON, _ := json.MarshalIndent(params, "", "  ")
+	// Log the parameters being sent to RunPod (excluding env vars for security)
+	logParams := make(map[string]interface{})
+	for k, v := range params {
+		if k != "env" { // Exclude environment variables from logs
+			logParams[k] = v
+		} else {
+			// Just log the count of environment variables
+			if envMap, ok := v.(map[string]string); ok {
+				logParams["envCount"] = len(envMap)
+			}
+		}
+	}
+	paramsJSON, _ := json.MarshalIndent(logParams, "", "  ")
 	p.logger.Info("Deploying pod with parameters",
 		"pod", pod.Name,
 		"namespace", pod.Namespace,
