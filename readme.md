@@ -196,7 +196,7 @@ The kubelet will check the pod first, then fall back to the job annotations if n
 metadata:
   annotations:
     runpod.io/required-gpu-memory: "16" # Minimum GPU memory in GB
-    runpod.io/container-registry-auth-id: "your-auth-id"  # For private registries. Works as of August 2025 and takes precedence over template authentication.
+    runpod.io/container-registry-auth-id: "your-auth-id"  # For private registries. Works as of August 2025 and takes precedence over template authentication. Note: RunPod may return "access forbidden" errors for up to 4 minutes after setting registry auth before it becomes active.
     runpod.io/templateId: "your-template-id"  # Use a specific RunPod template including a preregistered authentication.
     runpod.io/datacenter-ids: "datacenter1,datacenter2" # Comma-separated list of allowed datacenter IDs
 ```
