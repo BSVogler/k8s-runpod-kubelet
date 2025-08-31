@@ -192,15 +192,15 @@ You can customize the RunPod deployment using annotations. Add annotations to th
 metadata:
   annotations:
     runpod.io/required-gpu-memory: "16" # Minimum GPU memory in GB
-    runpod.io/templateId: "your-template-id"  # Use a specific RunPod template to use a preregistered authentication.
+    runpod.io/container-registry-auth-id: "your-auth-id"  # For private registries. Works as of August 2025 and takes precedence over template authentication.
+    runpod.io/templateId: "your-template-id"  # Use a specific RunPod template including a preregistered authentication.
     runpod.io/datacenter-ids: "datacenter1,datacenter2" # Comma-separated list of allowed datacenter IDs
 ```
 
-Experimental. Implemented here but not working with the RunPod API.
+Experimental:
 
 ```yaml
-    runpod.io/cloud-type: "COMMUNITY"   # SECURE or COMMUNITY.should in THEORY support COMMUNITY and STANDARD but in tests only STANDARD lead to results when using the API. Therefore, defaults to STANDARD.
-    runpod.io/container-registry-auth-id: "your-auth-id"  # For private registries. Should be supported in theory but only working solution so far found when using template id and preregistering.
+    runpod.io/cloud-type: "COMMUNITY"   # SECURE or COMMUNITY. Note: In tests, only SECURE consistently works with the API, so it defaults to SECURE.
 ```
 
 ### Port Configuration
