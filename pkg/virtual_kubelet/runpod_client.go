@@ -1050,7 +1050,17 @@ func (c *Client) ExtractEnvVars(pod *v1.Pod) ([]RunPodEnv, error) {
 
 // getOwnerJob retrieves the owner job of a pod if it exists
 func (c *Client) getOwnerJob(pod *v1.Pod) *batchv1.Job {
+	c.logger.Debug("Looking for owner job for pod", 
+		"pod", pod.Name, 
+		"namespace", pod.Namespace,
+		"ownerReferences", len(pod.OwnerReferences))
+	
 	for _, owner := range pod.OwnerReferences {
+		c.logger.Debug("Found owner reference", 
+			"kind", owner.Kind, 
+			"name", owner.Name, 
+			"uid", owner.UID)
+			
 		if owner.Kind == "Job" {
 			job, err := c.clientset.BatchV1().Jobs(pod.Namespace).Get(
 				context.Background(),
@@ -1058,10 +1068,28 @@ func (c *Client) getOwnerJob(pod *v1.Pod) *batchv1.Job {
 				metav1.GetOptions{},
 			)
 			if err == nil {
-				return job
+				// Verify the UID matches to ensure we have the correct job instance
+				if job.UID == owner.UID {
+					c.logger.Debug("Found owner job with annotations", 
+						"job", job.Name, 
+						"jobUID", job.UID,
+						"annotations", len(job.Annotations))
+					return job
+				} else {
+					c.logger.Debug("Job found but UID mismatch", 
+						"job", job.Name,
+						"expectedUID", owner.UID,
+						"actualUID", job.UID)
+				}
+			} else {
+				c.logger.Warn("Failed to get owner job", 
+					"job", owner.Name, 
+					"namespace", pod.Namespace, 
+					"error", err)
 			}
 		}
 	}
+	c.logger.Debug("No owner job found for pod", "pod", pod.Name)
 	return nil
 }
 
