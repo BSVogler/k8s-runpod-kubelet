@@ -26,7 +26,7 @@ type Client struct {
 	baseGraphqlURL string
 	baseRESTURL    string
 	logger         *slog.Logger
-	clientset      *kubernetes.Clientset // Add clientset field
+	clientset      kubernetes.Interface // Add clientset field
 }
 
 // Constants for RunPod integration
@@ -105,18 +105,20 @@ type InstanceInfo struct {
 }
 
 type DetailedStatus struct {
-	ID            string            `json:"id"`
-	Name          string            `json:"name"`
-	DesiredStatus string            `json:"desiredStatus"`
-	CurrentStatus string            `json:"currentStatus,omitempty"`
-	CostPerHr     float64           `json:"costPerHr"`
-	Image         string            `json:"image"`
-	Env           map[string]string `json:"env"`
-	MachineID     string            `json:"machineId"`
-	PortMappings  map[string]int    `json:"portMappings"`
-	Runtime       *RuntimeInfo      `json:"runtime,omitempty"`
-	Machine       *MachineInfo      `json:"machine,omitempty"`
-	LastError     string            `json:"lastError,omitempty"`
+	ID                     string            `json:"id"`
+	Name                   string            `json:"name"`
+	DesiredStatus          string            `json:"desiredStatus"`
+	CurrentStatus          string            `json:"currentStatus,omitempty"`
+	CostPerHr              float64           `json:"costPerHr"`
+	Image                  string            `json:"image"`
+	Env                    map[string]string `json:"env"`
+	MachineID              string            `json:"machineId"`
+	PortMappings           map[string]int    `json:"portMappings"`
+	Runtime                *RuntimeInfo      `json:"runtime,omitempty"`
+	Machine                *MachineInfo      `json:"machine,omitempty"`
+	LastError              string            `json:"lastError,omitempty"`
+	ContainerRegistryAuthId string           `json:"containerRegistryAuthId,omitempty"`
+	TemplateId             string            `json:"templateId,omitempty"`
 }
 
 type RuntimeInfo struct {
@@ -134,7 +136,7 @@ type MachineInfo struct {
 }
 
 // NewRunPodClient creates a new RunPod API client
-func NewRunPodClient(logger *slog.Logger, clientset *kubernetes.Clientset) *Client {
+func NewRunPodClient(logger *slog.Logger, clientset kubernetes.Interface) *Client {
 	apiKey := os.Getenv("RUNPOD_API_KEY")
 	if apiKey == "" {
 		logger.Error("RUNPOD_API_KEY environment variable is not set")
@@ -572,12 +574,14 @@ func (c *Client) DeployPodREST(params map[string]interface{}) (string, float64, 
 	}
 
 	var response struct {
-		ID            string  `json:"id"`
-		CostPerHr     float64 `json:"costPerHr"` // JSON returns this as a string
-		MachineID     string  `json:"machineId"`
-		Name          string  `json:"name"`
-		DesiredStatus string  `json:"desiredStatus"`
-		Image         string  `json:"image"` // Change from ImageName to match JSON
+		ID                     string  `json:"id"`
+		CostPerHr              float64 `json:"costPerHr"` // JSON returns this as a string
+		MachineID              string  `json:"machineId"`
+		Name                   string  `json:"name"`
+		DesiredStatus          string  `json:"desiredStatus"`
+		Image                  string  `json:"image"` // Change from ImageName to match JSON
+		ContainerRegistryAuthId string `json:"containerRegistryAuthId,omitempty"`
+		TemplateId             string  `json:"templateId,omitempty"`
 
 		Machine struct {
 			DataCenterID string `json:"dataCenterId"`
@@ -599,16 +603,31 @@ func (c *Client) DeployPodREST(params map[string]interface{}) (string, float64, 
 		return "", 0, fmt.Errorf("pod deployment failed: %s", string(body))
 	}
 
-	c.logger.Info("Pod deployed successfully",
+	// Log deployment success with all relevant fields
+	logFields := []interface{}{
 		"podId", response.ID,
 		"costPerHr", response.CostPerHr,
 		"machineId", response.MachineID,
 		"gpuType", response.Machine.GpuTypeID,
 		"location", response.Machine.Location,
-		"dataCenter", response.Machine.DataCenterID)
+		"dataCenter", response.Machine.DataCenterID,
+	}
+	
+	// Add containerRegistryAuthId to log if present
+	if response.ContainerRegistryAuthId != "" {
+		logFields = append(logFields, "containerRegistryAuthId", response.ContainerRegistryAuthId)
+	}
+	
+	// Add templateId to log if present
+	if response.TemplateId != "" {
+		logFields = append(logFields, "templateId", response.TemplateId)
+	}
+	
+	c.logger.Info("Pod deployed successfully", logFields...)
 
 	return response.ID, response.CostPerHr, nil
 }
+
 
 // DeployPod deploys a pod to RunPod
 func (c *Client) DeployPod(params map[string]interface{}) (string, float64, error) {
@@ -1250,7 +1269,13 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 
 	// Add datacenter IDs if specified in pod annotations
 	if datacenterID != "" {
-		params["dataCenterIds"] = []string{datacenterID}
+		// Split comma-separated datacenter IDs
+		datacenterIds := strings.Split(datacenterID, ",")
+		// Trim whitespace from each ID
+		for i, id := range datacenterIds {
+			datacenterIds[i] = strings.TrimSpace(id)
+		}
+		params["dataCenterIds"] = datacenterIds
 	}
 
 	// Add templateId to params if it exists
