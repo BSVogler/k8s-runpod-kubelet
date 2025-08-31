@@ -123,9 +123,6 @@ func NewProvider(ctx context.Context, nodeName, operatingSystem string, internal
 
 // CreatePod takes a Kubernetes Pod and deploys it within the provider
 func (p *Provider) CreatePod(ctx context.Context, pod *v1.Pod) error {
-	// Implementation for creating a pod
-	p.logger.Info("Creating pod", "pod", pod.Name, "namespace", pod.Namespace)
-
 	// Store the pod in our tracking map
 	podKey := fmt.Sprintf("%s-%s", pod.Namespace, pod.Name)
 	
@@ -197,9 +194,6 @@ func (p *Provider) DeployPodToRunPod(pod *v1.Pod) error {
 		}
 		pod = podCopy
 	}
-	p.logger.Info("Deploying pod to RunPod",
-		"pod", pod.Name,
-		"namespace", pod.Namespace)
 
 	// Check if RunPod API is available
 	if !p.runpodAvailable {
@@ -215,6 +209,13 @@ func (p *Provider) DeployPodToRunPod(pod *v1.Pod) error {
 			"error", err)
 		return err
 	}
+
+	// Log the parameters being sent to RunPod
+	paramsJSON, _ := json.MarshalIndent(params, "", "  ")
+	p.logger.Info("Deploying pod with parameters",
+		"pod", pod.Name,
+		"namespace", pod.Namespace,
+		"params", string(paramsJSON))
 
 	// Deploy to RunPod using REST API
 	podID, costPerHr, err := p.runpodClient.DeployPodREST(params)
