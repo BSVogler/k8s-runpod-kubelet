@@ -186,7 +186,11 @@ spec:
 
 ### Annotations
 
-You can customize the RunPod deployment using annotations. Add annotations to the pod or to the controlling job.
+You can customize the RunPod deployment using annotations. Annotations can be placed on either:
+- **The Pod spec** directly (in `pod.metadata.annotations`)
+- **The Job spec** that controls the pod (in `job.metadata.annotations`)
+
+The kubelet will check the pod first, then fall back to the job annotations if not found on the pod.
 
 ```yaml
 metadata:
