@@ -6,10 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	batchv1 "k8s.io/api/batch/v1"
-	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
 	"log/slog"
 	"net/http"
 	"os"
@@ -17,6 +13,13 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	batchv1 "k8s.io/api/batch/v1"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+
+	"github.com/bsvogler/k8s-runpod-kubelet/pkg/config"
 )
 
 // Client handles all interactions with the RunPod API
@@ -27,6 +30,7 @@ type Client struct {
 	baseRESTURL    string
 	logger         *slog.Logger
 	clientset      kubernetes.Interface // Add clientset field
+	config         *config.Config       // Add config field for datacenter restrictions
 }
 
 // Constants for RunPod integration
@@ -136,7 +140,7 @@ type MachineInfo struct {
 }
 
 // NewRunPodClient creates a new RunPod API client
-func NewRunPodClient(logger *slog.Logger, clientset kubernetes.Interface) *Client {
+func NewRunPodClient(logger *slog.Logger, clientset kubernetes.Interface, config *config.Config) *Client {
 	apiKey := os.Getenv("RUNPOD_API_KEY")
 	if apiKey == "" {
 		logger.Error("RUNPOD_API_KEY environment variable is not set")
@@ -149,6 +153,7 @@ func NewRunPodClient(logger *slog.Logger, clientset kubernetes.Interface) *Clien
 		baseRESTURL:    "https://rest.runpod.io/v1/",
 		logger:         logger,
 		clientset:      clientset, // Store the clientset
+		config:         config,    // Store the config for datacenter restrictions
 	}
 }
 
@@ -1128,6 +1133,50 @@ func (c *Client) validateCloudType(cloudTypeVal string, pod *v1.Pod) string {
 	return defaultCloudType
 }
 
+// validateDatacenterIDs validates datacenter IDs against node-level restrictions for compliance
+func (c *Client) validateDatacenterIDs(podDatacenterID string, pod *v1.Pod) (string, error) {
+	// If no node-level restriction is configured, allow any pod-level configuration
+	if c.config.DatacenterIDs == "" {
+		return podDatacenterID, nil
+	}
+
+	// Parse node-level allowed datacenters
+	allowedDatacenters := make(map[string]bool)
+	for _, id := range strings.Split(c.config.DatacenterIDs, ",") {
+		allowedDatacenters[strings.TrimSpace(id)] = true
+	}
+
+	// If pod has no datacenter specification, use node-level configuration
+	if podDatacenterID == "" {
+		return c.config.DatacenterIDs, nil
+	}
+
+	// Validate pod-level datacenters against node-level restrictions
+	podDatacenters := strings.Split(podDatacenterID, ",")
+	var validDatacenters []string
+
+	for _, id := range podDatacenters {
+		id = strings.TrimSpace(id)
+		if allowedDatacenters[id] {
+			validDatacenters = append(validDatacenters, id)
+		} else {
+			c.logger.Warn("Pod datacenter ID not allowed by node configuration - ignoring",
+				"pod", pod.Name,
+				"namespace", pod.Namespace,
+				"requestedDatacenter", id,
+				"allowedDatacenters", c.config.DatacenterIDs)
+		}
+	}
+
+	// If no valid datacenters remain, return error for compliance
+	if len(validDatacenters) == 0 {
+		return "", fmt.Errorf("pod requested datacenters %s but node only allows %s", 
+			podDatacenterID, c.config.DatacenterIDs)
+	}
+
+	return strings.Join(validDatacenters, ","), nil
+}
+
 // extractGPUMemory extracts GPU memory from annotations
 func extractGPUMemory(memStr string) int {
 	defaultMemory := 16 // Default minimum memory
@@ -1216,6 +1265,13 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 	templateId := getAnnotation(TemplateIdAnnotation, "")
 	datacenterID := getAnnotation(DatacenterAnnotation, "")
 	portsOverride := getAnnotation(PortsAnnotation, "")
+
+	// Validate datacenter IDs for compliance (node-level restrictions take precedence)
+	validatedDatacenterID, err := c.validateDatacenterIDs(datacenterID, pod)
+	if err != nil {
+		return nil, fmt.Errorf("datacenter validation failed: %w", err)
+	}
+	datacenterID = validatedDatacenterID
 
 	// Determine minimum GPU memory required
 	memStr := getAnnotation(GpuMemoryAnnotation, "")

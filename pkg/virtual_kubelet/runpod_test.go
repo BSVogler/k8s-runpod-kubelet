@@ -3,7 +3,6 @@ package runpod_test
 import (
 	"context"
 	"fmt"
-	runpod "github.com/bsvogler/k8s-runpod-kubelet/pkg/virtual_kubelet"
 	"log/slog"
 	"os"
 	"testing"
@@ -14,6 +13,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
+
+	"github.com/bsvogler/k8s-runpod-kubelet/pkg/config"
+	runpod "github.com/bsvogler/k8s-runpod-kubelet/pkg/virtual_kubelet"
 )
 
 type testContext struct {
@@ -55,7 +57,8 @@ func setupTestEnvironment(t *testing.T) *testContext {
 	require.NoError(t, err, "Failed to create Kubernetes clientset")
 
 	// Create RunPod client
-	client := runpod.NewRunPodClient(logger, clientset)
+	testConfig := &config.Config{}
+	client := runpod.NewRunPodClient(logger, clientset, testConfig)
 
 	// Create a test namespace
 	ns := &v1.Namespace{

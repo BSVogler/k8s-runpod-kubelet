@@ -18,6 +18,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/bsvogler/k8s-runpod-kubelet/pkg/config"
 )
 
 // TestContainerRegistryAuthAnnotation tests that container-registry-auth-id annotation
@@ -34,7 +36,9 @@ func TestContainerRegistryAuthAnnotation(t *testing.T) {
 
 	// Use fake clientset for testing
 	fakeClientset := fake.NewSimpleClientset()
-	client := NewRunPodClient(logger, fakeClientset)
+	// Create a test config with no datacenter restrictions
+	testConfig := &config.Config{}
+	client := NewRunPodClient(logger, fakeClientset, testConfig)
 
 	// Test container registry auth ID
 	testAuthID := "test-auth-id-12345"
@@ -163,7 +167,8 @@ func TestJobAnnotationFallback(t *testing.T) {
 	}))
 
 	fakeClientset := fake.NewSimpleClientset()
-	client := NewRunPodClient(logger, fakeClientset)
+	testConfig := &config.Config{}
+	client := NewRunPodClient(logger, fakeClientset, testConfig)
 
 	// Create test job with various annotations
 	job := &batchv1.Job{
@@ -255,7 +260,8 @@ func TestDeployWithContainerRegistryAuth(t *testing.T) {
 
 	// Use fake clientset for parameter testing
 	clientset := fake.NewSimpleClientset()
-	client := NewRunPodClient(logger, clientset)
+	testConfig := &config.Config{}
+	client := NewRunPodClient(logger, clientset, testConfig)
 
 	// Create a test pod with container registry auth annotation
 	pod := &v1.Pod{
@@ -389,7 +395,8 @@ func TestActualDeploymentWithCleanup(t *testing.T) {
 	}))
 
 	clientset := fake.NewSimpleClientset()
-	client := NewRunPodClient(logger, clientset)
+	testConfig := &config.Config{}
+	client := NewRunPodClient(logger, clientset, testConfig)
 
 	// Track deployed pod for cleanup
 	var deployedPodID string
@@ -473,7 +480,8 @@ func TestContainerRegistryAuthInDeploymentResponse(t *testing.T) {
 	}))
 
 	clientset := fake.NewSimpleClientset()
-	client := NewRunPodClient(logger, clientset)
+	testConfig := &config.Config{}
+	client := NewRunPodClient(logger, clientset, testConfig)
 
 	// Track deployed pod for cleanup
 	var deployedPodID string
