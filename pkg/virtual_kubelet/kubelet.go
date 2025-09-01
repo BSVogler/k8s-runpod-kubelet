@@ -88,8 +88,8 @@ func (p *Provider) checkRunPodAPIHealth() {
 func NewProvider(ctx context.Context, nodeName, operatingSystem string, internalIP string,
 	daemonEndpointPort int, config config.Config, clientset *kubernetes.Clientset, logger *slog.Logger) (*Provider, error) {
 
-	// Create a new RunPod client and pass the clientset
-	runpodClient := NewRunPodClient(logger, clientset)
+	// Create a new RunPod client and pass the clientset and config
+	runpodClient := NewRunPodClient(logger, clientset, &config)
 
 	provider := &Provider{
 		nodeName:           nodeName,
