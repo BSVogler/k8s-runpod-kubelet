@@ -236,6 +236,27 @@ metadata:
     runpod.io/ports: "8080/tcp,9000/http"  # Override auto-detection
 ```
 
+### Datacenter Configuration
+
+Datacenter IDs can be configured at two levels with compliance enforcement:
+
+1. **Node-level**: Using the `--datacenter-ids` flag when starting the virtual kubelet. This sets the **allowed** datacenters for all pods scheduled to this virtual node.
+
+2. **Pod-level**: Using the `runpod.io/datacenter-ids` annotation on individual pods. Pod-level annotations are **restricted** by the node-level configuration for compliance.
+
+```yaml
+# Pod-level datacenter configuration
+metadata:
+  annotations:
+    runpod.io/datacenter-ids: "US-NJ-1,EU-RO-1"  # Must be subset of node's allowed datacenters
+```
+
+**Compliance Behavior:**
+- If no node-level restriction is set, pods can specify any datacenters
+- If node-level datacenters are configured, pods can only use those datacenters or a subset
+- Pod requests for non-allowed datacenters will be filtered out with warnings
+- If no valid datacenters remain after filtering, the pod deployment will fail
+
 #### RunPod Port Behavior
 
 RunPod handles HTTP and TCP ports differently, which affects readiness detection:
