@@ -1,0 +1,21 @@
+{{- if .Values.priorityClasses.enabled }}
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: {{ .Values.priorityClasses.spot.name }}
+  labels:
+    {{- include "runpod-kubelet.labels" . | nindent 4 }}
+value: {{ .Values.priorityClasses.spot.value }}
+globalDefault: false
+description: "RunPod spot instances - interruptible pods at lower cost"
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: {{ .Values.priorityClasses.priority.name }}
+  labels:
+    {{- include "runpod-kubelet.labels" . | nindent 4 }}
+value: {{ .Values.priorityClasses.priority.value }}
+globalDefault: false
+description: "RunPod priority instances - reserved pods at higher cost with guaranteed runtime"
+{{- end }}

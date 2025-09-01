@@ -199,12 +199,32 @@ metadata:
     runpod.io/container-registry-auth-id: "your-auth-id"  # For private registries. Works as of August 2025 and takes precedence over template authentication. Note: RunPod may return "access forbidden" errors for up to 4 minutes after setting registry auth before it becomes active.
     runpod.io/templateId: "your-template-id"  # Use a specific RunPod template including a preregistered authentication.
     runpod.io/datacenter-ids: "datacenter1,datacenter2" # Comma-separated list of allowed datacenter IDs
+    runpod.io/interruptible: "true"  # Use spot/interruptible instances (lower cost, can be interrupted)
 ```
 
 Experimental:
 
 ```yaml
     runpod.io/cloud-type: "COMMUNITY"   # SECURE or COMMUNITY. Note: In tests, only SECURE consistently works with the API, so it defaults to SECURE.
+```
+
+### Spot Instances (Interruptible Pods)
+
+The kubelet supports RunPod's interruptible (spot) instances which offer lower costs but can be interrupted. Configure using:
+
+#### Method 1: PriorityClass (Recommended)
+```yaml
+apiVersion: v1
+kind: Pod
+spec:
+  priorityClassName: runpod-spot  # Any class with "spot" in the name triggers interruptible mode
+```
+
+#### Method 2: Annotation Override
+```yaml
+metadata:
+  annotations:
+    runpod.io/interruptible: "true"  # Explicitly enable spot instances
 ```
 
 ### Port Configuration

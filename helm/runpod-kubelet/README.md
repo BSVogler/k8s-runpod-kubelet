@@ -66,6 +66,11 @@ The following table lists the configurable parameters and their default values:
 | `health.port` | Health check port | `8080` |
 | `health.livenessProbe.enabled` | Enable liveness probe | `true` |
 | `health.readinessProbe.enabled` | Enable readiness probe | `true` |
+| `priorityClasses.enabled` | Create PriorityClasses for spot/priority instances | `true` |
+| `priorityClasses.spot.name` | Name of spot instance PriorityClass | `runpod-spot` |
+| `priorityClasses.spot.value` | Priority value for spot instances | `100` |
+| `priorityClasses.priority.name` | Name of priority instance PriorityClass | `runpod-priority` |
+| `priorityClasses.priority.value` | Priority value for priority instances | `200` |
 
 ## Usage
 
@@ -85,6 +90,47 @@ spec:
     resources:
       limits:
         nvidia.com/gpu: 1
+```
+
+### Using Spot Instances
+
+The chart automatically creates PriorityClasses for spot and priority instances. To use spot instances (lower cost, interruptible):
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: spot-gpu-pod
+spec:
+  priorityClassName: runpod-spot  # Use spot instances
+  nodeSelector:
+    kubernetes.io/hostname: runpod-node
+  tolerations:
+  - key: virtual-kubelet.io/provider
+    operator: Equal
+    value: runpod
+    effect: NoSchedule
+  containers:
+  - name: gpu-container
+    image: nvidia/cuda:11.0-base
+    resources:
+      limits:
+        nvidia.com/gpu: 1
+```
+
+For guaranteed priority instances (higher cost, no interruptions):
+
+```yaml
+spec:
+  priorityClassName: runpod-priority  # Use priority instances
+```
+
+You can also override with annotations:
+
+```yaml
+metadata:
+  annotations:
+    runpod.io/interruptible: "true"  # Force spot instance
 ```
 
 ## Uninstalling

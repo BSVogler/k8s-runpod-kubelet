@@ -64,3 +64,12 @@ health:
     initialDelaySeconds: 5
     periodSeconds: 5
     timeoutSeconds: 3
+
+priorityClasses:
+  enabled: true
+  spot:
+    name: runpod-spot
+    value: 100
+  priority:
+    name: runpod-priority
+    value: 200

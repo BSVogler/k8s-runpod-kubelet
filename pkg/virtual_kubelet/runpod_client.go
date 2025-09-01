@@ -40,6 +40,7 @@ const (
 	ContainerRegistryAuthAnnotation = "runpod.io/container-registry-auth-id"
 	DatacenterAnnotation            = "runpod.io/datacenter-ids" // Comma-separated list preferred
 	PortsAnnotation                 = "runpod.io/ports"          // Manual override for port specifications
+	InterruptibleAnnotation         = "runpod.io/interruptible"  // Manual override for interruptible setting
 	// DefaultMaxPrice for GPU
 	DefaultMaxPrice = 0.5
 
@@ -1196,6 +1197,41 @@ func (c *Client) extractPortsFromPod(pod *v1.Pod) []string {
 	return ports
 }
 
+// determineInterruptible checks if a pod should be deployed as interruptible (spot instance)
+// based on its PriorityClassName or annotation
+func (c *Client) determineInterruptible(pod *v1.Pod, ownerJob *batchv1.Job) bool {
+	// First check for explicit annotation override
+	if val, exists := pod.Annotations[InterruptibleAnnotation]; exists {
+		if val == "true" {
+			return true
+		} else if val == "false" {
+			return false
+		}
+	}
+	
+	// Check job annotations if pod is owned by a job
+	if ownerJob != nil && ownerJob.Annotations != nil {
+		if val, exists := ownerJob.Annotations[InterruptibleAnnotation]; exists {
+			if val == "true" {
+				return true
+			} else if val == "false" {
+				return false
+			}
+		}
+	}
+	
+	// Check PriorityClassName - if it contains "spot" (case-insensitive), use interruptible
+	if pod.Spec.PriorityClassName != "" {
+		priorityClass := strings.ToLower(pod.Spec.PriorityClassName)
+		if strings.Contains(priorityClass, "spot") {
+			return true
+		}
+	}
+	
+	// Default to non-interruptible (priority/reserved instance)
+	return false
+}
+
 // PrepareRunPodParameters prepares parameters for RunPod deployment
 // Update PrepareRunPodParameters to use the clientset from the Client struct
 func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]interface{}, error) {
@@ -1273,6 +1309,9 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 	// Default values
 	volumeInGb := 0
 	containerDiskInGb := 15
+	
+	// Determine if this should be an interruptible (spot) instance
+	interruptible := c.determineInterruptible(pod, ownerJob)
 
 	// Create deployment parameters
 	params := map[string]interface{}{
@@ -1284,15 +1323,31 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 		"name":              runpodName,
 		"imageName":         imageName,
 		"env":               formattedEnvVars,
+		"interruptible":     interruptible,
 	}
 	
 	// Add ports to parameters if any were specified
 	if len(ports) > 0 {
 		params["ports"] = ports
-		c.logger.Info("Configuring RunPod deployment with ports",
+		instanceType := "priority"
+		if interruptible {
+			instanceType = "spot"
+		}
+		c.logger.Info("Configuring RunPod deployment",
 			"pod", pod.Name,
 			"namespace", pod.Namespace,
+			"instanceType", instanceType,
 			"ports", ports)
+	} else {
+		// Log even when no ports are specified
+		instanceType := "priority"
+		if interruptible {
+			instanceType = "spot"
+		}
+		c.logger.Info("Configuring RunPod deployment",
+			"pod", pod.Name,
+			"namespace", pod.Namespace,
+			"instanceType", instanceType)
 	}
 
 	// Add datacenter IDs if specified in pod annotations
