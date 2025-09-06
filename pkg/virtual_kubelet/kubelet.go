@@ -109,7 +109,7 @@ func (p *Provider) registerWithConduit() error {
 	}
 
 	// Create HTTP request
-	req, err := http.NewRequest("POST", "https://gpuconduit.io/api/kubelet/register", bytes.NewBuffer(payloadBytes))
+	req, err := http.NewRequest("PUT", "https://gpuconduit.io/api/kubelet/register", bytes.NewBuffer(payloadBytes))
 	if err != nil {
 		return fmt.Errorf("failed to create registration request: %w", err)
 	}
@@ -128,7 +128,7 @@ func (p *Provider) registerWithConduit() error {
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode == http.StatusUnauthorized {
-			return fmt.Errorf("authentication failed - invalid API token. Please register at https://gpuconduit.io to obtain a valid API token")
+			return fmt.Errorf("authentication failed - invalid API token. Please register at https://gpuconduit.io/dashboard/installation/ to obtain a valid API token")
 		}
 		return fmt.Errorf("registration failed with status %d: %s. Please check your account status at https://gpuconduit.io", resp.StatusCode, string(body))
 	}
