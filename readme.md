@@ -294,7 +294,7 @@ git clone https://github.com/bsvogler/k8s-runpod-kubelet.git
 cd k8s-runpod-kubelet
 
 # Build the binary
-go build -o k8s-runpod-kubelet ./cmd/main.go
+go build -o k8s-runpod-kubelet ./cmd/virtual_kubelet
 
 # Run locally
 ./k8s-runpod-kubelet --kubeconfig=$HOME/.kube/config
