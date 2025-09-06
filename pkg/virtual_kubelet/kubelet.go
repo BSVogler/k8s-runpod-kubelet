@@ -1,6 +1,7 @@
 package runpod
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -15,6 +16,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"log/slog"
 	"net/http"
+	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -40,6 +43,102 @@ type Provider struct {
 	podsMutex   sync.RWMutex             // Mutex for thread-safe access to pods maps
 	notifyFunc  func(*v1.Pod)            // Function called when pod status changes
 	notifyMutex sync.RWMutex             // Mutex for thread-safe access to notify function
+}
+
+// RegistrationPayload represents the data sent to the conduit registration endpoint
+type RegistrationPayload struct {
+	ClusterName  string            `json:"cluster_name"`
+	Namespace    string            `json:"namespace"`
+	NodeName     string            `json:"node_name"`
+	Version      *string           `json:"version"`
+	Capabilities []string          `json:"capabilities"`
+	Metadata     map[string]string `json:"metadata"`
+}
+
+// registerWithConduit registers the kubelet with the conduit service
+func (p *Provider) registerWithConduit() error {
+	apiToken := os.Getenv("CONDUIT_API_TOKEN")
+	if apiToken == "" {
+		return fmt.Errorf("CONDUIT_API_TOKEN is required but not set. Please register at https://gpuconduit.io to obtain your API token")
+	}
+
+	// Get cluster name from environment or generate one
+	clusterName := os.Getenv("CLUSTER_NAME")
+	if clusterName == "" {
+		clusterName = "k8s-runpod-cluster"
+	}
+
+	// Get namespace (default to kube-system if not set)
+	namespace := os.Getenv("NAMESPACE")
+	if namespace == "" {
+		namespace = "kube-system"
+	}
+
+	// Get version info
+	version := runtime.Version()
+
+	// Define capabilities
+	capabilities := []string{
+		"gpu-scheduling",
+		"runpod-integration",
+		"virtual-kubelet",
+	}
+
+	// Create metadata
+	metadata := map[string]string{
+		"provider":         "runpod",
+		"operating_system": p.operatingSystem,
+		"internal_ip":      p.internalIP,
+		"go_version":       runtime.Version(),
+		"arch":             runtime.GOARCH,
+		"os":               runtime.GOOS,
+	}
+
+	payload := RegistrationPayload{
+		ClusterName:  clusterName,
+		Namespace:    namespace,
+		NodeName:     p.nodeName,
+		Version:      &version,
+		Capabilities: capabilities,
+		Metadata:     metadata,
+	}
+
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal registration payload: %w", err)
+	}
+
+	// Create HTTP request
+	req, err := http.NewRequest("POST", "https://gpuconduit.io/api/kubelet/register", bytes.NewBuffer(payloadBytes))
+	if err != nil {
+		return fmt.Errorf("failed to create registration request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiToken)
+
+	// Make the request
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to make registration request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode == http.StatusUnauthorized {
+			return fmt.Errorf("authentication failed - invalid API token. Please register at https://gpuconduit.io to obtain a valid API token")
+		}
+		return fmt.Errorf("registration failed with status %d: %s. Please check your account status at https://gpuconduit.io", resp.StatusCode, string(body))
+	}
+
+	p.logger.Info("Successfully registered with conduit service",
+		"cluster_name", clusterName,
+		"namespace", namespace,
+		"node_name", p.nodeName)
+
+	return nil
 }
 
 // startPeriodicStatusUpdates polls the RunPod API to keep pod statuses up to date
@@ -111,6 +210,12 @@ func NewProvider(ctx context.Context, nodeName, operatingSystem string, internal
 	// Initialize provider
 	provider.checkRunPodAPIHealth()
 	provider.cleanupStuckTerminatingPods()
+	
+	// Register with conduit service (mandatory for DRM)
+	if err := provider.registerWithConduit(); err != nil {
+		return nil, fmt.Errorf("kubelet registration failed: %w", err)
+	}
+	
 	// Start background processes
 	go provider.startPeriodicStatusUpdates()
 	go provider.startPeriodicCleanup()
