@@ -1,0 +1,20 @@
+{{- $configMapName := "runpod-kubelet-cluster-config" -}}
+{{- $existingConfigMap := (lookup "v1" "ConfigMap" .Values.kubelet.namespace $configMapName) -}}
+{{- $clusterIdentifier := "" -}}
+{{- if .Values.cluster.identifier -}}
+  {{- $clusterIdentifier = .Values.cluster.identifier -}}
+{{- else if $existingConfigMap -}}
+  {{- $clusterIdentifier = index $existingConfigMap.data "cluster-identifier" -}}
+{{- else -}}
+  {{- $clusterIdentifier = uuidv4 -}}
+{{- end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $configMapName }}
+  namespace: {{ .Values.kubelet.namespace }}
+  labels:
+    app.kubernetes.io/name: runpod-kubelet-cluster-config
+    app.kubernetes.io/component: config
+data:
+  cluster-identifier: {{ $clusterIdentifier | quote }}

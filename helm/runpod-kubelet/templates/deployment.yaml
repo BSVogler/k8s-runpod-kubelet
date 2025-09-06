@@ -51,6 +51,8 @@ spec:
           envFrom:
             - secretRef:
                 name: {{ .Values.runpod.existingSecret | default (include "runpod-kubelet.fullname" .) }}
+            - configMapRef:
+                name: runpod-kubelet-cluster-config
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       {{- with .Values.nodeSelector }}
