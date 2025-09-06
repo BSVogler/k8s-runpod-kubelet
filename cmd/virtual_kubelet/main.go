@@ -51,6 +51,7 @@ var (
 	healthServerAddress string
 	kubenamespace       string
 	datacenterIDs       string
+	heartbeatInterval   int
 )
 
 // Log handlers are defined in a separate file
@@ -68,6 +69,7 @@ func init() {
 	flag.StringVar(&logLevel, "log-level", "info", "log level (debug, info, warn, error)")
 	flag.StringVar(&kubenamespace, "namespace", "kube-system", "kubernetes namespace")
 	flag.StringVar(&datacenterIDs, "datacenter-ids", "", "Comma-separated list of RunPod datacenter IDs to launch pods in")
+	flag.IntVar(&heartbeatInterval, "heartbeat-interval", 300, "Heartbeat interval in seconds (0 to disable)")
 }
 
 // LoadConfig loads configuration from a YAML file
@@ -309,9 +311,10 @@ func validateEnvironment(logger *slog.Logger) {
 }
 
 // setupShutdownHandlers sets up graceful shutdown handlers
-func setupShutdownHandlers(ctx context.Context, apiServer *http.Server, healthServer *runpod.HealthServer, logger *slog.Logger) {
+func setupShutdownHandlers(ctx context.Context, apiServer *http.Server, healthServer *runpod.HealthServer, provider *runpod.Provider, logger *slog.Logger) {
 	go func() {
 		<-ctx.Done()
+		provider.StopHeartbeat()
 		if err := healthServer.Stop(); err != nil {
 			logger.Error("Health server shutdown error", "error", err)
 		}
@@ -363,6 +366,7 @@ func main() {
 		providerConfig,
 		k8sClient,
 		logger,
+		heartbeatInterval,
 	)
 	if err != nil {
 		logger.Error("Failed to create RunPod provider", "error", err)
@@ -400,7 +404,7 @@ func main() {
 	healthServer.Start()
 
 	// Ensure proper shutdown
-	setupShutdownHandlers(ctx, apiServer, healthServer, logger)
+	setupShutdownHandlers(ctx, apiServer, healthServer, provider, logger)
 
 	// Start controllers
 	if err := startControllers(ctx, podController, nodeController, logger); err != nil {
