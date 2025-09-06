@@ -6,9 +6,21 @@
 [![Container Image](https://img.shields.io/badge/container-ghcr.io-blue)](https://github.com/bsvogler/k8s-runpod-kubelet/pkgs/container/runpod-kubelet)
 [![Release](https://img.shields.io/github/v/release/bsvogler/k8s-runpod-kubelet)](https://github.com/bsvogler/k8s-runpod-kubelet/releases)
 
-This Virtual Kubelet implementation provides seamless integration between Kubernetes and RunPod, enabling dynamic,
-cloud-native GPU workload scaling across local and cloud resources - automatically extend your cluster with on-demand
-GPUs without managing infrastructure.
+This Virtual Kubelet implementation provides seamless integration between Kubernetes and RunPod, enabling dynamic, cloud-native GPU workload scaling across local and cloud resources - automatically extend your cluster with on-demand GPUs without managing infrastructure.
+
+## 🚀 Commercial License & Multi-Cloud Upgrade
+
+**Ready for production?** Get instant access with [GPU Conduit](https://gpuconduit.io) - the commercial license that unlocks:
+
+- ✅ **Multi-Cloud Access**: RunPod, Vast.ai, Lambda Labs, and 7+ more providers in one install
+- ✅ **3-5x Cost Savings**: Intelligent routing to cheapest available GPUs
+- ✅ **Automatic Failover**: Never get stuck when a provider goes down
+- ✅ **Production Support**: Enterprise-grade reliability and support
+- ✅ **One Unified Bill**: Stop managing multiple provider accounts
+
+**[Get started with GPU Conduit →](https://gpuconduit.io)**
+
+*This kubelet requires a GPU Conduit license for production use. Register at gpuconduit.io to get your API token.*
 
 ## 🌟 Key Features
 
@@ -63,7 +75,8 @@ The Virtual Kubelet acts as a bridge between Kubernetes and RunPod, providing a 
 ## 📋 Prerequisites
 
 - Kubernetes cluster (v1.19+)
-- RunPod account and API key with appropriate permissions
+- **GPU Conduit license** - [Register at gpuconduit.io](https://gpuconduit.io) to get your API token
+- RunPod account and API key (for direct RunPod usage)
 - `kubectl` configured to access your cluster
 - Go 1.19+ (for building from source)
 
@@ -76,15 +89,19 @@ The Virtual Kubelet acts as a bridge between Kubernetes and RunPod, providing a 
 helm install runpod-kubelet oci://ghcr.io/bsvogler/helm/runpod-kubelet \
   --namespace kube-system \
   --create-namespace \
+  --set conduit.apiToken=<your-conduit-api-token> \
   --set runpod.apiKey=<your-runpod-api-key>
 ```
 
-#### Configure secret for the API key
+**Required:** You must obtain your Conduit API token by registering at [gpuconduit.io](https://gpuconduit.io)
+
+#### Configure secret for API keys
 
 ```bash
-# Create secret with RunPod API key
+# Create secret with both Conduit and RunPod API keys
 kubectl create secret generic runpod-api-secret \
   --namespace kube-system \
+  --from-literal=CONDUIT_API_TOKEN=<your-conduit-api-token> \
   --from-literal=RUNPOD_API_KEY=<your-runpod-api-key>
 
 # Install with existing secret
@@ -96,9 +113,10 @@ helm install runpod-kubelet oci://ghcr.io/bsvogler/charts/runpod-kubelet \
 ### Installation using kubectl
 
 ```bash
-# Create secret with RunPod API key
+# Create secret with both Conduit and RunPod API keys
 kubectl create secret generic runpod-kubelet-secrets \
   --namespace kube-system \
+  --from-literal=CONDUIT_API_TOKEN=<your-conduit-api-token> \
   --from-literal=RUNPOD_API_KEY=<your-runpod-api-key>
 
 # Apply controller deployment
