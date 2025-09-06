@@ -41,6 +41,9 @@ kubelet:
   maxGpuPrice: 0.5
   healthServerAddress: ":8080"
   namespace: kube-system
+
+cluster:
+  identifier: ""  # If empty, a unique identifier will be generated
   
 runpod:
   apiKey: ""
