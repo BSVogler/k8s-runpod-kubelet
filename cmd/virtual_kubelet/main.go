@@ -27,32 +27,32 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/record"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
-	corev1 "k8s.io/api/core/v1"
 )
 
 var (
-	kubeconfig         string
-	configPath         string
-	nodeName           string
-	operatingSystem    string
-	internalIP         string
-	listenPort         int
-	logLevel           string
-	backendURL         string
-	backendAPIKey      string
-	healthServerAddr   string
-	namespace          string
-	reconcileInterval  int
-	enabledProviders   string
+	kubeconfig        string
+	configPath        string
+	nodeName          string
+	operatingSystem   string
+	internalIP        string
+	listenPort        int
+	logLevel          string
+	backendURL        string
+	backendAPIKey     string
+	healthServerAddr  string
+	namespace         string
+	reconcileInterval int
+	enabledProviders  string
 )
 
 func init() {
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig file")
 	flag.StringVar(&configPath, "config", "", "Path to configuration file")
 	flag.StringVar(&nodeName, "nodename", "virtual-proxy", "Kubernetes node name")
-	flag.StringVar(&operatingSystem, "os", "Linux", "Operating system (Linux/Windows)")
+	flag.StringVar(&operatingSystem, "operating-system", "Linux", "Operating system (Linux, Windows)")
 	flag.StringVar(&internalIP, "internal-ip", "127.0.0.1", "Internal IP address")
 	flag.IntVar(&listenPort, "listen-port", 10250, "Port to listen on")
 	flag.StringVar(&logLevel, "log-level", "info", "Log level (debug, info, warn, error)")

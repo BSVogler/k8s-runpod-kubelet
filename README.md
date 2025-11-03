@@ -1,560 +1,428 @@
-# K8s Proxy Kubelet
+# Conduit Kubelet
 
-A command-and-control virtual kubelet that acts as a proxy between Kubernetes and multiple GPU cloud providers. The kubelet executes provider API calls only when instructed by a backend service via WebSocket commands, enabling centralized routing decisions while keeping API keys secure in-cluster.
+**Source-available Kubernetes connector for seamless GPU cloud access**
 
-## Architecture
+Conduit Kubelet brings GPU cloud providers (RunPod, Vast.ai, Salad, and more) directly into your Kubernetes cluster. Deploy GPU workloads using familiar `kubectl` commands while the Conduit platform handles provider selection, cost optimization, and billing—all while you maintain full control and transparency through source-available code you can audit and compile yourself.
 
-### Command-and-Control Flow
-1. K8s schedules pod → Proxy Kubelet
-2. Kubelet reports pod event → Backend (via WebSocket)
-3. Backend makes provider selection decision
-4. Backend sends deployment command → Kubelet (via WebSocket)
-5. Kubelet executes RunPod/Vast.ai/etc API call
-6. Kubelet reports result → Backend
-7. Kubelet updates K8s pod status
+---
 
-### Key Benefits
-- **Centralized Decision Making**: Backend orchestrates all provider routing decisions
-- **Secure Key Management**: Provider API keys remain in-cluster, not in backend
-- **Multi-Provider Support**: Single kubelet supports RunPod, Vast.ai, Salad, AWS, GCP
-- **Real-Time Commands**: WebSocket communication for instant command delivery
-- **Cost Optimization**: Backend can optimize costs across providers globally
+## Why Source-Available?
+
+**Trust Through Transparency**
+
+We believe in earning your trust through complete transparency. Conduit Kubelet is source-available, allowing you to:
+
+- **Audit the code** - See exactly what runs in your cluster
+- **Compile from source** - Build the binary yourself for complete confidence
+- **Verify security** - Review how your credentials are handled
+- **Report issues** - Help us improve security and reliability
+
+The kubelet runs in your cluster and only communicates with the Conduit platform—no hidden telemetry, no black boxes.
+
+**Smart Separation**
+
+- **Source-Available (This Repo)**: The kubelet that runs in your cluster - fully auditable
+- **Conduit Platform**: The routing intelligence, cost optimization, and billing management - our secret sauce
+
+This architecture ensures you have full visibility into what runs in your infrastructure while we focus on making GPU access simple and cost-effective.
+
+---
+
+## How It Works
+
+```
+Your K8s Cluster → Conduit Kubelet (open source) → Conduit Platform → GPU Providers
+```
+
+1. **You deploy pods** using standard Kubernetes YAML
+2. **Kubelet detects** the pod and reports requirements to Conduit
+3. **Conduit selects** the best provider based on availability, cost, and your preferences
+4. **Kubelet executes** the deployment command from Conduit
+5. **Your pod runs** on the selected GPU provider (RunPod, Vast.ai, etc.)
+
+**What You Control:**
+- When and how pods are deployed (standard Kubernetes)
+- Which providers you want to use (configure in Conduit dashboard)
+- Your provider API keys (stored in your cluster or managed by Conduit)
+- All the source code running in your cluster
+
+**What Conduit Handles:**
+- Provider selection and availability monitoring
+- Cost optimization across providers
+- Plan limits and quota enforcement
+- Billing and usage tracking
+
+---
 
 ## Quick Start
 
 ### Prerequisites
-- Kubernetes cluster with RBAC permissions
-- Backend service with WebSocket API (see [Backend Requirements](#backend-requirements))
-- Provider API keys (RunPod, Vast.ai, etc.)
+
+- Kubernetes cluster (1.19+)
+- `kubectl` access with admin permissions
+- Conduit account (sign up at [conduit.example.com](https://conduit.example.com))
 
 ### Installation
 
-#### 1. Using Helm (Recommended)
-```bash
-# Add Helm repository (when published)
-helm repo add gpu-proxy https://charts.gpuconduit.io
-helm repo update
+#### Option 1: Using Pre-built Releases (Recommended)
 
-# Install with your backend configuration
-helm install gpu-proxy gpu-proxy/proxy-kubelet \
-  --set config.backendURL="wss://your-backend.com/api/kubelet/ws" \
-  --set config.backendAPIKey="your-api-key" \
-  --set providers.runpod.apiKey="your-runpod-key"
+```bash
+# Download the latest release
+curl -LO https://github.com/yourusername/conduit-kubelet/releases/latest/download/conduit-kubelet-linux-amd64
+
+# Verify checksum (optional but recommended)
+curl -LO https://github.com/yourusername/conduit-kubelet/releases/latest/download/checksums.txt
+sha256sum -c checksums.txt
+
+# Install
+chmod +x conduit-kubelet-linux-amd64
+sudo mv conduit-kubelet-linux-amd64 /usr/local/bin/conduit-kubelet
 ```
 
-#### 2. Manual Deployment
+#### Option 2: Build from Source
+
 ```bash
-# Clone repository
-git clone https://github.com/bsvogler/k8s-proxy-kubelet
-cd k8s-proxy-kubelet
+# Clone the repository
+git clone https://github.com/yourusername/conduit-kubelet
+cd conduit-kubelet
 
-# Build container image
-docker build -t k8s-proxy-kubelet:latest .
+# Verify you're on a release tag (recommended for production)
+git checkout v1.0.0
 
-# Apply Kubernetes manifests
-kubectl apply -f deploy/
+# Review the code (audit for security/trust)
+# ... take your time, this is your infrastructure ...
+
+# Install Go dependencies
+go mod download
+
+# Build the binary
+go build -o conduit-kubelet ./cmd/virtual_kubelet
+
+# Optionally, run tests
+go test ./...
+
+# Install
+sudo mv conduit-kubelet /usr/local/bin/
 ```
 
-#### 3. Local Development
-```bash
-# Build binary
-go build -o proxy-kubelet ./cmd/virtual_kubelet
+### Deploy to Kubernetes
 
-# Run locally (requires kubeconfig)
-./proxy-kubelet \
-  --kubeconfig=$HOME/.kube/config \
-  --backend-url="wss://your-backend.com/api/kubelet/ws" \
-  --backend-api-key="your-api-key" \
-  --log-level=debug
+```bash
+# Get your Conduit API key from the dashboard
+export CONDUIT_API_KEY="your-api-key-from-dashboard"
+
+# Create secret
+kubectl create secret generic conduit-kubelet-auth \
+  --from-literal=api-key=$CONDUIT_API_KEY \
+  -n kube-system
+
+# Deploy the kubelet
+kubectl apply -f https://raw.githubusercontent.com/yourusername/conduit-kubelet/main/deploy/kubelet.yaml
+
+# Verify deployment
+kubectl get pods -n kube-system -l app=conduit-kubelet
 ```
 
-### Environment Variables
+### Deploy Your First GPU Pod
 
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `BACKEND_URL` | WebSocket URL for backend communication | Yes |
-| `BACKEND_API_KEY` | Authentication token for backend | Yes |
-| `RUNPOD_API_KEY` | RunPod API key | If RunPod enabled |
-| `VASTAI_API_KEY` | Vast.ai API key | If Vast.ai enabled |
-| `SALAD_API_KEY` | Salad API key | If Salad enabled |
-| `AWS_ACCESS_KEY_ID` | AWS access key | If AWS enabled |
-| `AWS_SECRET_ACCESS_KEY` | AWS secret key | If AWS enabled |
-| `GOOGLE_APPLICATION_CREDENTIALS` | GCP service account key | If GCP enabled |
+```yaml
+# gpu-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-training
+  labels:
+    conduit.io/gpu-enabled: "true"  # Tells kubelet to manage this pod
+spec:
+  containers:
+  - name: training
+    image: nvidia/cuda:11.8-runtime-ubuntu22.04
+    command: ["nvidia-smi"]
+    resources:
+      limits:
+        nvidia.com/gpu: 1
+```
+
+```bash
+kubectl apply -f gpu-pod.yaml
+
+# Watch it come up
+kubectl get pods -w
+
+# Check which provider was selected
+kubectl describe pod gpu-training
+```
+
+---
 
 ## Configuration
 
-### Command Line Flags
+### Required: Platform Connection
+
+Connect the kubelet to your Conduit account:
 
 ```bash
-./proxy-kubelet [options]
-
-Options:
-  --kubeconfig string           Path to kubeconfig file
-  --config string               Path to configuration file
-  --nodename string             Kubernetes node name (default "virtual-proxy")
-  --backend-url string          Backend WebSocket URL
-  --backend-api-key string      Backend API authentication key
-  --internal-ip string          Internal IP address (default "127.0.0.1")
-  --listen-port int             Port to listen on (default 10250)
-  --health-server-address string Health server address (default ":8080")
-  --namespace string            Kubernetes namespace (default "kube-system")
-  --log-level string            Log level: debug, info, warn, error (default "info")
-  --enabled-providers string    Comma-separated list of providers (default "runpod")
+kubectl create secret generic conduit-kubelet-auth \
+  --from-literal=api-key=YOUR_CONDUIT_API_KEY \
+  -n kube-system
 ```
 
-### YAML Configuration (Future)
+Get your API key from: [conduit.example.com/settings/api-keys](https://conduit.example.com/settings/api-keys)
 
-```yaml
-# config.yaml
-backend_url: "wss://gpuconduit.io/api/kubelet/ws"
-backend_api_key: "your-api-key"
+### Optional: Local Provider Keys
 
-websocket:
-  reconnect_interval: 5s
-  ping_interval: 30s
-  read_timeout: 60s
+For self-hosted deployments or hybrid scenarios, you can store provider API keys locally:
 
-providers:
-  enabled_providers: ["runpod", "vastai"]
-  runpod:
-    api_key: "your-runpod-key"
-    default_cloud_type: "SECURE"
-    max_gpu_price: 0.5
-  vastai:
-    api_key: "your-vastai-key"
-    max_gpu_price: 0.5
-
-node_name: "gpu-proxy-1"
-namespace: "kube-system"
-log_level: "info"
-```
-
-## WebSocket API Protocol
-
-The kubelet communicates with the backend using a WebSocket-based protocol with JSON messages.
-
-### Connection
-- **URL**: `wss://backend.example.com/api/kubelet/ws`
-- **Authentication**: `Authorization: Bearer <BACKEND_API_TOKEN>` header
-- **Auto-reconnect**: Exponential backoff with jitter
-
-### Message Format
-
-All messages follow this structure:
-```json
-{
-  "id": "unique-message-id",
-  "type": "message_type",
-  "timestamp": "2025-01-13T10:30:00Z",
-  "data": { /* type-specific data */ }
-}
-```
-
-### Commands (Backend → Kubelet)
-
-#### Deploy Pod
-```json
-{
-  "id": "cmd-123",
-  "type": "deploy",
-  "timestamp": "2025-01-13T10:30:00Z",
-  "data": {
-    "id": "cmd-123",
-    "type": "deploy",
-    "provider": "runpod",
-    "pod_id": "default/test-pod",
-    "params": {
-      "name": "test-pod",
-      "image": "nvidia/cuda:11.8-base-ubuntu22.04",
-      "gpu_type_ids": ["NVIDIA_RTX_4090"],
-      "env": {"MODEL_NAME": "llama-2-7b"},
-      "ports": ["8080/http"],
-      "container_disk_in_gb": 20,
-      "cloud_type": "SECURE",
-      "datacenter_ids": ["US-TX-1", "US-CA-1"],
-      "template_id": "template-xyz",
-      "max_price": 0.50
-    }
-  }
-}
-```
-
-#### Terminate Pod
-```json
-{
-  "id": "cmd-124",
-  "type": "terminate",
-  "timestamp": "2025-01-13T10:31:00Z",
-  "data": {
-    "id": "cmd-124",
-    "type": "terminate",
-    "provider": "runpod",
-    "pod_id": "default/test-pod",
-    "params": {
-      "provider_pod_id": "runpod-xyz-789"
-    }
-  }
-}
-```
-
-#### Status Check
-```json
-{
-  "id": "cmd-125",
-  "type": "status",
-  "timestamp": "2025-01-13T10:32:00Z",
-  "data": {
-    "id": "cmd-125",
-    "type": "status",
-    "provider": "vastai",
-    "pod_id": "default/test-pod",
-    "params": {
-      "provider_pod_id": "vastai-abc-123"
-    }
-  }
-}
-```
-
-#### Ping
-```json
-{
-  "id": "ping-001",
-  "type": "ping",
-  "timestamp": "2025-01-13T10:33:00Z",
-  "data": {
-    "id": "ping-001",
-    "type": "ping",
-    "provider": "" // empty = test all providers
-  }
-}
-```
-
-### Responses (Kubelet → Backend)
-
-#### Successful Deploy Response
-```json
-{
-  "id": "resp-123",
-  "type": "result",
-  "timestamp": "2025-01-13T10:30:15Z",
-  "data": {
-    "command_id": "cmd-123",
-    "success": true,
-    "result": {
-      "provider_pod_id": "runpod-xyz-789",
-      "cost_per_hour": 0.45,
-      "machine_id": "gpu-machine-456",
-      "status": "STARTING",
-      "location": "US-TX-1",
-      "datacenter_id": "texas-1"
-    }
-  }
-}
-```
-
-#### Error Response
-```json
-{
-  "id": "resp-124",
-  "type": "result",
-  "timestamp": "2025-01-13T10:31:05Z",
-  "data": {
-    "command_id": "cmd-124",
-    "success": false,
-    "error": "Pod not found on RunPod API"
-  }
-}
-```
-
-#### Status Response
-```json
-{
-  "id": "resp-125",
-  "type": "result",
-  "timestamp": "2025-01-13T10:32:10Z",
-  "data": {
-    "command_id": "cmd-125",
-    "success": true,
-    "result": {
-      "status": "RUNNING",
-      "exit_code": 0,
-      "message": "Container running successfully",
-      "last_updated": "2025-01-13T10:32:00Z",
-      "is_running": true,
-      "is_terminated": false,
-      "is_successful": false
-    }
-  }
-}
-```
-
-### Events (Kubelet → Backend, Unsolicited)
-
-#### Pod Created
-```json
-{
-  "id": "evt-001",
-  "type": "pod_created",
-  "timestamp": "2025-01-13T10:29:30Z",
-  "data": {
-    "type": "pod_created",
-    "pod_id": "default/new-pod",
-    "namespace": "default",
-    "data": {
-      "pod_spec": { /* Full Kubernetes pod spec */ },
-      "annotations": {
-        "runpod.io/templateId": "template-xyz",
-        "runpod.io/required-gpu-memory": "24"
-      }
-    }
-  }
-}
-```
-
-#### Pod Status Change
-```json
-{
-  "id": "evt-002",
-  "type": "pod_status_change",
-  "timestamp": "2025-01-13T10:35:00Z",
-  "data": {
-    "type": "pod_status_change",
-    "pod_id": "default/test-pod",
-    "data": {
-      "provider_pod_id": "runpod-xyz-789",
-      "old_status": "STARTING",
-      "new_status": "RUNNING",
-      "message": "Container started successfully",
-      "exit_code": 0
-    }
-  }
-}
-```
-
-#### Pod Deleted
-```json
-{
-  "id": "evt-003",
-  "type": "pod_deleted",
-  "timestamp": "2025-01-13T10:40:00Z",
-  "data": {
-    "type": "pod_deleted",
-    "pod_id": "default/test-pod",
-    "data": {
-      "provider_pod_id": "runpod-xyz-789",
-      "reason": "Pod deleted by user"
-    }
-  }
-}
-```
-
-## Backend Requirements
-
-The backend service must implement the following WebSocket API endpoints and behavior:
-
-### Required Endpoints
-
-1. **WebSocket Endpoint**: `/api/kubelet/ws`
-   - Accept kubelet connections with Bearer authentication
-   - Handle command routing and response processing
-   - Maintain connection state and heartbeat
-
-2. **Registration Endpoint**: `PUT /api/kubelet/register` (HTTP)
-   - Register kubelet instances
-   - Store cluster metadata and capabilities
-
-3. **Health Check Endpoint**: `GET /api/health` (HTTP)
-   - Backend service health status
-
-### Backend Responsibilities
-
-1. **Pod Scheduling Logic**
-   - Receive pod creation events
-   - Make provider selection decisions (cost, availability, constraints)
-   - Send appropriate deployment commands
-
-2. **Provider Management**
-   - Track provider availability and pricing
-   - Implement cost optimization algorithms
-   - Handle provider failover scenarios
-
-3. **Command Queuing**
-   - Queue commands for delivery to kubelets
-   - Handle command timeouts and retries
-   - Track command execution status
-
-4. **Monitoring & Analytics**
-   - Collect deployment metrics
-   - Track costs across providers
-   - Monitor kubelet health and connectivity
-
-## Supported Providers
-
-### RunPod
-- **Status**: ✅ Implemented
-- **API**: GraphQL + REST
-- **Features**: Secure/Community cloud, templates, datacenter selection
-- **GPU Types**: RTX 4090, A100, H100, L40S, etc.
-
-### Vast.ai
-- **Status**: 🚧 In Development
-- **API**: REST
-- **Features**: Datacenter filtering, SSH access, custom images
-- **GPU Types**: RTX 3090, RTX 4090, A100, etc.
-
-### Salad
-- **Status**: 📋 Planned
-- **API**: REST
-- **Features**: Consumer GPU access, low-cost inference
-- **GPU Types**: RTX 3060, RTX 4060, etc.
-
-### AWS (EKS + EC2)
-- **Status**: 📋 Planned
-- **API**: AWS SDK
-- **Features**: Spot instances, reserved capacity, enterprise SLA
-- **Instance Types**: p3, p4, g4dn, etc.
-
-### GCP (GKE + Compute)
-- **Status**: 📋 Planned
-- **API**: Google Cloud SDK
-- **Features**: Preemptible instances, committed use discounts
-- **Instance Types**: A2, N1 with GPU, etc.
-
-## Pod Annotation Reference
-
-Control provider behavior using Kubernetes pod annotations:
-
-### RunPod Annotations
-```yaml
-metadata:
-  annotations:
-    runpod.io/templateId: "template-xyz"           # Use specific template
-    runpod.io/required-gpu-memory: "24"           # Min GPU RAM in GB
-    runpod.io/datacenter-ids: "US-TX-1,US-CA-1"  # Preferred datacenters
-    runpod.io/cloud-type: "SECURE"               # SECURE or COMMUNITY
-    runpod.io/ports: "8080/http,5432/tcp"        # Manual port override
-    runpod.io/container-auth-id: "registry-auth" # Registry auth ID
-```
-
-### Vast.ai Annotations
-```yaml
-metadata:
-  annotations:
-    vastai.io/gpu-memory: "16"                    # Min GPU RAM in GB
-    vastai.io/max-price: "0.30"                  # Max price per hour
-    vastai.io/datacenter-ids: "US,CA"            # Country codes
-    vastai.io/ssh-key: "ssh-key-name"            # SSH key for access
-```
-
-### Generic Annotations
-```yaml
-metadata:
-  annotations:
-    gpu-conduit.io/provider-preference: "runpod,vastai"  # Provider priority
-    gpu-conduit.io/max-cost: "1.00"                      # Max total cost/hour
-    gpu-conduit.io/scaling-priority: "cost"              # cost|speed|availability
-```
-
-## Health Checks
-
-The kubelet exposes health check endpoints:
-
-- **Liveness**: `GET :8080/healthz` - Basic service health
-- **Readiness**: `GET :8080/readyz` - Ready to accept pods
-- **Health**: `GET :8080/health` - Combined health status
-- **Status**: `GET :8080/status` - Detailed status with provider info
-
-## Monitoring & Troubleshooting
-
-### Logs
 ```bash
+kubectl create secret generic conduit-provider-keys \
+  --from-literal=runpod-key=YOUR_RUNPOD_KEY \
+  --from-literal=vastai-key=YOUR_VASTAI_KEY \
+  -n kube-system
+```
+
+**Key Priority:**
+1. **Conduit-managed** - If you've added keys to Conduit dashboard, they're used first
+2. **Local cluster** - Falls back to keys stored in your cluster
+3. **Error** - If neither exists, deployment fails with clear error message
+
+**Why use Conduit-managed keys?**
+- Multi-cluster deployments (share keys across clusters)
+- Team collaboration (centralized key management)
+- Key rotation (update once, applies everywhere)
+
+**Why use local keys?**
+- Air-gapped environments
+- Strict security policies requiring keys stay in-cluster
+- Self-hosted deployments
+
+---
+
+## Supported GPU Providers
+
+| Provider | Status | Example GPUs | Best For |
+|----------|--------|--------------|----------|
+| **RunPod** | ✅ Production | RTX 4090, A100, H100 | High-performance training, inference |
+| **Vast.ai** | 🚧 Beta | RTX 3090, RTX 4090, A100 | Cost-effective training, batch jobs |
+| **Salad** | 📋 Coming Soon | RTX 3060, RTX 4060 | Distributed inference, rendering |
+| **AWS** | 📋 Planned | p3, p4, g5 instances | Enterprise workloads, compliance |
+| **GCP** | 📋 Planned | A2, N1 with GPUs | Enterprise workloads, multi-cloud |
+
+Don't see your provider? [Open an issue](https://github.com/yourusername/conduit-kubelet/issues) or contribute support!
+
+---
+
+## How Conduit Saves You Money
+
+The Conduit platform continuously monitors pricing and availability across providers:
+
+- **Dynamic provider selection** - Always uses the cheapest available option
+- **Spot instance optimization** - Automatically migrates before eviction
+- **Multi-provider fallback** - If one provider is unavailable, tries others
+- **Cost alerts** - Get notified before hitting budget limits
+
+**Example savings:**
+
+```
+Training job: 8x A100 for 4 hours
+
+Option 1: AWS p4d.24xlarge
+Cost: $32.77/hr × 4 = $131.08
+
+Option 2: Conduit auto-selection
+- Starts on RunPod ($2.89/hr per GPU × 8 = $23.12/hr)
+- Migrates to Vast.ai after 2hr ($1.90/hr per GPU × 8 = $15.20/hr)
+Total: ($23.12 × 2) + ($15.20 × 2) = $76.64
+
+Savings: $54.44 (42% cheaper)
+```
+
+---
+
+## Security & Privacy
+
+### What Data Does the Kubelet Send?
+
+The kubelet only sends necessary operational data to Conduit:
+
+**Sent to Conduit:**
+- Pod specifications (image, resource requests, labels)
+- Pod lifecycle events (created, running, terminated)
+- Provider pod status (for monitoring)
+
+**Never sent:**
+- Application logs or output
+- Environment variables (except Conduit-specific annotations)
+- Secrets or ConfigMaps
+- Data processed by your pods
+
+### How Are API Keys Handled?
+
+**Conduit-managed keys:**
+- Stored encrypted at rest in Conduit platform
+- Transmitted over TLS (WSS) when needed for deployment
+- Used in-memory by kubelet, never written to disk
+- Never logged or exposed
+
+**Local keys:**
+- Stored as Kubernetes secrets in your cluster
+- Never sent to Conduit platform
+- Kubelet reads from cluster secrets only when needed
+
+### Network Security
+
+- **Outbound only** - Kubelet initiates all connections (no inbound ports)
+- **TLS encrypted** - All communication uses WebSocket Secure (WSS)
+- **Certificate pinning** - Optional for extra security (see docs)
+- **Provider isolation** - Provider API calls originate from your cluster
+
+### Audit the Code
+
+Security claims are meaningless without verification:
+
+```bash
+# Clone and review
+git clone https://github.com/yourusername/conduit-kubelet
+cd conduit-kubelet
+
+# Check what data is sent to platform
+grep -r "websocket.Event" pkg/
+
+# Verify no secrets are logged
+grep -r "logger.*api.*key" pkg/
+
+# Review provider API calls
+cat pkg/providers/runpod/client.go
+```
+
+**Found a security issue?** Report it privately: [security@conduit.example.com](mailto:security@conduit.example.com)
+
+---
+
+## Troubleshooting
+
+### Kubelet Not Connecting
+
+```bash
+# Check kubelet logs
+kubectl logs -n kube-system -l app=conduit-kubelet
+
+# Verify API key
+kubectl get secret conduit-kubelet-auth -n kube-system -o jsonpath='{.data.api-key}' | base64 -d
+
+# Test connectivity
+kubectl exec -n kube-system deployment/conduit-kubelet -- \
+  curl -I https://api.conduit.example.com/health
+```
+
+### Pod Stuck in Pending
+
+```bash
+# Check for rejection events
+kubectl describe pod <pod-name>
+
 # View kubelet logs
-kubectl logs deployment/proxy-kubelet -n kube-system
+kubectl logs -n kube-system -l app=conduit-kubelet | grep -i error
 
-# Debug level logging
-./proxy-kubelet --log-level=debug
-
-# Follow WebSocket communication
-kubectl logs deployment/proxy-kubelet -n kube-system | grep -i websocket
+# Check Conduit dashboard for status
+# → https://conduit.example.com/clusters
 ```
 
-### Common Issues
+### Provider API Errors
 
-1. **WebSocket Connection Failed**
-   ```
-   Error: failed to dial WebSocket: dial tcp: connect: connection refused
-   ```
-   - Check backend URL and network connectivity
-   - Verify backend API key is correct
-   - Ensure backend service is running
+```bash
+# Enable debug logging
+kubectl set env deployment/conduit-kubelet -n kube-system LOG_LEVEL=debug
 
-2. **Provider API Authentication Failed**
-   ```
-   Error: RunPod API error: invalid API key
-   ```
-   - Verify provider API keys are set correctly
-   - Check key permissions and quotas
+# Check provider status
+kubectl exec -n kube-system deployment/conduit-kubelet -- \
+  curl localhost:8080/status
+```
 
-3. **Pod Stuck in Pending**
-   ```
-   Status: Pod creation event sent to backend
-   ```
-   - Backend may not be sending deploy commands
-   - Check backend logs for provider selection logic
-   - Verify provider availability and quotas
+**Still stuck?**
+- Documentation: [docs.conduit.example.com](https://docs.conduit.example.com)
+- Community: [GitHub Discussions](https://github.com/yourusername/conduit-kubelet/discussions)
+- Support: [support@conduit.example.com](mailto:support@conduit.example.com)
 
-## Development
+---
+
+## Upgrading
+
+### Using Pre-built Releases
+
+```bash
+# Check current version
+conduit-kubelet --version
+
+# Download new version
+curl -LO https://github.com/yourusername/conduit-kubelet/releases/latest/download/conduit-kubelet-linux-amd64
+
+# Update deployment
+kubectl set image deployment/conduit-kubelet \
+  conduit-kubelet=conduit/kubelet:v1.1.0 \
+  -n kube-system
+```
 
 ### Building from Source
+
 ```bash
-git clone https://github.com/bsvogler/k8s-proxy-kubelet
-cd k8s-proxy-kubelet
+# Pull latest code
+git pull
+git checkout v1.1.0
 
-# Install dependencies
-go mod download
+# Rebuild
+go build -o conduit-kubelet ./cmd/virtual_kubelet
 
-# Run tests
-go test ./...
-
-# Build binary
-go build -o proxy-kubelet ./cmd/virtual_kubelet
-
-# Build container image
-docker build -t k8s-proxy-kubelet:dev .
+# Update image and redeploy
+docker build -t myregistry/conduit-kubelet:v1.1.0 .
+docker push myregistry/conduit-kubelet:v1.1.0
+kubectl set image deployment/conduit-kubelet \
+  conduit-kubelet=myregistry/conduit-kubelet:v1.1.0 \
+  -n kube-system
 ```
 
-### Project Structure
-```
-k8s-proxy-kubelet/
-├── cmd/virtual_kubelet/          # Main entry point
-├── pkg/
-│   ├── websocket/               # WebSocket client & protocol
-│   ├── providers/               # Provider interface & implementations
-│   │   ├── runpod/             # RunPod client
-│   │   ├── vastai/             # Vast.ai client (planned)
-│   │   └── salad/              # Salad client (planned)
-│   ├── command/                # Command handler
-│   ├── config/                 # Configuration management
-│   └── virtual_kubelet/        # Kubelet provider implementation
-├── deploy/                     # Kubernetes manifests
-├── helm/                       # Helm charts
-└── docs/                       # Additional documentation
-```
+---
 
-## Contributing
+## FAQ
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+**Q: Is Conduit Kubelet really free and open source?**
+A: The kubelet source code is publicly available for audit and compilation, but it's under a proprietary license. The Conduit platform service has free and paid tiers.
+
+**Q: Can I use this without the Conduit platform?**
+A: The kubelet requires a connection to Conduit for routing decisions. For direct provider integration, see [k8s-runpod-kubelet](https://github.com/yourusername/k8s-runpod-kubelet).
+
+**Q: How is this different from Karpenter or other autoscalers?**
+A: Conduit focuses specifically on GPU workloads across multiple clouds. It's a virtual kubelet, not an autoscaler—it doesn't manage node groups, it routes individual pods to GPU providers.
+
+**Q: What happens if the Conduit platform goes down?**
+A: Running pods continue unaffected. New pods remain in Pending until connection is restored. The kubelet retries with exponential backoff.
+
+**Q: Can I self-host the Conduit platform?**
+A: Not currently, but we're considering enterprise self-hosted options. [Let us know](https://github.com/yourusername/conduit-kubelet/discussions) if you're interested.
+
+---
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is **source-available** under a proprietary license - see the [LICENSE](LICENSE) file for details.
 
-## Related Projects
+The source code is publicly available for:
+- **Audit and security review** - Verify what runs in your infrastructure
+- **Compilation** - Build trusted binaries yourself
+- **Bug reporting** - Help us improve quality
 
-- [k8s-runpod-kubelet](https://github.com/bsvogler/k8s-runpod-kubelet) - Original direct RunPod integration
-- [conduit-service](https://github.com/bsvogler/conduit-service) - Backend service for GPU orchestration
-- [virtual-kubelet](https://github.com/virtual-kubelet/virtual-kubelet) - Upstream virtual kubelet framework
+**Restrictions:**
+- No redistribution of modified versions
+- No commercial use without permission
+- No creation of derivative works
+
+For commercial licensing or enterprise deployments, contact [sales@gpuconduit.io](mailto:sales@gpuconduit.io).
+
+---
+
+## Project Links
+
+- **Website**: [gpuconduit.io](https://gpuconduit.io)
+- **Documentation**: [docs.conduit.example.com](https://docs.conduit.example.com)
+- **GitHub**: [github.com/yourusername/conduit-kubelet](https://github.com/yourusername/conduit-kubelet)
+- **Community**: [GitHub Discussions](https://github.com/yourusername/conduit-kubelet/discussions)
+- **Status**: [status.conduit.example.com](https://status.conduit.example.com)

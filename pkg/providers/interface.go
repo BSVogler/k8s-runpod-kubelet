@@ -2,12 +2,17 @@ package providers
 
 import (
 	"context"
-	"time"
 
 	"github.com/bsvogler/conduit-kubelet/pkg/websocket"
 )
 
-// Provider defines the interface that all cloud GPU providers must implement
+// Provider defines the interface that all cloud GPU providers must implement.
+//
+// NOTE: This interface has been simplified for SaaS platform architecture.
+// Pricing and availability queries have been removed as they represent routing logic
+// that belongs in the platform, not the kubelet. The kubelet is a pure command executor.
+//
+// All methods now accept params objects that may contain platform-managed API keys.
 type Provider interface {
 	// GetName returns the provider name (e.g., "runpod", "vastai")
 	GetName() string
@@ -16,73 +21,18 @@ type Provider interface {
 	Deploy(ctx context.Context, params *websocket.DeployParams) (*websocket.DeployResult, error)
 
 	// GetStatus retrieves the current status of a deployed instance
-	GetStatus(ctx context.Context, providerPodID string) (*websocket.StatusResult, error)
+	GetStatus(ctx context.Context, params *websocket.StatusParams) (*websocket.StatusResult, error)
 
 	// Terminate stops and removes a deployed instance
-	Terminate(ctx context.Context, providerPodID string) error
-
-	// GetPricing retrieves current pricing information for available GPU types
-	GetPricing(ctx context.Context) (*PricingResult, error)
-
-	// GetAvailability checks which GPU types are currently available
-	GetAvailability(ctx context.Context, requirements *AvailabilityQuery) (*AvailabilityResult, error)
+	Terminate(ctx context.Context, params *websocket.TerminateParams) error
 
 	// Ping tests connectivity to the provider's API
 	Ping(ctx context.Context) error
 }
 
-// PricingResult contains pricing information from a provider
-type PricingResult struct {
-	Provider  string     `json:"provider"`
-	Currency  string     `json:"currency"`
-	Timestamp time.Time  `json:"timestamp"`
-	GPUTypes  []GPUPrice `json:"gpu_types"`
-}
-
-// GPUPrice represents the price of a specific GPU type
-type GPUPrice struct {
-	ID           string  `json:"id"`
-	DisplayName  string  `json:"display_name"`
-	MemoryGB     int     `json:"memory_gb"`
-	PricePerHour float64 `json:"price_per_hour"`
-	Available    bool    `json:"available"`
-	CloudType    string  `json:"cloud_type,omitempty"` // For providers that have different cloud types
-}
-
-// AvailabilityQuery represents requirements for checking availability
-type AvailabilityQuery struct {
-	MinMemoryGB   int      `json:"min_memory_gb"`
-	MaxPricePerHr float64  `json:"max_price_per_hr"`
-	DatacenterIDs []string `json:"datacenter_ids,omitempty"`
-	CloudType     string   `json:"cloud_type,omitempty"`
-}
-
-// AvailabilityResult contains availability information
-type AvailabilityResult struct {
-	Provider       string             `json:"provider"`
-	Timestamp      time.Time          `json:"timestamp"`
-	AvailableGPUs  []AvailableGPU     `json:"available_gpus"`
-	Datacenters    []DatacenterInfo   `json:"datacenters,omitempty"`
-}
-
-// AvailableGPU represents an available GPU instance
-type AvailableGPU struct {
-	ID           string  `json:"id"`
-	DisplayName  string  `json:"display_name"`
-	MemoryGB     int     `json:"memory_gb"`
-	PricePerHour float64 `json:"price_per_hour"`
-	DatacenterID string  `json:"datacenter_id,omitempty"`
-	CloudType    string  `json:"cloud_type,omitempty"`
-	Count        int     `json:"count"` // Number of available instances
-}
-
-// DatacenterInfo represents information about a datacenter
-type DatacenterInfo struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Location string `json:"location"`
-	Country  string `json:"country,omitempty"`
-}
+// NOTE: Pricing and availability types have been removed.
+// These represent routing/intelligence logic that belongs in the platform, not the kubelet.
+// Platform services should maintain their own provider clients for pricing and availability queries.
 
 // ProviderError represents an error from a cloud provider
 type ProviderError struct {

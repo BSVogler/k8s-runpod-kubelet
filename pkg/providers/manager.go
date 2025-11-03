@@ -95,7 +95,7 @@ func (m *Manager) Deploy(ctx context.Context, providerName string, params *webso
 }
 
 // GetStatus retrieves the status of a pod from the specified provider
-func (m *Manager) GetStatus(ctx context.Context, providerName string, providerPodID string) (*websocket.StatusResult, error) {
+func (m *Manager) GetStatus(ctx context.Context, providerName string, params *websocket.StatusParams) (*websocket.StatusResult, error) {
 	provider, err := m.GetProvider(providerName)
 	if err != nil {
 		return nil, err
@@ -103,27 +103,27 @@ func (m *Manager) GetStatus(ctx context.Context, providerName string, providerPo
 
 	m.logger.Debug("Getting pod status",
 		"provider", providerName,
-		"provider_pod_id", providerPodID)
+		"provider_pod_id", params.ProviderPodID)
 
-	result, err := provider.GetStatus(ctx, providerPodID)
+	result, err := provider.GetStatus(ctx, params)
 	if err != nil {
 		m.logger.Error("Failed to get pod status",
 			"provider", providerName,
-			"provider_pod_id", providerPodID,
+			"provider_pod_id", params.ProviderPodID,
 			"error", err)
 		return nil, err
 	}
 
 	m.logger.Debug("Pod status retrieved",
 		"provider", providerName,
-		"provider_pod_id", providerPodID,
+		"provider_pod_id", params.ProviderPodID,
 		"status", result.Status)
 
 	return result, nil
 }
 
 // Terminate terminates a pod on the specified provider
-func (m *Manager) Terminate(ctx context.Context, providerName string, providerPodID string) error {
+func (m *Manager) Terminate(ctx context.Context, providerName string, params *websocket.TerminateParams) error {
 	provider, err := m.GetProvider(providerName)
 	if err != nil {
 		return err
@@ -131,162 +131,27 @@ func (m *Manager) Terminate(ctx context.Context, providerName string, providerPo
 
 	m.logger.Info("Terminating pod",
 		"provider", providerName,
-		"provider_pod_id", providerPodID)
+		"provider_pod_id", params.ProviderPodID)
 
-	err = provider.Terminate(ctx, providerPodID)
+	err = provider.Terminate(ctx, params)
 	if err != nil {
 		m.logger.Error("Failed to terminate pod",
 			"provider", providerName,
-			"provider_pod_id", providerPodID,
+			"provider_pod_id", params.ProviderPodID,
 			"error", err)
 		return err
 	}
 
 	m.logger.Info("Pod terminated successfully",
 		"provider", providerName,
-		"provider_pod_id", providerPodID)
+		"provider_pod_id", params.ProviderPodID)
 
 	return nil
 }
 
-// GetPricing retrieves pricing information from a specific provider
-func (m *Manager) GetPricing(ctx context.Context, providerName string) (*PricingResult, error) {
-	provider, err := m.GetProvider(providerName)
-	if err != nil {
-		return nil, err
-	}
-
-	m.logger.Debug("Getting pricing information", "provider", providerName)
-
-	result, err := provider.GetPricing(ctx)
-	if err != nil {
-		m.logger.Error("Failed to get pricing information",
-			"provider", providerName,
-			"error", err)
-		return nil, err
-	}
-
-	m.logger.Debug("Pricing information retrieved",
-		"provider", providerName,
-		"gpu_types_count", len(result.GPUTypes))
-
-	return result, nil
-}
-
-// GetAvailability checks availability for a specific provider
-func (m *Manager) GetAvailability(ctx context.Context, providerName string, query *AvailabilityQuery) (*AvailabilityResult, error) {
-	provider, err := m.GetProvider(providerName)
-	if err != nil {
-		return nil, err
-	}
-
-	m.logger.Debug("Checking availability",
-		"provider", providerName,
-		"min_memory_gb", query.MinMemoryGB,
-		"max_price", query.MaxPricePerHr)
-
-	result, err := provider.GetAvailability(ctx, query)
-	if err != nil {
-		m.logger.Error("Failed to check availability",
-			"provider", providerName,
-			"error", err)
-		return nil, err
-	}
-
-	m.logger.Debug("Availability checked",
-		"provider", providerName,
-		"available_gpus_count", len(result.AvailableGPUs))
-
-	return result, nil
-}
-
-// GetAllPricing retrieves pricing information from all registered providers
-func (m *Manager) GetAllPricing(ctx context.Context) (map[string]*PricingResult, error) {
-	m.mutex.RLock()
-	providers := make(map[string]Provider)
-	for name, provider := range m.providers {
-		providers[name] = provider
-	}
-	m.mutex.RUnlock()
-
-	results := make(map[string]*PricingResult)
-	errors := make(map[string]error)
-
-	var wg sync.WaitGroup
-	var resultMutex sync.Mutex
-
-	for name, provider := range providers {
-		wg.Add(1)
-		go func(name string, provider Provider) {
-			defer wg.Done()
-
-			result, err := provider.GetPricing(ctx)
-
-			resultMutex.Lock()
-			if err != nil {
-				errors[name] = err
-			} else {
-				results[name] = result
-			}
-			resultMutex.Unlock()
-		}(name, provider)
-	}
-
-	wg.Wait()
-
-	// Log any errors but don't fail the entire operation
-	for name, err := range errors {
-		m.logger.Warn("Failed to get pricing from provider",
-			"provider", name,
-			"error", err)
-	}
-
-	return results, nil
-}
-
-// GetAllAvailability checks availability across all registered providers
-func (m *Manager) GetAllAvailability(ctx context.Context, query *AvailabilityQuery) (map[string]*AvailabilityResult, error) {
-	m.mutex.RLock()
-	providers := make(map[string]Provider)
-	for name, provider := range m.providers {
-		providers[name] = provider
-	}
-	m.mutex.RUnlock()
-
-	results := make(map[string]*AvailabilityResult)
-	errors := make(map[string]error)
-
-	var wg sync.WaitGroup
-	var resultMutex sync.Mutex
-
-	for name, provider := range providers {
-		wg.Add(1)
-		go func(name string, provider Provider) {
-			defer wg.Done()
-
-			result, err := provider.GetAvailability(ctx, query)
-
-			resultMutex.Lock()
-			if err != nil {
-				errors[name] = err
-			} else {
-				results[name] = result
-			}
-			resultMutex.Unlock()
-		}(name, provider)
-	}
-
-	wg.Wait()
-
-	// Log any errors but don't fail the entire operation
-	for name, err := range errors {
-		m.logger.Warn("Failed to check availability from provider",
-			"provider", name,
-			"error", err)
-	}
-
-	return results, nil
-}
+// Removed routing logic methods (GetPricing, GetAvailability, GetAllPricing, GetAllAvailability).
+// These methods represented routing/intelligence logic that belongs in the platform, not the kubelet.
+// Platform services should maintain their own provider clients for pricing and availability queries.
 
 // PingAll tests connectivity to all registered providers
 func (m *Manager) PingAll(ctx context.Context) map[string]error {

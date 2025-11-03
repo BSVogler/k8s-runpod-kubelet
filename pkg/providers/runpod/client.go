@@ -112,11 +112,18 @@ func (c *Client) GetName() string {
 
 // Deploy creates a new GPU instance on RunPod
 func (c *Client) Deploy(ctx context.Context, params *websocket.DeployParams) (*websocket.DeployResult, error) {
+	// Get API key from params (platform-managed) or fall back to local environment
+	apiKey := c.getAPIKey(params.APIKey)
+	if apiKey == "" {
+		return nil, providers.NewProviderError("runpod", "missing_api_key",
+			"no API key provided and RUNPOD_API_KEY not set", false)
+	}
+
 	// Convert parameters to RunPod format
 	runpodParams := c.convertDeployParams(params)
 
-	// Deploy using REST API
-	podID, costPerHour, err := c.deployPodREST(runpodParams)
+	// Deploy using REST API with the API key
+	podID, costPerHour, err := c.deployPodRESTWithKey(runpodParams, apiKey)
 	if err != nil {
 		return nil, providers.NewProviderError("runpod", "deployment_failed", err.Error(), true)
 	}
@@ -131,8 +138,15 @@ func (c *Client) Deploy(ctx context.Context, params *websocket.DeployParams) (*w
 }
 
 // GetStatus retrieves the current status of a RunPod instance
-func (c *Client) GetStatus(ctx context.Context, providerPodID string) (*websocket.StatusResult, error) {
-	status, err := c.getDetailedPodStatus(providerPodID)
+func (c *Client) GetStatus(ctx context.Context, params *websocket.StatusParams) (*websocket.StatusResult, error) {
+	// Get API key from params (platform-managed) or fall back to local environment
+	apiKey := c.getAPIKey(params.APIKey)
+	if apiKey == "" {
+		return nil, providers.NewProviderError("runpod", "missing_api_key",
+			"no API key provided and RUNPOD_API_KEY not set", false)
+	}
+
+	status, err := c.getDetailedPodStatusWithKey(params.ProviderPodID, apiKey)
 	if err != nil {
 		return nil, providers.NewProviderError("runpod", "status_check_failed", err.Error(), true)
 	}
@@ -167,101 +181,24 @@ func (c *Client) GetStatus(ctx context.Context, providerPodID string) (*websocke
 }
 
 // Terminate stops and removes a RunPod instance
-func (c *Client) Terminate(ctx context.Context, providerPodID string) error {
-	err := c.terminatePod(providerPodID)
+func (c *Client) Terminate(ctx context.Context, params *websocket.TerminateParams) error {
+	// Get API key from params (platform-managed) or fall back to local environment
+	apiKey := c.getAPIKey(params.APIKey)
+	if apiKey == "" {
+		return providers.NewProviderError("runpod", "missing_api_key",
+			"no API key provided and RUNPOD_API_KEY not set", false)
+	}
+
+	err := c.terminatePodWithKey(params.ProviderPodID, apiKey)
 	if err != nil {
 		return providers.NewProviderError("runpod", "termination_failed", err.Error(), true)
 	}
 	return nil
 }
 
-// GetPricing retrieves current GPU pricing from RunPod
-func (c *Client) GetPricing(ctx context.Context) (*providers.PricingResult, error) {
-	gpuTypes, err := c.getGPUTypes(0, 999.99, "SECURE") // Get all secure GPUs
-	if err != nil {
-		return nil, providers.NewProviderError("runpod", "pricing_failed", err.Error(), true)
-	}
-
-	var gpuPrices []providers.GPUPrice
-	for _, gpu := range gpuTypes {
-		price := providers.GPUPrice{
-			ID:           gpu.ID,
-			DisplayName:  gpu.DisplayName,
-			MemoryGB:     gpu.MemoryInGb,
-			PricePerHour: gpu.SecurePrice,
-			Available:    gpu.SecureCloud && gpu.SecurePrice > 0,
-			CloudType:    "SECURE",
-		}
-		gpuPrices = append(gpuPrices, price)
-	}
-
-	// Also get community pricing
-	communityGPUs, err := c.getGPUTypes(0, 999.99, "COMMUNITY")
-	if err == nil {
-		for _, gpu := range communityGPUs {
-			price := providers.GPUPrice{
-				ID:           gpu.ID + "_COMMUNITY",
-				DisplayName:  gpu.DisplayName + " (Community)",
-				MemoryGB:     gpu.MemoryInGb,
-				PricePerHour: gpu.CommunityPrice,
-				Available:    gpu.CommunityCloud && gpu.CommunityPrice > 0,
-				CloudType:    "COMMUNITY",
-			}
-			gpuPrices = append(gpuPrices, price)
-		}
-	}
-
-	return &providers.PricingResult{
-		Provider:  "runpod",
-		Currency:  "USD",
-		Timestamp: time.Now(),
-		GPUTypes:  gpuPrices,
-	}, nil
-}
-
-// GetAvailability checks GPU availability on RunPod
-func (c *Client) GetAvailability(ctx context.Context, query *providers.AvailabilityQuery) (*providers.AvailabilityResult, error) {
-	cloudType := query.CloudType
-	if cloudType == "" {
-		cloudType = "SECURE"
-	}
-
-	gpuTypes, err := c.getGPUTypes(query.MinMemoryGB, query.MaxPricePerHr, cloudType)
-	if err != nil {
-		return nil, providers.NewProviderError("runpod", "availability_failed", err.Error(), true)
-	}
-
-	var availableGPUs []providers.AvailableGPU
-	for _, gpu := range gpuTypes {
-		var price float64
-		var available bool
-
-		if cloudType == "SECURE" {
-			price = gpu.SecurePrice
-			available = gpu.SecureCloud
-		} else {
-			price = gpu.CommunityPrice
-			available = gpu.CommunityCloud
-		}
-
-		if available && price > 0 && price <= query.MaxPricePerHr && gpu.MemoryInGb >= query.MinMemoryGB {
-			availableGPUs = append(availableGPUs, providers.AvailableGPU{
-				ID:           gpu.ID,
-				DisplayName:  gpu.DisplayName,
-				MemoryGB:     gpu.MemoryInGb,
-				PricePerHour: price,
-				CloudType:    cloudType,
-				Count:        1, // RunPod doesn't provide exact counts
-			})
-		}
-	}
-
-	return &providers.AvailabilityResult{
-		Provider:      "runpod",
-		Timestamp:     time.Now(),
-		AvailableGPUs: availableGPUs,
-	}, nil
-}
+// NOTE: GetPricing and GetAvailability methods have been removed.
+// These represent routing logic that belongs in the platform, not the kubelet.
+// Platform services should maintain their own RunPod clients for pricing/availability queries.
 
 // Ping tests connectivity to RunPod API
 func (c *Client) Ping(ctx context.Context) error {
@@ -423,12 +360,16 @@ func (c *Client) getGPUTypes(minRAMPerGPU int, maxPrice float64, cloudType strin
 }
 
 func (c *Client) deployPodREST(params map[string]interface{}) (string, float64, error) {
+	return c.deployPodRESTWithKey(params, c.apiKey)
+}
+
+func (c *Client) deployPodRESTWithKey(params map[string]interface{}, apiKey string) (string, float64, error) {
 	reqBody, err := json.Marshal(params)
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	resp, err := c.makeRESTRequest("POST", "pods", bytes.NewBuffer(reqBody))
+	resp, err := c.makeRESTRequestWithKey("POST", "pods", bytes.NewBuffer(reqBody), apiKey)
 	if err != nil {
 		return "", 0, fmt.Errorf("API request failed: %w", err)
 	}
@@ -460,9 +401,13 @@ func (c *Client) deployPodREST(params map[string]interface{}) (string, float64, 
 }
 
 func (c *Client) getDetailedPodStatus(podID string) (*DetailedStatus, error) {
+	return c.getDetailedPodStatusWithKey(podID, c.apiKey)
+}
+
+func (c *Client) getDetailedPodStatusWithKey(podID string, apiKey string) (*DetailedStatus, error) {
 	endpoint := fmt.Sprintf("pods/%s", podID)
 
-	resp, err := c.makeRESTRequest("GET", endpoint, nil)
+	resp, err := c.makeRESTRequestWithKey("GET", endpoint, nil, apiKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get pod details: %w", err)
 	}
@@ -491,9 +436,13 @@ func (c *Client) getDetailedPodStatus(podID string) (*DetailedStatus, error) {
 }
 
 func (c *Client) terminatePod(podID string) error {
+	return c.terminatePodWithKey(podID, c.apiKey)
+}
+
+func (c *Client) terminatePodWithKey(podID string, apiKey string) error {
 	endpoint := fmt.Sprintf("pods/%s/stop", podID)
 
-	resp, err := c.makeRESTRequest("POST", endpoint, nil)
+	resp, err := c.makeRESTRequestWithKey("POST", endpoint, nil, apiKey)
 	if err != nil {
 		return err
 	}
@@ -508,6 +457,10 @@ func (c *Client) terminatePod(podID string) error {
 }
 
 func (c *Client) makeRESTRequest(method, endpoint string, body io.Reader) (*http.Response, error) {
+	return c.makeRESTRequestWithKey(method, endpoint, body, c.apiKey)
+}
+
+func (c *Client) makeRESTRequestWithKey(method, endpoint string, body io.Reader, apiKey string) (*http.Response, error) {
 	url := fmt.Sprintf("%s%s", c.baseRESTURL, endpoint)
 	req, err := http.NewRequest(method, url, body)
 	if err != nil {
@@ -515,7 +468,7 @@ func (c *Client) makeRESTRequest(method, endpoint string, body io.Reader) (*http
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.apiKey))
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiKey))
 
 	timeout := DefaultAPITimeout
 	if method == "POST" && endpoint == "pods" {
@@ -548,4 +501,20 @@ func (c *Client) isSuccessfulCompletion(status *DetailedStatus) bool {
 	}
 
 	return false
+}
+
+// getAPIKey returns the API key from params if provided, otherwise falls back to client's configured key or environment
+func (c *Client) getAPIKey(paramKey string) string {
+	// Use key from command params if provided (SaaS mode - platform-managed)
+	if paramKey != "" {
+		return paramKey
+	}
+
+	// Fall back to client's configured key (from environment at initialization)
+	if c.apiKey != "" {
+		return c.apiKey
+	}
+
+	// Last resort: check environment variable directly
+	return os.Getenv("RUNPOD_API_KEY")
 }

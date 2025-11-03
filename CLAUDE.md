@@ -1,10 +1,37 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with the k8s-proxy-kubelet repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with the conduit-kubelet repository.
 
 ## Project Overview
 
-This is a command-and-control virtual kubelet that acts as a proxy between Kubernetes and multiple GPU cloud providers. Unlike traditional virtual kubelets that make provider API calls automatically, this kubelet only executes provider calls when instructed by a backend service via WebSocket commands. This architecture enables centralized routing decisions while keeping API keys secure in-cluster.
+Conduit Kubelet is an **open-source virtual Kubernetes kubelet** that acts as a pure proxy between Kubernetes clusters and GPU cloud providers. It is designed for a **SaaS platform architecture** where all routing intelligence, cost optimization, and provider selection logic resides in a proprietary platform service.
+
+**Architecture Principle:** The kubelet is a **pure command executor** with no business logic. The platform makes all decisions.
+
+### Key Characteristics
+
+- **Command-and-Control**: Kubelet only executes commands from the platform, never makes routing decisions
+- **Event-Driven**: Reports all Kubernetes pod lifecycle events to the platform
+- **Dual Key Mode**: Supports both platform-managed API keys (SaaS) and local keys (self-hosted)
+- **Open Source**: This kubelet is open source; the platform is proprietary (your business)
+
+### What Kubelet Does
+
+1. Detects Kubernetes pod events (created, deleted)
+2. Reports events to platform via WebSocket
+3. Executes commands from platform (deploy, terminate, status)
+4. Updates Kubernetes pod status based on results
+5. Handles platform rejections (plan limits, quotas)
+
+### What Kubelet Does NOT Do
+
+- ❌ Provider selection or routing decisions
+- ❌ Cost optimization or pricing queries
+- ❌ Availability checking across providers
+- ❌ Plan limit enforcement (platform's job)
+- ❌ User quota management
+
+**For detailed architecture, see `docs/ARCHITECTURE.md`**
 
 ## Architecture
 
@@ -29,12 +56,18 @@ This is a command-and-control virtual kubelet that acts as a proxy between Kuber
 **Main Entry** (`cmd/virtual_kubelet/`)
 - `main.go`: Application entry point with configuration and controller setup
 
-### Data Flow
+### Data Flow (SaaS Mode)
 
-1. **Pod Creation**: K8s schedules pod → Kubelet reports to backend via WebSocket
-2. **Backend Decision**: Backend analyzes pod requirements and selects provider
-3. **Command Execution**: Backend sends deploy command → Kubelet executes RunPod/Vast.ai API call
-4. **Status Updates**: Kubelet reports results and updates K8s pod status
+1. **Event Detection**: K8s schedules pod → Kubelet sends `pod_created` event to platform
+2. **Platform Intelligence**: Platform analyzes requirements, checks quotas, selects provider
+3. **Command Execution**: Platform sends `deploy` command with provider name + API key → Kubelet executes provider API call
+4. **Status Updates**: Kubelet returns result → Platform tracks cost → Kubelet updates K8s pod status
+5. **Rejection Handling**: If platform rejects (plan limits, quota), kubelet creates K8s event and keeps pod pending
+
+**Terminology:**
+- **Platform** = Proprietary SaaS backend service (your business logic)
+- **Providers** = GPU cloud providers (RunPod, Vast.ai, Salad, etc.)
+- **Kubelet** = This open-source proxy (conduit-kubelet)
 
 ## Build and Development Commands
 
@@ -87,41 +120,53 @@ docker run --rm \
   k8s-proxy-kubelet:latest
 ```
 
-## Key Differences from Original Kubelet
+## API Key Management
 
-### Command-Driven vs Event-Driven
-- **Original**: Automatically deploys pods when K8s schedules them
-- **Proxy**: Reports pod events to backend, waits for deployment commands
+Conduit Kubelet supports two modes for API key management:
 
-### API Key Storage
-- **Original**: Provider keys stored in kubelet environment
-- **Proxy**: Keys stored in-cluster, backend uses separate authentication
+### Mode 1: Platform-Managed Keys (SaaS)
+- User adds provider API keys to platform web UI
+- Platform stores keys encrypted
+- Platform includes key in each command
+- Kubelet never stores keys locally
+- **Use Case:** Multi-tenant SaaS deployments
 
-### Provider Selection
-- **Original**: Uses annotations and availability checks locally
-- **Proxy**: Backend makes all routing decisions centrally
+### Mode 2: Local Keys (Self-Hosted)
+- Provider API keys stored as Kubernetes secrets
+- Mounted to kubelet pod as environment variables
+- Platform sends commands WITHOUT keys
+- Kubelet falls back to local environment
+- **Use Case:** Single-tenant, self-hosted deployments
 
-### WebSocket Communication
-- **Original**: Direct HTTP/GraphQL calls to providers
-- **Proxy**: WebSocket-based command protocol with backend
+### Implementation
+```go
+// Providers check for key in command params first
+apiKey := params.APIKey  // From platform (SaaS mode)
+if apiKey == "" {
+    apiKey = os.Getenv("RUNPOD_API_KEY")  // Fall back to local (self-hosted mode)
+}
+```
+
+**Security:** Keys are never logged, always transmitted over TLS (WSS://)
 
 ## Configuration
 
 ### Environment Variables
 
 **Required:**
-- `BACKEND_URL`: WebSocket URL for backend (e.g., "wss://gpuconduit.io/api/kubelet/ws")
-- `BACKEND_API_KEY`: Authentication token for backend service
+- `BACKEND_URL`: WebSocket URL for platform (e.g., "wss://platform.example.com/api/kubelet/ws")
+- `BACKEND_API_KEY`: Authentication token for platform service
 
-**Provider Keys (at least one required):**
-- `RUNPOD_API_KEY`: RunPod API key
-- `VASTAI_API_KEY`: Vast.ai API key (when implemented)
-- `SALAD_API_KEY`: Salad API key (when implemented)
+**Provider Keys (optional - only for self-hosted mode):**
+- `RUNPOD_API_KEY`: RunPod API key (optional if platform provides keys)
+- `VASTAI_API_KEY`: Vast.ai API key (optional if platform provides keys)
+- `SALAD_API_KEY`: Salad API key (optional if platform provides keys)
 
 **Optional:**
-- `NODE_NAME`: Kubernetes node name (default: "virtual-proxy")
+- `NODE_NAME`: Kubernetes node name (default: "conduit-kubelet")
 - `NAMESPACE`: Kubernetes namespace (default: "kube-system")
 - `LOG_LEVEL`: Logging level (default: "info")
+- `KEY_MODE`: Key management mode - "local", "platform", or "hybrid" (default: "hybrid")
 
 ### Command Line Flags
 - `--kubeconfig`: Path to kubeconfig file
@@ -133,9 +178,23 @@ docker run --rm \
 ## WebSocket Protocol
 
 ### Message Types
-- **Commands** (Backend → Kubelet): `deploy`, `terminate`, `status`, `ping`
-- **Events** (Kubelet → Backend): `pod_created`, `pod_status_change`, `pod_deleted`
-- **Responses** (Kubelet → Backend): `result`, `error`
+- **Commands** (Platform → Kubelet): `deploy`, `terminate`, `status`, `ping`
+- **Events** (Kubelet → Platform): `pod_created`, `pod_deleted`, `kubelet_registration`
+- **Responses** (Kubelet → Platform): `result`, `error`
+- **Rejections** (Platform → Kubelet): `rejection` with error codes (plan limits, quota, credits)
+
+### Rejection Handling
+When the platform rejects a deployment (e.g., plan limit exceeded), the kubelet:
+1. Receives rejection message with error code and remediation info
+2. Creates Kubernetes Event with reason and message
+3. Keeps pod in Pending state (does not fail it)
+4. User sees event in `kubectl describe pod`
+
+**Common Rejection Codes:**
+- `PLAN_LIMIT_EXCEEDED` - User at concurrent pod limit
+- `QUOTA_EXCEEDED` - User/team quota exceeded
+- `INSUFFICIENT_CREDITS` - Not enough balance
+- `COST_LIMIT_EXCEEDED` - Pod exceeds cost limits
 
 ### Debug WebSocket Communication
 ```bash
@@ -161,11 +220,17 @@ type Provider interface {
     Deploy(ctx context.Context, params *websocket.DeployParams) (*websocket.DeployResult, error)
     GetStatus(ctx context.Context, providerPodID string) (*websocket.StatusResult, error)
     Terminate(ctx context.Context, providerPodID string) error
-    GetPricing(ctx context.Context) (*PricingResult, error)
-    GetAvailability(ctx context.Context, query *AvailabilityQuery) (*AvailabilityResult, error)
+
+    // ⚠️ DEPRECATED: GetPricing and GetAvailability should be called by platform, not kubelet
+    // These methods are retained for backward compatibility and will be removed in v2.0
+    GetPricing(ctx context.Context) (*PricingResult, error)         // Deprecated
+    GetAvailability(ctx context.Context, query *AvailabilityQuery) (*AvailabilityResult, error)  // Deprecated
+
     Ping(ctx context.Context) error
 }
 ```
+
+**Note:** In SaaS mode, the platform queries provider pricing/availability directly. The kubelet only executes deploy/terminate/status commands.
 
 ## Debugging
 
@@ -210,31 +275,60 @@ curl http://localhost:8080/status
 curl http://localhost:8080/status | jq '.providers'
 ```
 
-## Backend Integration
+## Platform Integration
 
-### Required Backend Endpoints
-The backend service must implement:
-- `WebSocket /api/kubelet/ws` - Command and event processing
-- `PUT /api/kubelet/register` - Kubelet registration
-- `GET /api/health` - Backend health check
+### Required Platform Endpoints
+The platform service must implement:
+- `WebSocket /api/kubelet/ws` - Command and event processing (TLS required)
+- Authentication via `BACKEND_API_KEY` header or query param
 
-### Backend Responsibilities
-- Pod scheduling decisions and provider selection
-- Command queuing and delivery to kubelets
-- Cost optimization across multiple clusters
-- Provider availability and pricing tracking
+### Platform Responsibilities (All Intelligence)
+- **Pod requirement analysis** - Parse K8s pod specs for GPU/memory/disk needs
+- **Provider selection** - Choose optimal provider based on cost, availability, region
+- **Cost optimization** - Minimize costs across multiple clusters and providers
+- **Plan enforcement** - Enforce concurrent pod limits (free/pro/enterprise plans)
+- **Quota management** - Track and enforce user/team resource quotas
+- **API key management** - Store and securely provide provider API keys
+- **Billing & usage tracking** - Track costs per user, generate invoices
+- **Multi-cluster routing** - Optimize pod placement across multiple Kubernetes clusters
+
+### Platform → Kubelet Communication
+- Send `deploy` commands with provider name + API key (if platform-managed)
+- Send `terminate` commands on pod deletion or quota enforcement
+- Send `status` commands to poll provider status
+- Send `rejection` messages when plan limits/quotas exceeded
+
+### Kubelet → Platform Communication
+- Send `pod_created` events with full pod spec + annotations
+- Send `pod_deleted` events when K8s deletes pod
+- Send `kubelet_registration` on startup with capabilities
+- Send `result` responses with deployment outcomes
+- Send `error` responses on failures
 
 ## Security Considerations
 
 ### API Key Management
-- Provider API keys stored as Kubernetes secrets in kubelet namespace
-- Backend uses separate authentication (BACKEND_API_KEY)
+**SaaS Mode (Platform-Managed):**
+- User API keys stored encrypted in platform
+- Platform includes keys in deploy commands
+- Kubelet never stores keys locally (only in memory during execution)
+- Keys transmitted over TLS (WSS://)
+
+**Self-Hosted Mode (Local Keys):**
+- Provider API keys stored as Kubernetes secrets
+- Mounted to kubelet pod as environment variables
+- Platform never sees provider keys
+
+**Both Modes:**
+- Kubelet authenticates to platform with `BACKEND_API_KEY`
 - WebSocket connections use TLS (wss://) in production
+- Keys are never logged
 
 ### Network Security
-- Kubelet initiates outbound WebSocket connections (no inbound ports)
-- Provider API calls originate from kubelet (backend never sees provider keys)
+- Kubelet initiates outbound WebSocket connections (no inbound ports required)
+- Provider API calls originate from kubelet (in-cluster, not from platform)
 - Health checks available on configurable port (default :8080)
+- All WebSocket traffic encrypted (TLS/WSS)
 
 ## Performance Notes
 
@@ -277,8 +371,29 @@ helm install gpu-proxy ./helm/proxy-kubelet \
 4. **Integration Testing**: Deploy with test backend service
 5. **Production**: Deploy via Helm with proper secrets management
 
+## Documentation Structure
+
+For comprehensive documentation, see:
+
+- **`docs/CURRENT_STATE.md`** - Current implementation status (what exists today)
+- **`docs/ARCHITECTURE.md`** - Target SaaS architecture (detailed design)
+- **`docs/PRODUCTION_GAPS.md`** - Missing features for production launch
+- **`docs/PRODUCTION_CHECKLIST.md`** - Go-live checklist
+- **`README.md`** - Project overview and quick start
+
 ## Related Components
 
-- **Backend Service**: Handles command routing and provider selection
-- **Original Kubelet**: `k8s-runpod-kubelet` for direct RunPod integration
-- **Virtual Kubelet Framework**: Upstream framework for Kubernetes integration
+- **Platform Service**: Proprietary SaaS backend (your business logic)
+- **GPU Providers**: RunPod, Vast.ai, Salad, AWS, GCP
+- **Original Kubelet**: `k8s-runpod-kubelet` (predecessor - direct provider integration)
+- **Virtual Kubelet Framework**: Upstream Kubernetes integration framework
+
+## Historical Context
+
+This project evolved from a direct virtual kubelet (`k8s-runpod-kubelet`) that made provider API calls automatically. The architecture was refactored to a command-and-control model to support:
+- Centralized multi-cluster routing optimization
+- Secure API key management (platform-side)
+- Open-source kubelet + proprietary platform business model
+- Easy provider addition without kubelet changes
+
+Some routing logic (`GetPricing`, `GetAvailability`) remains from the original implementation and is deprecated for SaaS mode.

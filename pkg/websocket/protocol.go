@@ -74,6 +74,10 @@ type Event struct {
 
 // DeployParams represents parameters for pod deployment
 type DeployParams struct {
+	// Platform-managed API key (SaaS mode) - optional, falls back to local environment if not provided
+	APIKey string `json:"api_key,omitempty"`
+
+	// Deployment parameters
 	Image              string            `json:"image"`
 	GPUTypeIDs         []string          `json:"gpu_type_ids,omitempty"`
 	Env                map[string]string `json:"env,omitempty"`
@@ -101,11 +105,15 @@ type DeployResult struct {
 
 // TerminateParams represents parameters for pod termination
 type TerminateParams struct {
+	// Platform-managed API key (SaaS mode) - optional, falls back to local environment if not provided
+	APIKey        string `json:"api_key,omitempty"`
 	ProviderPodID string `json:"provider_pod_id"`
 }
 
 // StatusParams represents parameters for status check
 type StatusParams struct {
+	// Platform-managed API key (SaaS mode) - optional, falls back to local environment if not provided
+	APIKey        string `json:"api_key,omitempty"`
 	ProviderPodID string `json:"provider_pod_id"`
 }
 

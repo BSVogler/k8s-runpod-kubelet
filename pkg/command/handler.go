@@ -128,7 +128,7 @@ func (h *Handler) handleTerminate(ctx context.Context, cmd *websocket.Command) *
 	}
 
 	// Execute termination
-	err = h.providerManager.Terminate(ctx, string(cmd.Provider), params.ProviderPodID)
+	err = h.providerManager.Terminate(ctx, string(cmd.Provider), params)
 	if err != nil {
 		h.logger.Error("Termination failed",
 			"command_id", cmd.ID,
@@ -179,7 +179,7 @@ func (h *Handler) handleStatus(ctx context.Context, cmd *websocket.Command) *web
 	}
 
 	// Get status
-	result, err := h.providerManager.GetStatus(ctx, string(cmd.Provider), params.ProviderPodID)
+	result, err := h.providerManager.GetStatus(ctx, string(cmd.Provider), params)
 	if err != nil {
 		h.logger.Error("Status check failed",
 			"command_id", cmd.ID,
