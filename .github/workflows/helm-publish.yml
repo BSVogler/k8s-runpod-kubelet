@@ -1,0 +1,94 @@
+name: Publish Helm Chart
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Docker Image CI"]
+    types:
+      - completed
+    branches:
+      - master
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Only run if the Docker workflow succeeded
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name != 'workflow_run' }}
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: 'v3.14.0'
+          token: ${{ secrets.GITHUB_TOKEN }}
+        
+      - name: Update Chart version and appVersion
+        run: |
+          # Auto-bump patch version
+          CURRENT_VERSION=$(grep '^version:' ./helm/runpod-kubelet/Chart.yaml | awk '{print $2}')
+          MAJOR=$(echo $CURRENT_VERSION | cut -d. -f1)
+          MINOR=$(echo $CURRENT_VERSION | cut -d. -f2)  
+          PATCH=$(echo $CURRENT_VERSION | cut -d. -f3)
+          NEW_PATCH=$((PATCH + 1))
+          NEW_VERSION="$MAJOR.$MINOR.$NEW_PATCH"
+          
+          # Update version and appVersion to latest
+          sed -i "s/version: .*/version: $NEW_VERSION/" ./helm/runpod-kubelet/Chart.yaml
+          sed -i "s/appVersion: .*/appVersion: \"latest\"/" ./helm/runpod-kubelet/Chart.yaml
+          
+          echo "Updated Chart.yaml to version $NEW_VERSION:"
+          grep -E '^(version|appVersion):' ./helm/runpod-kubelet/Chart.yaml
+          
+      - name: Package Helm chart
+        run: |
+          helm package ./helm/runpod-kubelet
+          ls -la *.tgz
+          
+      - name: Login to GitHub Container Registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          
+      - name: Push Helm chart using OCI
+        run: |
+          CHART_VERSION=$(grep '^version:' ./helm/runpod-kubelet/Chart.yaml | awk '{print $2}')
+          REPO_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          CHART_NAME="runpod-kubelet"
+          
+          echo "Chart version: ${CHART_VERSION}"
+          echo "Repository: oci://ghcr.io/${REPO_OWNER}/helm/runpod-kubelet"
+          
+          # Create a charts subdirectory to organize helm charts
+          helm push ${CHART_NAME}-${CHART_VERSION}.tgz oci://ghcr.io/${REPO_OWNER}/helm
+          
+      - name: Deploy to K3s cluster
+        if: ${{ vars.DEPLOY_TO_CLUSTER == 'true' }}
+        run: |
+          # Setup kubectl with cluster credentials
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > ~/.kube/config
+          
+          # Verify connection
+          kubectl cluster-info
+          
+          # Deploy using Helm
+          CHART_VERSION=$(grep '^version:' ./helm/runpod-kubelet/Chart.yaml | awk '{print $2}')
+          REPO_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          
+          helm upgrade --install runpod-kubelet \
+            oci://ghcr.io/${REPO_OWNER}/helm/runpod-kubelet \
+            --version ${CHART_VERSION} \
+            --namespace runpod-kubelet \
+            --create-namespace \
+            --set runpodApiKey="${{ secrets.RUNPOD_API_KEY }}" \
+            --wait --timeout 5m
+          
+          # Show deployment status
+          kubectl get pods -n runpod-kubelet
+          kubectl get nodes
