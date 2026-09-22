@@ -1,0 +1,60 @@
+# 225 内网上海测试管理集群 cls-jqdqhcy9
+# helm upgrade --install runpod-kubelet ./helm/runpod-kubelet \
+#   -n kube-system -f helm/runpod-kubelet/values-225-sh-test.yaml \
+#   --set runpod.existingSecret=runpod-kubelet-secrets
+#
+# 前置：
+# 1) 镜像推到 CCR（集群拉不到 ghcr）
+# 2) kubectl create secret generic runpod-kubelet-secrets -n kube-system --from-literal=RUNPOD_API_KEY=...
+#    不要带 CONDUIT_API_TOKEN（P0 关掉 DRM；当前代码若仍强制 registerWithConduit 会 CrashLoop，需先跳过）
+# 3) 调度到真实 CVM，避开 eklet / vk8s 虚节点
+
+replicaCount: 1
+
+image:
+  # cluster can pull this namespace; image was imported onto both CVM nodes
+  repository: ccr.ccs.tencentyun.com/qcloud-ti-platform/runpod-kubelet
+  tag: dev-exec-fix-20260921
+  pullPolicy: IfNotPresent
+
+imagePullSecrets:
+  - name: ticloudrepo
+
+kubelet:
+  namespace: kube-system
+  reconcileInterval: 30
+  maxGpuPrice: 7.9
+  nodeCapacityCPU: "100"
+  nodeCapacityMemory: "1Ti"
+  nodeCapacityGPU: "100"
+  nodeCapacityPods: "50"
+
+cluster:
+  identifier: "225-sh-test"
+
+runpod:
+  apiKey: ""
+  existingSecret: runpod-kubelet-secrets
+
+conduit:
+  apiToken: ""
+
+nodeSelector:
+  kubernetes.io/os: linux
+
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: NotIn
+              values:
+                - virtual-runpod
+                - vk8s-ap-shanghai
+            - key: node.kubernetes.io/instance-type
+              operator: NotIn
+              values:
+                - eklet
+
+tolerations: []

@@ -8,7 +8,6 @@ import (
 	runpod "github.com/bsvogler/k8s-runpod-kubelet/pkg/virtual_kubelet"
 	"github.com/getsentry/sentry-go"
 	sentryslog "github.com/getsentry/sentry-go/slog"
-	"io"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/informers"
@@ -225,12 +224,8 @@ func createControllers(ctx context.Context, provider *runpod.Provider, k8sClient
 func createAPIServer(provider *runpod.Provider, internalIP string, listenPort int) *http.Server {
 	// Set up basic handlers for the HTTP server. This lets k8s interact with the kubelet
 	podHandlerConfig := api.PodHandlerConfig{
-		RunInContainer: func(ctx context.Context, namespace, podName, containerName string, cmd []string, attach api.AttachIO) error {
-			return fmt.Errorf("running commands in container is not supported by RunPod")
-		},
-		GetContainerLogs: func(ctx context.Context, namespace, podName, containerName string, opts api.ContainerLogOpts) (io.ReadCloser, error) {
-			return nil, fmt.Errorf("container logs not supported by RunPod")
-		},
+		RunInContainer:   provider.RunInContainer,
+		GetContainerLogs: provider.GetContainerLogs,
 		GetPods: func(ctx context.Context) ([]*v1.Pod, error) {
 			return provider.GetPods(ctx)
 		},
@@ -250,8 +245,10 @@ func createAPIServer(provider *runpod.Provider, internalIP string, listenPort in
 	api.AttachPodRoutes(podHandlerConfig, mux, false) // Set debug to false for production
 
 	return &http.Server{
-		Addr:    fmt.Sprintf("%s:%d", internalIP, listenPort),
-		Handler: mux,
+		// Bind all interfaces so apiserver can reach kubelet on the pod IP:10250.
+		// Node status still advertises internalIP (POD_IP).
+		Addr:    fmt.Sprintf(":%d", listenPort),
+		Handler: runpod.FilterExecStreamProtocols(mux),
 	}
 }
 
@@ -426,8 +423,18 @@ func main() {
 
 	// Start API server
 	go func() {
-		logger.Info("Starting API server for K8S to use", "port", listenPort)
-		if err := apiServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		certDir := os.Getenv("KUBELET_CERT_DIR")
+		if certDir == "" {
+			certDir = "/tmp/kubelet-pki"
+		}
+		certFile, keyFile, err := runpod.WriteSelfSignedKubeletCert(certDir, internalIP)
+		if err != nil {
+			logger.Error("Failed to write kubelet TLS cert", "error", err)
+			cancel()
+			return
+		}
+		logger.Info("Starting API server for K8S to use", "port", listenPort, "tls", true, "cert", certFile)
+		if err := apiServer.ListenAndServeTLS(certFile, keyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("Failed to run API server", "error", err)
 			cancel()
 		}

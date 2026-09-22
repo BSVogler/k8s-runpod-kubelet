@@ -40,9 +40,14 @@ spec:
             - "--node-capacity-memory={{ .Values.kubelet.nodeCapacityMemory }}"
             - "--node-capacity-gpu={{ .Values.kubelet.nodeCapacityGPU }}"
             - "--node-capacity-pods={{ .Values.kubelet.nodeCapacityPods }}"
+            - "--internal-ip=$(POD_IP)"
+            - "--listen-port=10250"
           ports:
             - name: http
               containerPort: {{ .Values.health.port }}
+              protocol: TCP
+            - name: kubelet
+              containerPort: 10250
               protocol: TCP
           {{- if .Values.health.livenessProbe.enabled }}
           livenessProbe:
@@ -52,6 +57,11 @@ spec:
           readinessProbe:
             {{- omit .Values.health.readinessProbe "enabled" | toYaml | nindent 12 }}
           {{- end }}
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
           envFrom:
             - secretRef:
                 name: {{ .Values.runpod.existingSecret | default (include "runpod-kubelet.fullname" .) }}

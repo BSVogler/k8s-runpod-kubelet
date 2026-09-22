@@ -69,12 +69,8 @@ type RegistrationPayload struct {
 func (p *Provider) registerWithConduit() error {
 	apiToken := os.Getenv("CONDUIT_API_TOKEN")
 	if apiToken == "" {
-		// Get conduit host for error message
-		conduitHost := os.Getenv("CONDUIT_HOST")
-		if conduitHost == "" {
-			conduitHost = "https://gpuconduit.io"
-		}
-		return fmt.Errorf("CONDUIT_API_TOKEN is required but not set. Please register at %s to obtain your API token", conduitHost)
+		p.logger.Info("CONDUIT_API_TOKEN unset; skipping GPU Conduit registration")
+		return nil
 	}
 
 	// Get cluster name from environment or generate one
@@ -569,8 +565,10 @@ func (p *Provider) DeployPodToRunPod(pod *v1.Pod) error {
 			"pod", pod.Name,
 			"namespace", pod.Namespace,
 			"error", err)
+		p.emitEvent(pod, v1.EventTypeWarning, "RunPodCreateFailed", err.Error())
 		return err
 	}
+	p.emitEvent(pod, v1.EventTypeNormal, "RunPodCreated", "created RunPod instance "+podID)
 
 	// Update pod with RunPod annotations
 	return p.updatePodWithRunPodInfo(pod, podID, costPerHr)
@@ -682,10 +680,11 @@ func (p *Provider) checkPortsExposed(portMappings map[string]int, requestedPorts
 // getReadinessProbe extracts the httpGet readiness probe from the first container in pod spec.
 // Returns nil if no httpGet readiness probe is configured.
 func getReadinessProbe(pod *v1.Pod) *v1.Probe {
-	if pod == nil || len(pod.Spec.Containers) == 0 {
+	container := SelectWorkloadContainer(pod)
+	if container == nil {
 		return nil
 	}
-	probe := pod.Spec.Containers[0].ReadinessProbe
+	probe := container.ReadinessProbe
 	if probe == nil || probe.HTTPGet == nil {
 		return nil
 	}
@@ -1079,6 +1078,9 @@ func (p *Provider) updateAllPodStatuses() {
 					"newStatus", string(status),
 					"portsExposed", hasExposedPorts,
 					"requestedPorts", podInfo.RequestedPorts)
+				if status == PodRunning {
+					p.emitEvent(pod, v1.EventTypeNormal, "RunPodRunning", "RunPod instance is running")
+				}
 			} else if portsExposureChanged {
 				p.logger.Info("Port exposure changed",
 					"pod", pod.Name,
@@ -2386,47 +2388,7 @@ func (p *Provider) translateRunPodStatus(runpodStatus string, statusMessage stri
 	return podStatus
 }
 
-// RunInContainer implements the ContainerExecHandlerFunc interface
-func (p *Provider) RunInContainer(ctx context.Context, namespace, podName, containerName string, cmd []string, attach api.AttachIO) error {
-	p.logger.Info("RunInContainer called but not supported by RunPod",
-		"namespace", namespace,
-		"pod", podName,
-		"container", containerName)
-	return fmt.Errorf("running commands in container is not supported by RunPod")
-}
-
-// GetContainerLogs implements the ContainerLogsHandlerFunc interface
-func (p *Provider) GetContainerLogs(ctx context.Context, namespace, podName, containerName string, opts api.ContainerLogOpts) (io.ReadCloser, error) {
-	p.logger.Info("GetContainerLogs called",
-		"namespace", namespace,
-		"pod", podName,
-		"container", containerName)
-
-	// Get the RunPod ID from the pod
-	pod, err := p.GetPod(ctx, namespace, podName)
-	if err != nil {
-		return nil, fmt.Errorf("error getting pod for logs: %w", err)
-	}
-
-	podID := pod.Annotations[PodIDAnnotation]
-	if podID == "" {
-		return nil, fmt.Errorf("pod %s/%s has no RunPod ID annotation", namespace, podName)
-	}
-
-	// If RunPod doesn't support container logs, return an error
-	return nil, fmt.Errorf("container logs not supported by RunPod")
-
-	// If RunPod supports logs, you would implement something like:
-	/*
-	   logs, err := p.runpodClient.GetPodLogs(podID)
-	   if err != nil {
-	       return nil, fmt.Errorf("failed to get container logs: %w", err)
-	   }
-
-	   // Convert string to ReadCloser
-	   return io.NopCloser(strings.NewReader(logs)), nil
-	*/
-}
+// RunInContainer / GetContainerLogs live in exec.go.
 
 // syncEndpointSlices creates or updates EndpointSlices for Services that target RunPod pods.
 // RunPod pods have fake cluster IPs (10.0.0.2) that are not routable, so real public IPs

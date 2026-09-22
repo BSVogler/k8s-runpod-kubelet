@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/crypto/ssh"
 	batchv1 "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,9 +30,12 @@ type Client struct {
 	apiKey         string
 	baseGraphqlURL string
 	baseRESTURL    string
+	baseV2URL      string
 	logger         *slog.Logger
 	clientset      kubernetes.Interface // Add clientset field
 	config         *config.Config       // Add config field for datacenter restrictions
+	sshPublicKey   string
+	sshSigner      ssh.Signer
 }
 
 // Constants for RunPod integration
@@ -47,10 +52,10 @@ const (
 	PortsAnnotation                 = "runpod.io/ports"          // Manual override for port specifications
 
 	// Disk and volume configuration.
-	ContainerDiskGbAnnotation    = "runpod.io/container-disk-gb"
-	VolumeGbAnnotation           = "runpod.io/volume-gb"
-	VolumeMountPathAnnotation    = "runpod.io/volume-mount-path"
-	NetworkVolumeIdAnnotation    = "runpod.io/network-volume-id"
+	ContainerDiskGbAnnotation = "runpod.io/container-disk-gb"
+	VolumeGbAnnotation        = "runpod.io/volume-gb"
+	VolumeMountPathAnnotation = "runpod.io/volume-mount-path"
+	NetworkVolumeIdAnnotation = "runpod.io/network-volume-id"
 
 	// Cost optimization and compatibility.
 	InterruptibleAnnotation       = "runpod.io/interruptible"
@@ -108,42 +113,42 @@ type GPUType struct {
 
 // InstanceInfo stores information about a RunPod instance in the cluster
 type InstanceInfo struct {
-	ID            string
-	CostPerHr     float64
-	PodName       string
-	Namespace     string
-	Status        string
-	StatusMessage string
-	ExitCode      int
-	CreationTime  time.Time
-	RequestedPorts []string  // Ports that were requested for this pod
-	PortsExposed  bool      // Tracks whether requested ports are currently exposed
+	ID             string
+	CostPerHr      float64
+	PodName        string
+	Namespace      string
+	Status         string
+	StatusMessage  string
+	ExitCode       int
+	CreationTime   time.Time
+	RequestedPorts []string // Ports that were requested for this pod
+	PortsExposed   bool     // Tracks whether requested ports are currently exposed
 
 	// Readiness probe state
-	ReadinessProbeReady   bool      // Whether the readiness probe has passed
-	ReadinessFailCount    int       // Consecutive failure count
-	ReadinessLastCheck    time.Time // Last probe check time
-	RunningStartTime      time.Time // When pod first entered RUNNING state (for initialDelaySeconds)
-	PublicIP              string    // Public IP from RunPod API
-	ExternalPortMappings  map[string]int // Internal port -> external port
+	ReadinessProbeReady  bool           // Whether the readiness probe has passed
+	ReadinessFailCount   int            // Consecutive failure count
+	ReadinessLastCheck   time.Time      // Last probe check time
+	RunningStartTime     time.Time      // When pod first entered RUNNING state (for initialDelaySeconds)
+	PublicIP             string         // Public IP from RunPod API
+	ExternalPortMappings map[string]int // Internal port -> external port
 }
 
 type DetailedStatus struct {
-	ID                     string            `json:"id"`
-	Name                   string            `json:"name"`
-	DesiredStatus          string            `json:"desiredStatus"`
-	CurrentStatus          string            `json:"currentStatus,omitempty"`
-	CostPerHr              float64           `json:"costPerHr"`
-	Image                  string            `json:"image"`
-	Env                    map[string]string `json:"env"`
-	MachineID              string            `json:"machineId"`
-	PublicIP               string            `json:"publicIp"`
-	PortMappings           map[string]int    `json:"portMappings"`
-	Runtime                *RuntimeInfo      `json:"runtime,omitempty"`
-	Machine                *MachineInfo      `json:"machine,omitempty"`
-	LastError              string            `json:"lastError,omitempty"`
-	ContainerRegistryAuthId string           `json:"containerRegistryAuthId,omitempty"`
-	TemplateId             string            `json:"templateId,omitempty"`
+	ID                      string            `json:"id"`
+	Name                    string            `json:"name"`
+	DesiredStatus           string            `json:"desiredStatus"`
+	CurrentStatus           string            `json:"currentStatus,omitempty"`
+	CostPerHr               float64           `json:"costPerHr"`
+	Image                   string            `json:"image"`
+	Env                     map[string]string `json:"env"`
+	MachineID               string            `json:"machineId"`
+	PublicIP                string            `json:"publicIp"`
+	PortMappings            map[string]int    `json:"portMappings"`
+	Runtime                 *RuntimeInfo      `json:"runtime,omitempty"`
+	Machine                 *MachineInfo      `json:"machine,omitempty"`
+	LastError               string            `json:"lastError,omitempty"`
+	ContainerRegistryAuthId string            `json:"containerRegistryAuthId,omitempty"`
+	TemplateId              string            `json:"templateId,omitempty"`
 }
 
 type RuntimeInfo struct {
@@ -167,15 +172,24 @@ func NewRunPodClient(logger *slog.Logger, clientset kubernetes.Interface, config
 		logger.Error("RUNPOD_API_KEY environment variable is not set")
 	}
 
-	return &Client{
+	c := &Client{
 		httpClient:     &http.Client{Timeout: DefaultAPITimeout},
 		apiKey:         apiKey,
 		baseGraphqlURL: "https://api.runpod.io/graphql",
 		baseRESTURL:    "https://rest.runpod.io/v1/",
+		baseV2URL:      "https://api.runpod.io/v2",
 		logger:         logger,
 		clientset:      clientset, // Store the clientset
 		config:         config,    // Store the config for datacenter restrictions
 	}
+	if pub, signer, err := generateExecSSHKey(); err != nil {
+		logger.Warn("failed to generate exec SSH key; kubectl exec will be unavailable", "error", err)
+	} else {
+		c.sshPublicKey = pub
+		c.sshSigner = signer
+		logger.Info("generated in-memory SSH key for kubectl exec")
+	}
+	return c
 }
 
 // ExecuteGraphQL executes a GraphQL query with proper error handling
@@ -541,6 +555,16 @@ func (c *Client) GetGPUTypes(minRAMPerGPU int, maxPrice float64, cloudType strin
 }
 
 func (c *Client) DeployPodREST(params map[string]interface{}) (string, float64, error) {
+	if api, _ := params["api"].(string); api == "v2" {
+		clean := make(map[string]interface{}, len(params))
+		for k, v := range params {
+			if k == "api" {
+				continue
+			}
+			clean[k] = v
+		}
+		return c.deployPodV2(clean)
+	}
 	// https://rest.runpod.io/v1/docs#tag/pods/POST/pods
 	reqBody, err := json.Marshal(params)
 	if err != nil {
@@ -600,14 +624,14 @@ func (c *Client) DeployPodREST(params map[string]interface{}) (string, float64, 
 	}
 
 	var response struct {
-		ID                     string  `json:"id"`
-		CostPerHr              float64 `json:"costPerHr"` // JSON returns this as a string
-		MachineID              string  `json:"machineId"`
-		Name                   string  `json:"name"`
-		DesiredStatus          string  `json:"desiredStatus"`
-		Image                  string  `json:"image"` // Change from ImageName to match JSON
-		ContainerRegistryAuthId string `json:"containerRegistryAuthId,omitempty"`
-		TemplateId             string  `json:"templateId,omitempty"`
+		ID                      string  `json:"id"`
+		CostPerHr               float64 `json:"costPerHr"` // JSON returns this as a string
+		MachineID               string  `json:"machineId"`
+		Name                    string  `json:"name"`
+		DesiredStatus           string  `json:"desiredStatus"`
+		Image                   string  `json:"image"` // Change from ImageName to match JSON
+		ContainerRegistryAuthId string  `json:"containerRegistryAuthId,omitempty"`
+		TemplateId              string  `json:"templateId,omitempty"`
 
 		Machine struct {
 			DataCenterID string `json:"dataCenterId"`
@@ -638,22 +662,61 @@ func (c *Client) DeployPodREST(params map[string]interface{}) (string, float64, 
 		"location", response.Machine.Location,
 		"dataCenter", response.Machine.DataCenterID,
 	}
-	
+
 	// Add containerRegistryAuthId to log if present
 	if response.ContainerRegistryAuthId != "" {
 		logFields = append(logFields, "containerRegistryAuthId", response.ContainerRegistryAuthId)
 	}
-	
+
 	// Add templateId to log if present
 	if response.TemplateId != "" {
 		logFields = append(logFields, "templateId", response.TemplateId)
 	}
-	
+
 	c.logger.Info("Pod deployed successfully", logFields...)
 
 	return response.ID, response.CostPerHr, nil
 }
 
+func (c *Client) deployPodV2(params map[string]interface{}) (string, float64, error) {
+	reqBody, err := json.Marshal(params)
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to marshal v2 request: %w", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://api.runpod.io/v2/pods", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to create v2 request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.apiKey))
+	resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(req)
+	if err != nil {
+		return "", 0, fmt.Errorf("v2 API request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to read v2 response: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		c.logger.Error("RunPod v2 API returned error",
+			"statusCode", resp.StatusCode,
+			"response", string(body))
+		return "", 0, fmt.Errorf("v2 API returned error: %d %s", resp.StatusCode, string(body))
+	}
+	var response struct {
+		ID        string  `json:"id"`
+		CostPerHr float64 `json:"costPerHr"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return "", 0, fmt.Errorf("failed to parse v2 response: %w", err)
+	}
+	if response.ID == "" {
+		return "", 0, fmt.Errorf("v2 pod deployment failed: %s", string(body))
+	}
+	c.logger.Info("CPU pod deployed via v2", "podId", response.ID, "costPerHr", response.CostPerHr)
+	return response.ID, response.CostPerHr, nil
+}
 
 // DeployPod deploys a pod to RunPod
 func (c *Client) DeployPod(params map[string]interface{}) (string, float64, error) {
@@ -838,6 +901,117 @@ func (c *Client) GetDetailedPodStatus(podID string) (*DetailedStatus, error) {
 	}
 
 	return &status, nil
+}
+
+// StreamPodLogs streams GET /v2/pods/{id}/logs as an SSE body.
+func (c *Client) StreamPodLogs(ctx context.Context, podID, source string, tail int, since time.Time) (io.ReadCloser, error) {
+	if strings.TrimSpace(podID) == "" {
+		return nil, fmt.Errorf("missing RunPod id")
+	}
+	if source == "" {
+		source = "container"
+	}
+	if tail < 0 {
+		tail = 0
+	}
+	if tail > 5000 {
+		tail = 5000
+	}
+	u := fmt.Sprintf("%s/pods/%s/logs?source=%s&tail=%d", c.baseV2URL, podID, source, tail)
+	if !since.IsZero() {
+		u += "&since=" + since.UTC().Format(time.RFC3339)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create logs request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	req.Header.Set("Accept", "text/event-stream")
+	resp, err := (&http.Client{Timeout: 0}).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request logs: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("logs status %d: %s", resp.StatusCode, string(body))
+	}
+	return resp.Body, nil
+}
+
+type v2SSHEndpoint struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Username string `json:"username"`
+}
+
+type v2RuntimePort struct {
+	Private int    `json:"private"`
+	Public  *int   `json:"public"`
+	Type    string `json:"type"`
+	IP      string `json:"ip"`
+}
+
+type v2PodView struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+	SSH    *struct {
+		Direct *v2SSHEndpoint `json:"direct"`
+		Proxy  *v2SSHEndpoint `json:"proxy"`
+	} `json:"ssh"`
+	Runtime *struct {
+		Ports []v2RuntimePort `json:"ports"`
+	} `json:"runtime"`
+}
+
+func (c *Client) getPodV2(ctx context.Context, podID string) (*v2PodView, error) {
+	if strings.TrimSpace(podID) == "" {
+		return nil, fmt.Errorf("missing RunPod id")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseV2URL+"/pods/"+podID, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create v2 pod request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	req.Header.Set("Accept", "application/json")
+	resp, err := (&http.Client{Timeout: DefaultAPITimeout}).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request v2 pod: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read v2 pod: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("v2 pod status %d: %s", resp.StatusCode, string(body))
+	}
+	var view v2PodView
+	if err := json.Unmarshal(body, &view); err != nil {
+		return nil, fmt.Errorf("parse v2 pod: %w", err)
+	}
+	return &view, nil
+}
+
+func sshAddrFromV2(view *v2PodView) (addr, user string, err error) {
+	if view == nil {
+		return "", "", fmt.Errorf("missing v2 pod")
+	}
+	if view.SSH != nil && view.SSH.Direct != nil && view.SSH.Direct.Host != "" && view.SSH.Direct.Port > 0 {
+		user = view.SSH.Direct.Username
+		if user == "" {
+			user = "root"
+		}
+		return net.JoinHostPort(view.SSH.Direct.Host, strconv.Itoa(view.SSH.Direct.Port)), user, nil
+	}
+	if view.Runtime != nil {
+		for _, p := range view.Runtime.Ports {
+			if p.Private == 22 && p.Public != nil && *p.Public > 0 && p.IP != "" {
+				return net.JoinHostPort(p.IP, strconv.Itoa(*p.Public)), "root", nil
+			}
+		}
+	}
+	return "", "", fmt.Errorf("RunPod instance %s has no SSH direct endpoint yet", view.ID)
 }
 
 // IsSuccessfulCompletion determines if a RunPod instance exited successfully
@@ -1047,9 +1221,9 @@ func (c *Client) ExtractEnvVars(pod *v1.Pod) ([]RunPodEnv, error) {
 	var envVars []RunPodEnv
 	collector := newSecretCollector()
 
-	// First pass: collect all secrets we need to fetch
-	if len(pod.Spec.Containers) > 0 {
-		c.processContainerEnv(pod.Spec.Containers[0], &envVars, collector)
+	// First pass: collect all secrets we need to fetch (skip sidecars; prefer main)
+	if container := SelectWorkloadContainer(pod); container != nil {
+		c.processContainerEnv(*container, &envVars, collector)
 	}
 
 	// Process volume secrets
@@ -1078,17 +1252,17 @@ func (c *Client) ExtractEnvVars(pod *v1.Pod) ([]RunPodEnv, error) {
 
 // getOwnerJob retrieves the owner job of a pod if it exists
 func (c *Client) getOwnerJob(pod *v1.Pod) *batchv1.Job {
-	c.logger.Debug("Looking for owner job for pod", 
-		"pod", pod.Name, 
+	c.logger.Debug("Looking for owner job for pod",
+		"pod", pod.Name,
 		"namespace", pod.Namespace,
 		"ownerReferences", len(pod.OwnerReferences))
-	
+
 	for _, owner := range pod.OwnerReferences {
-		c.logger.Debug("Found owner reference", 
-			"kind", owner.Kind, 
-			"name", owner.Name, 
+		c.logger.Debug("Found owner reference",
+			"kind", owner.Kind,
+			"name", owner.Name,
 			"uid", owner.UID)
-			
+
 		if owner.Kind == "Job" {
 			job, err := c.clientset.BatchV1().Jobs(pod.Namespace).Get(
 				context.Background(),
@@ -1098,21 +1272,21 @@ func (c *Client) getOwnerJob(pod *v1.Pod) *batchv1.Job {
 			if err == nil {
 				// Verify the UID matches to ensure we have the correct job instance
 				if job.UID == owner.UID {
-					c.logger.Debug("Found owner job with annotations", 
-						"job", job.Name, 
+					c.logger.Debug("Found owner job with annotations",
+						"job", job.Name,
 						"jobUID", job.UID,
 						"annotations", len(job.Annotations))
 					return job
 				} else {
-					c.logger.Debug("Job found but UID mismatch", 
+					c.logger.Debug("Job found but UID mismatch",
 						"job", job.Name,
 						"expectedUID", owner.UID,
 						"actualUID", job.UID)
 				}
 			} else {
-				c.logger.Warn("Failed to get owner job", 
-					"job", owner.Name, 
-					"namespace", pod.Namespace, 
+				c.logger.Warn("Failed to get owner job",
+					"job", owner.Name,
+					"namespace", pod.Namespace,
 					"error", err)
 			}
 		}
@@ -1193,7 +1367,7 @@ func (c *Client) validateDatacenterIDs(podDatacenterID string, pod *v1.Pod) (str
 
 	// If no valid datacenters remain, return error for compliance
 	if len(validDatacenters) == 0 {
-		return "", fmt.Errorf("pod requested datacenters %s but node only allows %s", 
+		return "", fmt.Errorf("pod requested datacenters %s but node only allows %s",
 			podDatacenterID, c.config.DatacenterIDs)
 	}
 
@@ -1217,7 +1391,7 @@ func extractGPUMemory(memStr string) int {
 // and converts them to RunPod format (e.g., "8080/http", "5432/tcp")
 func (c *Client) extractPortsFromPod(pod *v1.Pod) []string {
 	var ports []string
-	
+
 	// Common HTTP ports that should default to HTTP protocol
 	httpPorts := map[int32]bool{
 		80:   true,
@@ -1229,9 +1403,13 @@ func (c *Client) extractPortsFromPod(pod *v1.Pod) []string {
 		8888: true,
 		9000: true,
 	}
-	
-	// Process all containers in the pod
+
+	// Ports from non-sidecar containers. If every container is a sidecar, keep the fallback workload.
+	workload := SelectWorkloadContainer(pod)
 	for _, container := range pod.Spec.Containers {
+		if isSidecarContainer(container) && (workload == nil || container.Name != workload.Name) {
+			continue
+		}
 		for _, port := range container.Ports {
 			// Skip unsupported protocols (RunPod only supports TCP-based protocols)
 			if port.Protocol != "" && port.Protocol != v1.ProtocolTCP {
@@ -1242,7 +1420,7 @@ func (c *Client) extractPortsFromPod(pod *v1.Pod) []string {
 					"protocol", port.Protocol)
 				continue
 			}
-			
+
 			// Determine protocol - default to TCP unless it's a common HTTP port
 			protocol := "tcp"
 			if httpPorts[port.ContainerPort] {
@@ -1253,18 +1431,18 @@ func (c *Client) extractPortsFromPod(pod *v1.Pod) []string {
 					"port", port.ContainerPort,
 					"note", "Use annotation 'runpod.io/ports' to override if needed")
 			}
-			
+
 			// Format as RunPod expects: "port/protocol"
 			portSpec := fmt.Sprintf("%d/%s", port.ContainerPort, protocol)
 			ports = append(ports, portSpec)
-			
+
 			c.logger.Debug("Adding port to RunPod deployment",
 				"pod", pod.Name,
 				"namespace", pod.Namespace,
 				"portSpec", portSpec)
 		}
 	}
-	
+
 	return ports
 }
 
@@ -1295,6 +1473,21 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 		return nil, fmt.Errorf("datacenter validation failed: %w", err)
 	}
 	datacenterID = validatedDatacenterID
+
+	// Determine image name from the workload container (skip sidecars; prefer main)
+	workload := SelectWorkloadContainer(pod)
+	if workload == nil {
+		return nil, fmt.Errorf("pod has no containers")
+	}
+
+	// CPU-only pods skip GPU catalog discovery and use v2 cpu flavor.
+	if !requestsGPU(workload) && getAnnotation(GpuTypeIdsAnnotation, "") == "" && getAnnotation(GpuMemoryAnnotation, "") == "" {
+		params, err := c.prepareCPUPodParameters(pod, workload, cloudType)
+		if err != nil {
+			return nil, err
+		}
+		return params, nil
+	}
 
 	// Determine minimum GPU memory required
 	memStr := getAnnotation(GpuMemoryAnnotation, "")
@@ -1339,18 +1532,22 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 		formattedEnvVars = FormatEnvVarsForREST(envVars)
 	}
 
-	// Determine image name from pod
-	if len(pod.Spec.Containers) == 0 {
-		return nil, fmt.Errorf("pod has no containers")
+	imageName := workload.Image
+	if len(pod.Spec.Containers) > 0 && workload.Name != pod.Spec.Containers[0].Name {
+		c.logger.Info("Using non-first container as RunPod workload",
+			"pod", pod.Name,
+			"namespace", pod.Namespace,
+			"container", workload.Name,
+			"image", imageName,
+			"skippedFirst", pod.Spec.Containers[0].Name)
 	}
-	imageName := pod.Spec.Containers[0].Image
 
 	// Use the pod name as the RunPod name
 	runpodName := pod.Name
 
 	// Extract ports from pod specification
 	ports := c.extractPortsFromPod(pod)
-	
+
 	// Allow manual override via annotation
 	if portsOverride != "" {
 		// Parse the comma-separated list of ports
@@ -1359,7 +1556,7 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 		for i, port := range overridePorts {
 			overridePorts[i] = strings.TrimSpace(port)
 		}
-		
+
 		c.logger.Info("Using manual port specification from annotation",
 			"pod", pod.Name,
 			"namespace", pod.Namespace,
@@ -1402,24 +1599,25 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 		"imageName":         imageName,
 		"env":               formattedEnvVars,
 	}
-	
+
 	// Map K8s container spec to RunPod REST API docker override fields.
 	// K8s `command` = Docker ENTRYPOINT → RunPod `dockerEntrypoint` (array).
 	// K8s `args` = Docker CMD → RunPod `dockerStartCmd` (array).
 	// RunPod later reverted the dockerArgs approach in favour of these dedicated fields.
-	if len(pod.Spec.Containers) > 0 {
-		container := pod.Spec.Containers[0]
-		if len(container.Command) > 0 {
-			params["dockerEntrypoint"] = container.Command
-			c.logger.Info("Setting dockerEntrypoint from pod spec",
+	if workload != nil {
+		if len(workload.Command) > 0 {
+			params["dockerEntrypoint"] = workload.Command
+			c.logger.Info("Setting dockerEntrypoint from workload container",
 				"pod", pod.Name,
-				"dockerEntrypoint", container.Command)
+				"container", workload.Name,
+				"dockerEntrypoint", workload.Command)
 		}
-		if len(container.Args) > 0 {
-			params["dockerStartCmd"] = container.Args
-			c.logger.Info("Setting dockerStartCmd from pod spec",
+		if len(workload.Args) > 0 {
+			params["dockerStartCmd"] = workload.Args
+			c.logger.Info("Setting dockerStartCmd from workload container",
 				"pod", pod.Name,
-				"dockerStartCmd", container.Args)
+				"container", workload.Name,
+				"dockerStartCmd", workload.Args)
 		}
 	}
 
@@ -1493,20 +1691,95 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 			"allowedCudaVersions", cudaVersions)
 	}
 
-	// GPU count from K8s resource requests; default is 1 (RunPod default).
-	if len(pod.Spec.Containers) > 0 {
-		gpuReq := pod.Spec.Containers[0].Resources.Requests["nvidia.com/gpu"]
+	// GPU count from the workload container; default is 1 (RunPod default).
+	if workload != nil {
+		gpuReq := workload.Resources.Requests["nvidia.com/gpu"]
 		if gpuCount, ok := gpuReq.AsInt64(); ok && gpuCount > 1 {
 			params["gpuCount"] = gpuCount
 			c.logger.Info("Setting multi-GPU count from resource requests",
 				"pod", pod.Name,
 				"namespace", pod.Namespace,
+				"container", workload.Name,
 				"gpuCount", gpuCount)
 		}
 	}
 
 	// Return both params and the ports that were requested
 	// We'll need to update the callers to handle the ports
+	return params, nil
+}
+
+func requestsGPU(container *v1.Container) bool {
+	if container == nil {
+		return false
+	}
+	if req, ok := container.Resources.Requests["nvidia.com/gpu"]; ok && !req.IsZero() {
+		return true
+	}
+	if lim, ok := container.Resources.Limits["nvidia.com/gpu"]; ok && !lim.IsZero() {
+		return true
+	}
+	return false
+}
+
+func cpuVCPUCount(container *v1.Container) int {
+	if container == nil {
+		return 2
+	}
+	if req, ok := container.Resources.Requests[v1.ResourceCPU]; ok && !req.IsZero() {
+		if n := req.Value(); n > 0 {
+			return int(n)
+		}
+	}
+	return 2
+}
+
+func (c *Client) prepareCPUPodParameters(pod *v1.Pod, workload *v1.Container, cloudType string) (map[string]interface{}, error) {
+	envVars, err := c.ExtractEnvVars(pod)
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract environment variables: %w", err)
+	}
+	diskGb := 10
+	if diskGbStr, exists := pod.Annotations[ContainerDiskGbAnnotation]; exists {
+		if val, err := strconv.Atoi(diskGbStr); err == nil {
+			diskGb = val
+		}
+	}
+	vcpu := cpuVCPUCount(workload)
+	params := map[string]interface{}{
+		"name":  pod.Name,
+		"image": workload.Image,
+		"cloud": strings.ToUpper(cloudType),
+		"cpu": map[string]interface{}{
+			"id":        "cpu5c",
+			"vcpuCount": vcpu,
+		},
+		"disk":     diskGb,
+		"startSsh": c.sshPublicKey != "",
+		"api":      "v2",
+	}
+	env := FormatEnvVarsForREST(envVars)
+	if c.sshPublicKey != "" {
+		if env == nil {
+			env = map[string]string{}
+		}
+		env["PUBLIC_KEY"] = c.sshPublicKey
+	}
+	if len(env) > 0 {
+		params["env"] = env
+	}
+	ports := c.extractPortsFromPod(pod)
+	if c.sshPublicKey != "" {
+		ports = ensureSSHPort(ports)
+	}
+	if len(ports) > 0 {
+		params["ports"] = ports
+	}
+	c.logger.Info("Preparing CPU-only RunPod v2 create",
+		"pod", pod.Name,
+		"namespace", pod.Namespace,
+		"image", workload.Image,
+		"vcpuCount", vcpu)
 	return params, nil
 }
 
@@ -1521,7 +1794,7 @@ func (c *Client) GetRequestedPorts(pod *v1.Pod) []string {
 		}
 		return overridePorts
 	}
-	
+
 	// Otherwise extract from pod spec
 	return c.extractPortsFromPod(pod)
 }
