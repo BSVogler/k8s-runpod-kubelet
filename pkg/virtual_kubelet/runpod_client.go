@@ -709,10 +709,11 @@ func (c *Client) DeployPod(params map[string]interface{}) (string, float64, erro
 }
 
 // TerminatePod terminates a RunPod instance by ID
+// Uses DELETE instead of /stop: a stopped pod stays in the account and keeps billing for its disk.
 func (c *Client) TerminatePod(podID string) error {
-	endpoint := fmt.Sprintf("/pods/%s/stop", podID)
+	endpoint := fmt.Sprintf("pods/%s", podID)
 
-	resp, err := c.makeRESTRequest("POST", endpoint, nil)
+	resp, err := c.makeRESTRequest("DELETE", endpoint, nil)
 	if err != nil {
 		return err
 	}
@@ -730,7 +731,13 @@ func (c *Client) TerminatePod(podID string) error {
 		return fmt.Errorf("invalid pod ID: %s", podID)
 	}
 
-	if resp.StatusCode != http.StatusOK {
+	// Already gone counts as terminated
+	if resp.StatusCode == http.StatusNotFound {
+		c.logger.Info("RunPod instance already deleted", "podID", podID)
+		return nil
+	}
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("failed to terminate pod, status: %d, response: %s", resp.StatusCode, string(body))
 	}
@@ -1371,9 +1378,34 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 		params["containerRegistryAuthId"] = containerRegistryAuthId
 	}
 
+	applyContainerSpec(params, pod.Spec.Containers[0])
+
 	// Return both params and the ports that were requested
 	// We'll need to update the callers to handle the ports
 	return params, nil
+}
+
+// applyContainerSpec maps container command, args and GPU count onto RunPod REST parameters.
+// K8s command overrides the image ENTRYPOINT and args override CMD, matching RunPod's
+// dockerEntrypoint and dockerStartCmd. Unset fields keep the image defaults.
+func applyContainerSpec(params map[string]interface{}, container v1.Container) {
+	if len(container.Command) > 0 {
+		params["dockerEntrypoint"] = container.Command
+	}
+	if len(container.Args) > 0 {
+		params["dockerStartCmd"] = container.Args
+	}
+
+	// Limits take precedence since extended resources like GPUs are usually set there
+	gpuQuantity, ok := container.Resources.Limits["nvidia.com/gpu"]
+	if !ok {
+		gpuQuantity, ok = container.Resources.Requests["nvidia.com/gpu"]
+	}
+	if ok {
+		if gpuCount, isInt := gpuQuantity.AsInt64(); isInt && gpuCount > 0 {
+			params["gpuCount"] = gpuCount
+		}
+	}
 }
 
 // GetRequestedPorts extracts the ports that were configured for a pod deployment

@@ -50,10 +50,10 @@ func setupTestEnvironment(t *testing.T) *testContext {
 		t.Skip("KUBECONFIG environment variable not set")
 	}
 
-	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	restConfig, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	require.NoError(t, err, "Failed to build config from flags")
 
-	clientset, err := kubernetes.NewForConfig(config)
+	clientset, err := kubernetes.NewForConfig(restConfig)
 	require.NoError(t, err, "Failed to create Kubernetes clientset")
 
 	// Create RunPod client
