@@ -31,3 +31,9 @@ go.work
 !go.sum
 .run/go build github.com_bsvogler_k8s-runpod-kubelet_cmd_virtual_kubelet.run.xml
 *.tgz
+
+# local secrets and build output
+.key
+/k8s-runpod-kubelet
+/vk-test
+.aider*
