@@ -1,0 +1,64 @@
+Conduit Kubelet {{ .Chart.AppVersion }} installed as release "{{ .Release.Name }}".
+
+1. Check that the kubelet pod is running and connected:
+
+   kubectl -n {{ include "conduit-kubelet.namespace" . }} get pods -l "app.kubernetes.io/name={{ include "conduit-kubelet.name" . }},app.kubernetes.io/instance={{ .Release.Name }}"
+   kubectl -n {{ include "conduit-kubelet.namespace" . }} logs -l "app.kubernetes.io/name={{ include "conduit-kubelet.name" . }},app.kubernetes.io/instance={{ .Release.Name }}" -f
+
+   The pod becomes Ready once the WebSocket connection to {{ .Values.conduit.url }} is up.
+
+2. Check that the virtual node "{{ .Values.kubelet.nodeName }}" is registered and Ready:
+
+   kubectl get node {{ .Values.kubelet.nodeName }}
+
+   The node also shows up in the Conduit dashboard: https://gpuconduit.io/dashboard/
+
+3. Run your first GPU pod. The node is tainted so that only pods that opt in
+   are scheduled there:
+
+   cat <<'EOF' | kubectl apply -f -
+   apiVersion: v1
+   kind: Pod
+   metadata:
+     name: gpu-smoke-test
+     annotations:
+       runpod.io/required-gpu-memory: "16"
+   spec:
+     restartPolicy: Never
+     nodeSelector:
+       conduit.io/provider: "true"
+     tolerations:
+       - key: virtual-kubelet.io/provider
+         operator: Equal
+         value: conduit
+         effect: NoSchedule
+     containers:
+       - name: cuda
+         image: nvidia/cuda:12.4.1-base-ubuntu22.04
+         command: ["nvidia-smi"]
+         resources:
+           limits:
+             nvidia.com/gpu: 1
+   EOF
+
+   kubectl get pod gpu-smoke-test -w
+   kubectl describe pod gpu-smoke-test
+
+   A pod that ends up Failed with reason "quota_exceeded" or "no_api_key"
+   was rejected by the platform: check your plan and provider keys at
+   https://gpuconduit.io/dashboard/billing/ and
+   https://gpuconduit.io/dashboard/providers/
+
+{{- if .Values.conduit.existingSecret }}
+
+Credentials are read from the existing Secret "{{ .Values.conduit.existingSecret }}"
+(keys: CONDUIT_API_TOKEN, optionally RUNPOD_API_KEY).
+{{- else if not .Values.runpod.apiKey }}
+
+No RunPod API key was set (runpod.apiKey), so the kubelet runs in platform key
+mode: the key stored in your Conduit account is used. Add one at
+https://gpuconduit.io/dashboard/providers/ or upgrade the release with
+--set runpod.apiKey=... to keep the key in your cluster.
+{{- end }}
+
+Tokens are managed at https://gpuconduit.io/dashboard/installation/

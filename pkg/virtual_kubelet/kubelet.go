@@ -448,21 +448,39 @@ func (p *Provider) NotifyNodeStatus(ctx context.Context, notifyFunc func(*v1.Nod
 	// This is required by the virtual-kubelet interface
 }
 
-// ConfigureNode configures the virtual node
+// Taint and labels applied to the virtual node. Pods must tolerate the taint
+// (and usually select the node) to be scheduled onto it.
+const (
+	NodeTaintKey   = "virtual-kubelet.io/provider"
+	NodeTaintValue = "conduit"
+	NodeLabelKey   = "conduit.io/provider"
+	NodeLabelValue = "true"
+)
+
+// Version is the binary version, set by main from the build-time ldflags.
+var Version = "dev"
+
+// ConfigureNode configures the virtual node object before it is registered
+// with the Kubernetes API server.
 func (p *Provider) ConfigureNode(ctx context.Context, node *v1.Node) {
 	node.Status.Capacity = p.GetNodeStatus().Capacity
 	node.Status.Allocatable = p.GetNodeStatus().Allocatable
 
-	// Add taints to prevent accidental scheduling
+	if node.Labels == nil {
+		node.Labels = map[string]string{}
+	}
+	node.Labels["type"] = "virtual-kubelet"
+	node.Labels["kubernetes.io/role"] = "agent"
+	node.Labels["kubernetes.io/hostname"] = node.Name
+	node.Labels["kubernetes.io/os"] = "linux"
+	node.Labels[NodeLabelKey] = NodeLabelValue
+
+	// Taint the node so that regular workloads are not scheduled here by
+	// accident. Pods opt in with a matching toleration.
 	node.Spec.Taints = []v1.Taint{
 		{
-			Key:    "virtual-kubelet.io/provider",
-			Value:  "proxy",
-			Effect: v1.TaintEffectNoSchedule,
-		},
-		{
-			Key:    "gpu-conduit.io/proxy",
-			Value:  "true",
+			Key:    NodeTaintKey,
+			Value:  NodeTaintValue,
 			Effect: v1.TaintEffectNoSchedule,
 		},
 	}

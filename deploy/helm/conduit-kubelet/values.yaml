@@ -1,0 +1,112 @@
+# Default values for conduit-kubelet.
+#
+# Minimal install:
+#   helm install conduit-kubelet oci://ghcr.io/bsvogler/helm/conduit-kubelet \
+#     --namespace conduit-system --create-namespace \
+#     --set conduit.apiToken=YOUR_TOKEN
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/bsvogler/conduit-kubelet
+  pullPolicy: IfNotPresent
+  # Defaults to the chart's appVersion.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+conduit:
+  # Conduit API token. Get one at https://gpuconduit.io/dashboard/installation/
+  # Required unless existingSecret is set.
+  apiToken: ""
+  # Platform WebSocket URL (BACKEND_URL).
+  url: "wss://gpuconduit.io/api/kubelet/ws"
+  # Name of a pre-existing Secret in the release namespace with the key
+  # CONDUIT_API_TOKEN (required) and optionally RUNPOD_API_KEY.
+  # When set, the chart does not create a Secret and ignores conduit.apiToken
+  # and runpod.apiKey.
+  existingSecret: ""
+
+cluster:
+  # Cluster name shown in the Conduit dashboard (CLUSTER_NAME).
+  name: "default"
+
+runpod:
+  # Optional. Keep your RunPod API key in the cluster instead of on the
+  # platform ("local key mode"). Leave empty to use the key stored in your
+  # Conduit account ("platform key mode").
+  apiKey: ""
+
+kubelet:
+  # Name of the virtual node registered in the cluster (NODE_NAME).
+  nodeName: "conduit-node"
+  # Namespace the kubelet runs in and reports to the platform (NAMESPACE).
+  # Defaults to the release namespace.
+  namespace: ""
+  # debug, info, warn, error (LOG_LEVEL)
+  logLevel: "info"
+  # Listen address of the health server (/healthz, /readyz, /status).
+  healthServerAddress: ":8080"
+  # Informer resync interval in seconds.
+  reconcileInterval: 30
+
+serviceAccount:
+  create: true
+  annotations: {}
+  # Defaults to the release fullname.
+  name: ""
+
+rbac:
+  # Create the ClusterRole/ClusterRoleBinding the virtual kubelet needs.
+  create: true
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+livenessProbe:
+  enabled: true
+  httpGet:
+    path: /healthz
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  timeoutSeconds: 5
+
+readinessProbe:
+  enabled: true
+  httpGet:
+    path: /readyz
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 6
+
+# Where the kubelet pod itself runs (it must not run on the virtual node).
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Extra environment variables for the kubelet container.
+extraEnv: []

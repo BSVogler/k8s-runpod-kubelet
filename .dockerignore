@@ -1,0 +1,12 @@
+.git
+.github
+.idea
+.claude
+.DS_Store
+**/.DS_Store
+conduit-kubelet
+dist/
+deploy/
+docs/
+*.md
+*.tgz

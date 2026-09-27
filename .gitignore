@@ -1,1 +1,6 @@
-conduit-kubelet
+# local binary build output (root only; the chart dir has the same name)
+/conduit-kubelet
+/dist/
+*.tgz
+.DS_Store
+.idea/

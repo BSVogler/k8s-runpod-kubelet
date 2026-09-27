@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -32,7 +33,11 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 )
 
+// version is set at build time via -ldflags "-X main.version=<tag>".
+var version = "dev"
+
 var (
+	showVersion       bool
 	kubeconfig        string
 	configPath        string
 	nodeName          string
@@ -49,28 +54,42 @@ var (
 	enabledProviders  string
 )
 
+// Flags default to the zero value so that environment variables (see
+// config.LoadFromEnvironment) are not silently overridden. The effective
+// defaults live in config.DefaultConfig.
 func init() {
+	flag.BoolVar(&showVersion, "version", false, "Print the version and exit")
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig file")
 	flag.StringVar(&configPath, "config", "", "Path to configuration file")
-	flag.StringVar(&nodeName, "nodename", "virtual-proxy", "Kubernetes node name")
+	flag.StringVar(&nodeName, "nodename", "", "Kubernetes node name (env: NODE_NAME, default: \"conduit-node\")")
 	flag.StringVar(&clusterName, "cluster-name", "", "Cluster name reported to the platform (env: CLUSTER_NAME, default: \"default\")")
-	flag.StringVar(&operatingSystem, "operating-system", "Linux", "Operating system (Linux, Windows)")
-	flag.StringVar(&internalIP, "internal-ip", "127.0.0.1", "Internal IP address")
-	flag.IntVar(&listenPort, "listen-port", 10250, "Port to listen on")
-	flag.StringVar(&logLevel, "log-level", "info", "Log level (debug, info, warn, error)")
-	flag.StringVar(&backendURL, "backend-url", "", "Backend WebSocket URL")
-	flag.StringVar(&backendAPIKey, "backend-api-key", "", "Backend API key")
-	flag.StringVar(&healthServerAddr, "health-server-address", ":8080", "Address for health check server")
-	flag.StringVar(&namespace, "namespace", "kube-system", "Kubernetes namespace")
-	flag.IntVar(&reconcileInterval, "reconcile-interval", 30, "Reconcile interval in seconds")
-	flag.StringVar(&enabledProviders, "enabled-providers", "runpod", "Comma-separated list of enabled providers")
+	flag.StringVar(&operatingSystem, "operating-system", "", "Operating system (default: \"Linux\")")
+	flag.StringVar(&internalIP, "internal-ip", "", "Internal IP address (default: \"127.0.0.1\")")
+	flag.IntVar(&listenPort, "listen-port", 0, "Kubelet API port (default: 10250)")
+	flag.StringVar(&logLevel, "log-level", "", "Log level: debug, info, warn, error (env: LOG_LEVEL, default: \"info\")")
+	flag.StringVar(&backendURL, "backend-url", "", "Platform WebSocket URL (env: BACKEND_URL, default: \"wss://gpuconduit.io/api/kubelet/ws\")")
+	flag.StringVar(&backendAPIKey, "backend-api-key", "", "Platform API token (env: BACKEND_API_KEY)")
+	flag.StringVar(&healthServerAddr, "health-server-address", "", "Address for the health check server (default: \":8080\")")
+	flag.StringVar(&namespace, "namespace", "", "Kubernetes namespace the kubelet runs in (env: NAMESPACE, default: \"kube-system\")")
+	flag.IntVar(&reconcileInterval, "reconcile-interval", 0, "Reconcile interval in seconds (default: 30)")
+	flag.StringVar(&enabledProviders, "enabled-providers", "", "Comma-separated list of enabled providers (default: \"runpod\")")
 }
 
 func main() {
 	flag.Parse()
 
+	if showVersion {
+		fmt.Printf("conduit-kubelet %s\n", version)
+		return
+	}
+
+	// Load configuration before the logger so LOG_LEVEL is honoured
+	cfg := loadConfiguration()
+	overrideConfiguration(cfg)
+
 	// Initialize logger
-	logger := initializeLogger(logLevel)
+	logger := initializeLogger(cfg.LogLevel)
+	virtualkubelet.Version = version
 
 	// Create context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
@@ -85,11 +104,9 @@ func main() {
 		cancel()
 	}()
 
-	// Load configuration
-	cfg := loadConfiguration(logger)
-
-	// Override configuration with command line flags and environment variables
-	overrideConfiguration(cfg)
+	if configPath != "" {
+		logger.Warn("--config is not implemented yet; using environment variables and flags", "path", configPath)
+	}
 
 	// Validate configuration
 	if err := cfg.Validate(); err != nil {
@@ -97,7 +114,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	logger.Info("Starting proxy kubelet",
+	logger.Info("Starting conduit-kubelet",
+		"version", version,
 		"node_name", cfg.NodeName,
 		"cluster_name", cfg.ClusterName,
 		"key_mode", cfg.KeyMode(),
@@ -214,14 +232,8 @@ func initializeLogger(level string) *slog.Logger {
 	return slog.New(handler)
 }
 
-func loadConfiguration(logger *slog.Logger) *config.Config {
+func loadConfiguration() *config.Config {
 	cfg := config.DefaultConfig()
-
-	if configPath != "" {
-		logger.Info("Loading configuration from file", "path", configPath)
-		// TODO: Implement YAML configuration file loading
-		// For now, we'll use the default configuration
-	}
 
 	// Load from environment variables
 	cfg.LoadFromEnvironment()
@@ -257,15 +269,23 @@ func overrideConfiguration(cfg *config.Config) {
 	if namespace != "" {
 		cfg.Namespace = namespace
 	}
+	if logLevel != "" {
+		cfg.LogLevel = logLevel
+	}
 	if reconcileInterval != 0 {
 		cfg.ReconcileInterval = time.Duration(reconcileInterval) * time.Second
 	}
 
-	// Override enabled providers if specified
 	if enabledProviders != "" {
-		// Parse comma-separated list
-		// TODO: Implement proper parsing
-		cfg.Providers.EnabledProviders = []string{"runpod"} // Default for now
+		var list []string
+		for _, p := range strings.Split(enabledProviders, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				list = append(list, p)
+			}
+		}
+		if len(list) > 0 {
+			cfg.Providers.EnabledProviders = list
+		}
 	}
 }
 
@@ -346,15 +366,19 @@ func createControllers(ctx context.Context, provider *virtualkubelet.Provider, k
 		return nil, nil, fmt.Errorf("failed to create pod controller: %w", err)
 	}
 
-	// Create node controller
+	// Create the virtual node object; ConfigureNode adds labels and the
+	// virtual-kubelet taint so that only pods that opt in are scheduled here.
+	virtualNode := &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: nodeName,
+		},
+		Status: *provider.GetNodeStatus(),
+	}
+	provider.ConfigureNode(ctx, virtualNode)
+
 	nodeController, err := node.NewNodeController(
 		provider,
-		&v1.Node{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: nodeName,
-			},
-			Status: *provider.GetNodeStatus(),
-		},
+		virtualNode,
 		k8sClient.CoreV1().Nodes(),
 	)
 	if err != nil {

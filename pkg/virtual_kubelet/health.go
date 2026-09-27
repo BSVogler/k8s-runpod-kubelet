@@ -11,22 +11,22 @@ import (
 
 // HealthServer provides health check endpoints for the proxy kubelet
 type HealthServer struct {
-	server       *http.Server
-	logger       *slog.Logger
+	server        *http.Server
+	logger        *slog.Logger
 	readinessFunc func() bool
 	livenessFunc  func() bool
-	mutex        sync.RWMutex
+	mutex         sync.RWMutex
 }
 
 // HealthStatus represents the health status response
 type HealthStatus struct {
-	Status      string            `json:"status"`
-	Timestamp   time.Time         `json:"timestamp"`
-	Uptime      time.Duration     `json:"uptime"`
-	Version     string            `json:"version"`
-	Providers   map[string]bool   `json:"providers,omitempty"`
-	WebSocket   WebSocketStatus   `json:"websocket"`
-	Details     map[string]string `json:"details,omitempty"`
+	Status    string            `json:"status"`
+	Timestamp time.Time         `json:"timestamp"`
+	Uptime    time.Duration     `json:"uptime"`
+	Version   string            `json:"version"`
+	Providers map[string]bool   `json:"providers,omitempty"`
+	WebSocket WebSocketStatus   `json:"websocket"`
+	Details   map[string]string `json:"details,omitempty"`
 }
 
 // WebSocketStatus represents WebSocket connection status
@@ -190,7 +190,7 @@ func (hs *HealthServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	status := HealthStatus{
 		Status:    "running",
 		Timestamp: time.Now(),
-		Version:   "1.0.0",
+		Version:   Version,
 		WebSocket: WebSocketStatus{
 			Connected: false, // This should be updated by the provider
 		},

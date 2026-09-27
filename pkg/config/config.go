@@ -130,7 +130,7 @@ func DefaultConfig() *Config {
 		},
 
 		ClusterName:         "default",
-		NodeName:            "virtual-proxy",
+		NodeName:            "conduit-node",
 		OperatingSystem:     "Linux",
 		InternalIP:          "127.0.0.1",
 		ListenPort:          10250,

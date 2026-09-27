@@ -73,21 +73,21 @@ Conduit Kubelet is an **open-source virtual Kubernetes kubelet** that acts as a 
 
 ### Build Commands
 ```bash
-# Build the main binary
-go build -o proxy-kubelet ./cmd/virtual_kubelet
-
-# Build for testing locally
-go build -o proxy-kubelet-dev ./cmd/virtual_kubelet
+# Build the main binary (version is injected via ldflags; printed at startup and by --version)
+go build -ldflags "-X main.version=$(git describe --tags --always)" -o conduit-kubelet ./cmd/virtual_kubelet
 
 # Run locally with kubeconfig
-./proxy-kubelet --kubeconfig=$HOME/.kube/config \
-  --backend-url="wss://localhost:8000/api/kubelet/ws" \
+./conduit-kubelet --kubeconfig=$HOME/.kube/config \
+  --backend-url="ws://localhost:8010/api/kubelet/ws" \
   --backend-api-key="test-key"
 
 # Run with debug logging
-./proxy-kubelet --log-level=debug \
-  --nodename=proxy-test \
+./conduit-kubelet --log-level=debug \
+  --nodename=conduit-test \
   --namespace=default
+
+# Formatting must be clean (CI checks gofmt -l)
+gofmt -l .
 ```
 
 ### Testing Commands
@@ -108,16 +108,18 @@ go test -tags=integration ./...
 ```
 
 ### Container Commands
+The `Dockerfile` is multi-stage (golang builder → `gcr.io/distroless/static:nonroot`, CGO disabled, uid 65532) and honours `TARGETOS`/`TARGETARCH` for buildx multi-arch builds. Published image: `ghcr.io/bsvogler/conduit-kubelet` (`latest` on the default branch, `<git tag>` on releases, `<sha>` always).
+
 ```bash
 # Build container image
-docker build -t k8s-proxy-kubelet:latest .
+docker build --build-arg VERSION=$(git describe --tags --always) -t conduit-kubelet:dev .
 
 # Run in container (requires backend service)
 docker run --rm \
-  -e BACKEND_URL="wss://backend.example.com/api/kubelet/ws" \
-  -e BACKEND_API_KEY="your-key" \
+  -e BACKEND_URL="wss://gpuconduit.io/api/kubelet/ws" \
+  -e BACKEND_API_KEY="your-token" \
   -e RUNPOD_API_KEY="your-runpod-key" \
-  k8s-proxy-kubelet:latest
+  conduit-kubelet:dev
 ```
 
 ## API Key Management
@@ -164,7 +166,7 @@ if apiKey == "" {
 
 **Optional:**
 - `CLUSTER_NAME`: Cluster name reported to the platform (default: "default")
-- `NODE_NAME`: Kubernetes node name (default: "virtual-proxy")
+- `NODE_NAME`: Kubernetes node name (default: "conduit-node")
 - `NAMESPACE`: Kubernetes namespace (default: "kube-system")
 - `LOG_LEVEL`: Logging level (default: "info")
 
@@ -176,7 +178,14 @@ The key mode reported in the registration is derived: "local" if any provider ke
 - `--backend-api-key`: Backend authentication key
 - `--nodename`: Node name for Kubernetes
 - `--cluster-name`: Cluster name reported to the platform
+- `--namespace`, `--health-server-address`, `--reconcile-interval`
 - `--log-level`: Set to "debug" for WebSocket message tracing
+- `--version`: Print the build version and exit
+
+Flags default to the zero value so environment variables are not overridden; precedence is flag > env > `config.DefaultConfig()`.
+
+### The Virtual Node
+`Provider.ConfigureNode` (`pkg/virtual_kubelet/kubelet.go`) is called from `main.go` before the node controller starts. It sets labels `conduit.io/provider=true`, `type=virtual-kubelet`, `kubernetes.io/role=agent`, `kubernetes.io/hostname=<nodeName>` and the taint `virtual-kubelet.io/provider=conduit:NoSchedule`. Pods need a matching toleration (and normally the nodeSelector) to be scheduled onto the node; the README's first-pod example must stay in sync with these constants. virtual-kubelet only applies labels/taints when it creates the node object, not on updates.
 
 ## WebSocket Protocol
 
@@ -200,10 +209,10 @@ When the platform refuses a pod it sends a `reject` command (`{pod_name, namespa
 ### Debug WebSocket Communication
 ```bash
 # Enable debug logging to see WebSocket messages
-./proxy-kubelet --log-level=debug 2>&1 | grep -E "(WebSocket|Command|Response)"
+./conduit-kubelet --log-level=debug 2>&1 | grep -E "(WebSocket|Command|Response)"
 
 # Monitor specific message types
-./proxy-kubelet --log-level=debug 2>&1 | grep -E "(deploy|terminate)"
+./conduit-kubelet --log-level=debug 2>&1 | grep -E "(deploy|terminate)"
 ```
 
 ## Provider Implementation
@@ -240,7 +249,7 @@ type Provider interface {
 **WebSocket Connection Problems:**
 ```bash
 # Check WebSocket connectivity
-./proxy-kubelet --log-level=debug --backend-url="wss://backend.test.com/api/kubelet/ws"
+./conduit-kubelet --log-level=debug --backend-url="wss://backend.test.com/api/kubelet/ws"
 
 # Look for connection errors
 grep -i "websocket\|connection" kubelet.log
@@ -248,18 +257,14 @@ grep -i "websocket\|connection" kubelet.log
 
 **Provider API Issues:**
 ```bash
-# Test provider connectivity separately
-export RUNPOD_API_KEY=your-key
-go run ./cmd/test-provider --provider=runpod --operation=ping
-
 # Debug provider calls
-./proxy-kubelet --log-level=debug 2>&1 | grep -A5 -B5 "provider.*error"
+./conduit-kubelet --log-level=debug 2>&1 | grep -A5 -B5 "provider.*error"
 ```
 
 **Command Processing Issues:**
 ```bash
 # Monitor command flow
-./proxy-kubelet --log-level=debug 2>&1 | grep -E "(Processing command|Command execution)"
+./conduit-kubelet --log-level=debug 2>&1 | grep -E "(Processing command|Command execution)"
 
 # Check for command timeouts
 grep -i timeout kubelet.log
@@ -345,24 +350,28 @@ The platform service must implement:
 
 ## Deployment
 
-### Kubernetes Deployment
+### Helm Chart
+The chart lives in `deploy/helm/conduit-kubelet/` and is published as `oci://ghcr.io/bsvogler/helm/conduit-kubelet` (chart version = git tag without `v`, appVersion = git tag). Default namespace in docs is `conduit-system`.
+
+Values → env mapping (`templates/deployment.yaml`): `conduit.url`→`BACKEND_URL`, `conduit.apiToken`→Secret key `CONDUIT_API_TOKEN`→`BACKEND_API_KEY`, `runpod.apiKey`→Secret key `RUNPOD_API_KEY`→`RUNPOD_API_KEY` (optional), `cluster.name`→`CLUSTER_NAME`, `kubelet.nodeName`→`NODE_NAME`, `kubelet.namespace`→`NAMESPACE`, `kubelet.logLevel`→`LOG_LEVEL`; `kubelet.healthServerAddress` and `kubelet.reconcileInterval` are passed as flags. `conduit.existingSecret` replaces the chart-managed Secret (same keys). Rendering fails unless `conduit.apiToken` or `conduit.existingSecret` is set.
+
 ```bash
-# Apply RBAC and deployment
-kubectl apply -f deploy/kubelet.yaml
+helm lint deploy/helm/conduit-kubelet --set conduit.apiToken=x
+helm template ck deploy/helm/conduit-kubelet -n conduit-system --set conduit.apiToken=x
 
-# Check deployment status
-kubectl get pods -n kube-system -l app=proxy-kubelet
+helm upgrade --install conduit-kubelet deploy/helm/conduit-kubelet \
+  --namespace conduit-system --create-namespace \
+  --set conduit.apiToken="your-token" [--set runpod.apiKey="your-runpod-key"]
 
-# View logs
-kubectl logs -n kube-system -l app=proxy-kubelet -f
+kubectl -n conduit-system get pods
+kubectl get node conduit-node
+kubectl -n conduit-system logs deploy/conduit-kubelet -f
 ```
 
-### Helm Deployment (Future)
-```bash
-helm install gpu-proxy ./helm/proxy-kubelet \
-  --set config.backendURL="wss://your-backend.com/api/kubelet/ws" \
-  --set config.backendAPIKey="your-api-key"
-```
+### CI (`.github/workflows/`)
+- `build.yml`: gofmt/vet/test, helm lint, multi-arch image push to ghcr.io on push to `master`/`main` and tags (PRs build without push)
+- `helm-publish.yml`: packages and pushes the chart on tags/releases/workflow_dispatch
+- `release.yml`: builds linux/darwin amd64/arm64 binaries with `-X main.version=<tag>`, attaches them plus `checksums.txt` to the GitHub release
 
 ## Development Workflow
 
@@ -376,17 +385,16 @@ helm install gpu-proxy ./helm/proxy-kubelet \
 
 For comprehensive documentation, see:
 
-- **`docs/CURRENT_STATE.md`** - Current implementation status (what exists today)
+- **`README.md`** - Public documentation: quick start, configuration, annotations, license
+- **`README.dev.md`** - Developer notes
 - **`docs/ARCHITECTURE.md`** - Target SaaS architecture (detailed design)
-- **`docs/PRODUCTION_GAPS.md`** - Missing features for production launch
-- **`docs/PRODUCTION_CHECKLIST.md`** - Go-live checklist
-- **`README.md`** - Project overview and quick start
+- **`LICENSE`** - PolyForm Strict 1.0.0 (source-available; commercial use via the Conduit platform)
 
 ## Related Components
 
 - **Platform Service**: Proprietary SaaS backend (your business logic)
 - **GPU Providers**: RunPod, Vast.ai, Salad, AWS, GCP
-- **Original Kubelet**: `k8s-runpod-kubelet` (predecessor - direct provider integration)
+- **Original Kubelet**: `k8s-runpod-kubelet` (predecessor - direct provider integration; kept on the `legacy` branch / tag `v1-legacy` of the public repo, unsupported)
 - **Virtual Kubelet Framework**: Upstream Kubernetes integration framework
 
 ## Historical Context

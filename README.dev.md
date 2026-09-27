@@ -36,12 +36,11 @@ conduit-kubelet/
 │   ├── websocket/           # WebSocket client & protocol
 │   ├── providers/           # Provider implementations
 │   │   ├── runpod/         # RunPod client
-│   │   ├── vastai/         # Vast.ai client
 │   │   └── interface.go    # Provider interface
 │   ├── command/            # Command handler
 │   ├── config/             # Configuration
 │   └── virtual_kubelet/    # K8s integration
-├── deploy/                 # Kubernetes manifests
+├── deploy/helm/            # Helm chart
 └── docs/                   # Documentation
 ```
 
@@ -59,7 +58,7 @@ conduit-kubelet/
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/conduit-kubelet
+git clone https://github.com/BSVogler/k8s-runpod-kubelet conduit-kubelet
 cd conduit-kubelet
 
 # Install dependencies
@@ -279,8 +278,8 @@ Add environment variable support in `pkg/config/config.go` if needed.
 - `SALAD_API_KEY` - Salad API key
 
 **Optional:**
-- `NODE_NAME` - Kubernetes node name (default: "virtual-proxy")
-- `NAMESPACE` - Kubernetes namespace (default: "kube-system")
+- `NODE_NAME` - Kubernetes node name (default: "conduit-node")
+- `NAMESPACE` - Kubernetes namespace (default: "kube-system"; the chart sets the release namespace)
 - `LOG_LEVEL` - Logging level: debug, info, warn, error (default: "info")
 
 ### Command Line Flags
@@ -292,7 +291,9 @@ Flags:
   --kubeconfig string              Path to kubeconfig file
   --backend-url string             Backend WebSocket URL
   --backend-api-key string         Backend authentication key
-  --nodename string                Node name for Kubernetes (default "virtual-proxy")
+  --nodename string                Node name for Kubernetes (default "conduit-node")
+  --cluster-name string            Cluster name reported to the platform (default "default")
+  --version                        Print the version and exit
   --operating-system string        Operating system (default "Linux")
   --internal-ip string             Internal IP address (default "127.0.0.1")
   --listen-port int                Port to listen on (default 10250)
@@ -353,7 +354,7 @@ go run cmd/mock-backend/main.go
 kubectl apply -f examples/test-pod.yaml
 
 # Watch logs
-kubectl logs -n kube-system -l app=conduit-kubelet -f
+kubectl logs -n conduit-system -l app=conduit-kubelet -f
 ```
 
 ---
@@ -371,17 +372,17 @@ export LOG_LEVEL=debug
 ./conduit-kubelet
 
 # In Kubernetes
-kubectl set env deployment/conduit-kubelet -n kube-system LOG_LEVEL=debug
+kubectl set env deployment/conduit-kubelet -n conduit-system LOG_LEVEL=debug
 ```
 
 ### Debug WebSocket Communication
 
 ```bash
 # Filter for WebSocket messages
-kubectl logs -n kube-system -l app=conduit-kubelet | grep -E "(WebSocket|Command|Response)"
+kubectl logs -n conduit-system -l app=conduit-kubelet | grep -E "(WebSocket|Command|Response)"
 
 # Monitor specific message types
-kubectl logs -n kube-system -l app=conduit-kubelet | grep -E "(deploy|terminate)"
+kubectl logs -n conduit-system -l app=conduit-kubelet | grep -E "(deploy|terminate)"
 ```
 
 ### Debug Provider Calls
@@ -394,7 +395,7 @@ curl http://localhost:8080/status | jq '.providers'
 curl http://localhost:8080/status | jq '.'
 
 # Test provider ping
-kubectl exec -n kube-system deployment/conduit-kubelet -- \
+kubectl exec -n conduit-system deployment/conduit-kubelet -- \
   curl localhost:8080/healthz
 ```
 
@@ -403,16 +404,16 @@ kubectl exec -n kube-system deployment/conduit-kubelet -- \
 **WebSocket Connection Failed:**
 ```bash
 # Check logs for connection errors
-kubectl logs -n kube-system -l app=conduit-kubelet | grep -i "websocket\|connection"
+kubectl logs -n conduit-system -l app=conduit-kubelet | grep -i "websocket\|connection"
 
 # Verify backend URL
-kubectl get deployment conduit-kubelet -n kube-system -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="BACKEND_URL")].value}'
+kubectl get deployment conduit-kubelet -n conduit-system -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="BACKEND_URL")].value}'
 ```
 
 **Provider API Errors:**
 ```bash
 # Check if API keys are set
-kubectl get secret conduit-provider-keys -n kube-system -o json | jq '.data'
+kubectl get secret conduit-provider-keys -n conduit-system -o json | jq '.data'
 
 # Test provider directly (requires API key)
 curl -H "Authorization: Bearer $RUNPOD_API_KEY" https://api.runpod.io/v2/gpuTypes
@@ -487,9 +488,7 @@ ls -la pkg/providers/*/client.go
 ## Documentation
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) - Detailed architecture
-- [`docs/CURRENT_STATE.md`](docs/CURRENT_STATE.md) - Implementation status
-- [`docs/PRODUCTION_GAPS.md`](docs/PRODUCTION_GAPS.md) - Production gaps
-- [`docs/PRODUCTION_CHECKLIST.md`](docs/PRODUCTION_CHECKLIST.md) - Go-live checklist
+- [`deploy/helm/conduit-kubelet`](deploy/helm/conduit-kubelet) - Helm chart
 - [`CLAUDE.md`](CLAUDE.md) - Claude Code guidelines
 
 ---
@@ -502,4 +501,4 @@ See [README.md](README.md#contributing) for contribution guidelines.
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) file for details.
+PolyForm Strict 1.0.0 - see [LICENSE](LICENSE) and the License section of [README.md](README.md#license).

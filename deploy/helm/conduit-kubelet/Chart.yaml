@@ -1,0 +1,19 @@
+apiVersion: v2
+name: conduit-kubelet
+description: Virtual kubelet that connects a Kubernetes cluster to the Conduit GPU platform (gpuconduit.io)
+type: application
+# version and appVersion are overwritten from the git tag by the helm-publish workflow.
+version: 0.1.0
+appVersion: "latest"
+home: https://gpuconduit.io
+sources:
+  - https://github.com/BSVogler/k8s-runpod-kubelet
+maintainers:
+  - name: bsvogler
+    url: https://benediktsvogler.com
+keywords:
+  - conduit
+  - gpu
+  - virtual-kubelet
+  - runpod
+  - kubernetes
