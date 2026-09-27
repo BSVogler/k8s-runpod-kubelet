@@ -1,7 +1,7 @@
 # Virtual Kubelet for RunPod
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/bsvogler/k8s-runpod-kubelet)](https://goreportcard.com/report/github.com/bsvogler/k8s-runpod-kubelet)
-[![License](https://img.shields.io/github/license/bsvogler/k8s-runpod-kubelet)](LICENSE)
+[![License](https://img.shields.io/badge/license-PolyForm%20Strict%201.0.0-blue)](LICENSE)
 [![Helm Chart](https://img.shields.io/badge/helm-ghcr.io-blue)](https://github.com/users/bsvogler/packages/container/package/charts%2Frunpod-kubelet)
 [![Container Image](https://img.shields.io/badge/container-ghcr.io-blue)](https://github.com/bsvogler/k8s-runpod-kubelet/pkgs/container/runpod-kubelet)
 [![Release](https://img.shields.io/github/v/release/bsvogler/k8s-runpod-kubelet)](https://github.com/bsvogler/k8s-runpod-kubelet/releases)
@@ -55,21 +55,30 @@ The Virtual Kubelet acts as a bridge between Kubernetes and RunPod, providing a 
 
 ```
 ┌─────────────────────────┐                 ┌─────────────────────┐
-│  Kubernetes Cluster     │                 │     RunPod Cloud    │
+│  Kubernetes Cluster     │                 │   GPU Conduit API   │
 │                         │                 │                     │
-│  ┌───────────────────┐  │    RunPod API   │  ┌───────────────┐  │
-│  │                   │  │                 │  │               │  │
-│  │  Regular Nodes    │  │                 │  │  GPU Instance │  │
-│  │                   │  │                 │  │               │  │
+│  ┌───────────────────┐  │                 │  ┌───────────────┐  │
+│  │                   │  │                 │  │   Intelligent │  │
+│  │  Regular Nodes    │  │                 │  │   Routing &   │  │
+│  │                   │  │                 │  │   Pricing     │  │
 │  └───────────────────┘  │                 │  └───────────────┘  │
 │                         │                 │                     │
-│  ┌───────────────────┐  │     ◄─────►     │  ┌───────────────┐  │
-│  │  RunPod           │  │                 │  │               │  │
-│  │  Virtual Node     │──┼─────────────────┼─►│  GPU Instance │  │
-│  │                   │  │                 │  │               │  │
-│  └───────────────────┘  │                 │  └───────────────┘  │
+│  ┌───────────────────┐  │   Conduit API   │                     │
+│  │  Conduit          │  │                 │                     │
+│  │  Virtual Node     │──┼─────────────────┤                     │
+│  │                   │  │                 │                     │
+│  └───────────────────┘  │                 │                     │
 │                         │                 │                     │
-└─────────────────────────┘                 └─────────────────────┘
+└─────────────────────────┘                 └─────────┬───────────┘
+                                                      │
+                            ┌─────────────────────────┼───────────────────────────┐
+                            │                         │                           │
+                            ▼                         ▼                           ▼
+                    ┌──────────────┐        ┌──────────────┐            ┌──────────────┐
+                    │   RunPod     │        │   Vast.ai    │            │ Lambda Labs  │
+                    │  GPU Cloud   │        │  GPU Cloud   │            │  GPU Cloud   │
+                    │              │        │              │            │   (+ 7 more) │
+                    └──────────────┘        └──────────────┘            └──────────────┘
 ```
 
 ## 📋 Prerequisites
@@ -334,15 +343,14 @@ The controller consists of several components:
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Bug reports and feature requests are welcome as [GitHub issues](https://github.com/BSVogler/k8s-runpod-kubelet/issues). The license does not permit modified versions, so please get in touch before working on a code contribution.
 
 ## 📄 License
 
-This project is licensed under a Non-Commercial License - see the [LICENSE](LICENSE) file for details.
+This project is source-available under the [PolyForm Strict License 1.0.0](LICENSE).
 
-- **Permitted**: Private, personal, and non-commercial use
-- **Prohibited**: Commercial use without explicit permission
-- **Required**: License and copyright notice
+- **Permitted**: Personal and other non-commercial use, and use by non-commercial organizations (education, public research, charities, government)
+- **Not permitted**: Commercial use, modifying the software, or redistributing it (including modified builds and container images)
+- **Commercial use**: Requires a commercial license, available through [GPU Conduit](https://gpuconduit.io)
 
-For commercial licensing inquiries or to discuss custom development work as a freelancer, please contact me at
-engineering@benediktsvogler.com.
+For commercial licensing or custom development work, contact engineering@benediktsvogler.com.
