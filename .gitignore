@@ -1,39 +1,6 @@
-# Binaries for programs and plugins
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
-
-# Test binary, built with `go test -c`
-*.test
-
-# Output of the go coverage tool, specifically when used with LiteIDE
-*.out
-
-# Dependency directories
-vendor/
-
-# Go workspace file
-go.work
-
-# IDE specific files
-.idea
-.vscode
-*.swp
-*.swo
-
-# OS specific files
-.DS_Store
-
-# Explicitly do not ignore these files
-!go.mod
-!go.sum
-.run/go build github.com_bsvogler_k8s-runpod-kubelet_cmd_virtual_kubelet.run.xml
+# local binary build output (root only; the chart dir has the same name)
+/conduit-kubelet
+/dist/
 *.tgz
-
-# local secrets and build output
-.key
-/k8s-runpod-kubelet
-/vk-test
-.aider*
+.DS_Store
+.idea/

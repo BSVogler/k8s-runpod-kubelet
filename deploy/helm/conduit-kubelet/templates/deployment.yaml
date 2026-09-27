@@ -1,0 +1,104 @@
+{{- if and (not .Values.conduit.existingSecret) (not .Values.conduit.apiToken) -}}
+{{- fail "conduit.apiToken is required (or set conduit.existingSecret to a Secret containing CONDUIT_API_TOKEN). Get a token at https://gpuconduit.io/dashboard/installation/" -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "conduit-kubelet.fullname" . }}
+  namespace: {{ include "conduit-kubelet.namespace" . }}
+  labels:
+    {{- include "conduit-kubelet.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  # Only one kubelet may own a given virtual node at a time.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "conduit-kubelet.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        {{- if not .Values.conduit.existingSecret }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "conduit-kubelet.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "conduit-kubelet.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: kubelet
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "--health-server-address={{ .Values.kubelet.healthServerAddress }}"
+            - "--reconcile-interval={{ .Values.kubelet.reconcileInterval }}"
+          env:
+            - name: BACKEND_URL
+              value: {{ .Values.conduit.url | quote }}
+            - name: BACKEND_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "conduit-kubelet.secretName" . }}
+                  key: CONDUIT_API_TOKEN
+            - name: RUNPOD_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "conduit-kubelet.secretName" . }}
+                  key: RUNPOD_API_KEY
+                  optional: true
+            - name: CLUSTER_NAME
+              value: {{ .Values.cluster.name | quote }}
+            - name: NODE_NAME
+              value: {{ .Values.kubelet.nodeName | quote }}
+            - name: NAMESPACE
+              value: {{ include "conduit-kubelet.namespace" . | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.kubelet.logLevel | quote }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: health
+              containerPort: {{ include "conduit-kubelet.healthPort" . }}
+              protocol: TCP
+          {{- if .Values.livenessProbe.enabled }}
+          {{- $probe := omit .Values.livenessProbe "enabled" }}
+          {{- $_ := set $probe.httpGet "port" "health" }}
+          livenessProbe:
+            {{- toYaml $probe | nindent 12 }}
+          {{- end }}
+          {{- if .Values.readinessProbe.enabled }}
+          {{- $probe := omit .Values.readinessProbe "enabled" }}
+          {{- $_ := set $probe.httpGet "port" "health" }}
+          readinessProbe:
+            {{- toYaml $probe | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

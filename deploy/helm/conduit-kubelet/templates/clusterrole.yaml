@@ -1,0 +1,26 @@
+{{- if .Values.rbac.create -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "conduit-kubelet.fullname" . }}
+  labels:
+    {{- include "conduit-kubelet.labels" . | nindent 4 }}
+rules:
+  # Virtual-kubelet: register the node, watch pods scheduled to it, read
+  # ConfigMaps/Secrets referenced by those pods.
+  - apiGroups: [""]
+    resources: ["pods", "nodes", "nodes/status", "namespaces", "configmaps", "secrets"]
+    verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/status"]
+    verbs: ["update", "patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+{{- end }}
