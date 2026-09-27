@@ -2,6 +2,7 @@ package websocket
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -56,8 +57,11 @@ type Client struct {
 	closeCh chan struct{}
 
 	// Connection state
-	connected   bool
-	connectedAt time.Time
+	connected bool
+	// refusedReason is the close text of the last 1008 close from the platform
+	// (plan limit reached, token revoked); empty when the last close was normal.
+	refusedReason string
+	connectedAt   time.Time
 
 	// Called (in its own goroutine) after every successful (re)connect,
 	// used by the kubelet to register itself.
@@ -247,7 +251,26 @@ func (c *Client) connectionManager() {
 		case <-c.ctx.Done():
 			return
 		default:
+		}
+
+		c.connMutex.Lock()
+		refused := c.refusedReason
+		c.refusedReason = ""
+		c.connMutex.Unlock()
+
+		if refused == "" {
 			c.logger.Warn("Connection lost, attempting to reconnect")
+			continue
+		}
+
+		// Reconnecting quickly cannot fix a plan limit; wait the maximum delay
+		// and keep the reason visible in the logs.
+		c.logger.Error("Platform refused this kubelet", "reason", refused,
+			"retry_delay", c.config.MaxReconnectDelay)
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-time.After(c.config.MaxReconnectDelay):
 		}
 	}
 }
@@ -384,7 +407,15 @@ func (c *Client) messageReader() {
 
 		_, data, err := conn.ReadMessage()
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+			// The platform closes with 1008 (policy violation) when the
+			// organization's plan does not allow this kubelet; remember it so
+			// the reconnect loop can surface the reason and back off.
+			var closeErr *websocket.CloseError
+			if errors.As(err, &closeErr) && closeErr.Code == websocket.ClosePolicyViolation {
+				c.connMutex.Lock()
+				c.refusedReason = closeErr.Text
+				c.connMutex.Unlock()
+			} else if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				c.logger.Error("WebSocket read error", "error", err)
 			}
 			return
