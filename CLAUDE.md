@@ -406,3 +406,17 @@ This project evolved from a direct virtual kubelet (`k8s-runpod-kubelet`) that m
 - Easy provider addition without kubelet changes
 
 Some routing logic (`GetPricing`, `GetAvailability`) remains from the original implementation and is deprecated for SaaS mode.
+## Two Repositories: Private Development, Public Releases
+
+- **Private:** `BSVogler/conduit-kubelet` (remote `origin`) — day-to-day development, PRs, CI runs vet/test/lint only.
+- **Public:** `BSVogler/k8s-runpod-kubelet` (remote `public`, branch `master`) — trust building and build verification. Only this repo's CI publishes the image, chart and release binaries (the workflows gate on `github.repository`).
+
+Both share one linear history, so publishing a release is a fast-forward push:
+
+```bash
+git push public main:master          # source becomes visible
+git tag -a vX.Y.Z -m "..." && git push public vX.Y.Z   # triggers image, chart and binaries
+git push origin main vX.Y.Z          # keep the private repo in sync
+```
+
+Never force-push `public/master`; never push provider keys, binaries or `.idea/` (all gitignored).

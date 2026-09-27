@@ -59,6 +59,8 @@ jobs:
   image:
     name: Container image
     runs-on: ubuntu-latest
+    # Only the public repo publishes; the private development repo just verifies.
+    if: github.repository == 'BSVogler/k8s-runpod-kubelet'
     needs: [test]
     steps:
       - uses: actions/checkout@v4
