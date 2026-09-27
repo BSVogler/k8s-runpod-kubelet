@@ -20,6 +20,7 @@ type Config struct {
 	Providers ProviderConfig `yaml:"providers"`
 
 	// Kubelet settings
+	ClusterName         string        `yaml:"cluster_name"`
 	NodeName            string        `yaml:"node_name"`
 	OperatingSystem     string        `yaml:"operating_system"`
 	InternalIP          string        `yaml:"internal_ip"`
@@ -47,12 +48,12 @@ type WebSocketConfig struct {
 
 // ProviderConfig holds provider-specific configuration
 type ProviderConfig struct {
-	EnabledProviders []string              `yaml:"enabled_providers"`
-	RunPod           RunPodProviderConfig  `yaml:"runpod"`
-	VastAI           VastAIProviderConfig  `yaml:"vastai"`
-	Salad            SaladProviderConfig   `yaml:"salad"`
-	AWS              AWSProviderConfig     `yaml:"aws"`
-	GCP              GCPProviderConfig     `yaml:"gcp"`
+	EnabledProviders []string             `yaml:"enabled_providers"`
+	RunPod           RunPodProviderConfig `yaml:"runpod"`
+	VastAI           VastAIProviderConfig `yaml:"vastai"`
+	Salad            SaladProviderConfig  `yaml:"salad"`
+	AWS              AWSProviderConfig    `yaml:"aws"`
+	GCP              GCPProviderConfig    `yaml:"gcp"`
 }
 
 // RunPodProviderConfig holds RunPod-specific configuration
@@ -78,11 +79,11 @@ type SaladProviderConfig struct {
 
 // AWSProviderConfig holds AWS-specific configuration
 type AWSProviderConfig struct {
-	AccessKeyID     string   `yaml:"access_key_id"`
-	SecretAccessKey string   `yaml:"secret_access_key"`
-	Region          string   `yaml:"region"`
+	AccessKeyID       string   `yaml:"access_key_id"`
+	SecretAccessKey   string   `yaml:"secret_access_key"`
+	Region            string   `yaml:"region"`
 	AvailabilityZones []string `yaml:"availability_zones"`
-	MaxInstancePrice float64  `yaml:"max_instance_price"`
+	MaxInstancePrice  float64  `yaml:"max_instance_price"`
 }
 
 // GCPProviderConfig holds GCP-specific configuration
@@ -128,6 +129,7 @@ func DefaultConfig() *Config {
 			},
 		},
 
+		ClusterName:         "default",
 		NodeName:            "virtual-proxy",
 		OperatingSystem:     "Linux",
 		InternalIP:          "127.0.0.1",
@@ -191,6 +193,30 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+// Key management modes reported in the registration metadata.
+const (
+	KeyModeLocal    = "local"    // provider API keys are configured on the kubelet
+	KeyModePlatform = "platform" // the platform must supply provider API keys with each command
+)
+
+// KeyMode returns "local" if any provider key is configured locally, else "platform".
+func (c *Config) KeyMode() string {
+	if c.HasLocalProviderKey() {
+		return KeyModeLocal
+	}
+	return KeyModePlatform
+}
+
+// HasLocalProviderKey reports whether any provider credential is configured locally.
+func (c *Config) HasLocalProviderKey() bool {
+	p := c.Providers
+	return p.RunPod.APIKey != "" ||
+		p.VastAI.APIKey != "" ||
+		p.Salad.APIKey != "" ||
+		(p.AWS.AccessKeyID != "" && p.AWS.SecretAccessKey != "") ||
+		p.GCP.ServiceAccountKey != ""
+}
+
 // IsProviderEnabled checks if a specific provider is enabled
 func (c *Config) IsProviderEnabled(provider string) bool {
 	for _, enabled := range c.Providers.EnabledProviders {
@@ -248,6 +274,10 @@ func (c *Config) LoadFromEnvironment() {
 
 	if apiKey := os.Getenv("BACKEND_API_KEY"); apiKey != "" {
 		c.BackendAPIKey = apiKey
+	}
+
+	if clusterName := os.Getenv("CLUSTER_NAME"); clusterName != "" {
+		c.ClusterName = clusterName
 	}
 
 	if nodeName := os.Getenv("NODE_NAME"); nodeName != "" {

@@ -62,7 +62,7 @@ Conduit Kubelet is an **open-source virtual Kubernetes kubelet** that acts as a 
 2. **Platform Intelligence**: Platform analyzes requirements, checks quotas, selects provider
 3. **Command Execution**: Platform sends `deploy` command with provider name + API key → Kubelet executes provider API call
 4. **Status Updates**: Kubelet returns result → Platform tracks cost → Kubelet updates K8s pod status
-5. **Rejection Handling**: If platform rejects (plan limits, quota), kubelet creates K8s event and keeps pod pending
+5. **Rejection Handling**: If platform rejects (plan limits, quota, no key), kubelet marks the pod Failed with the reject code and message
 
 **Terminology:**
 - **Platform** = Proprietary SaaS backend service (your business logic)
@@ -163,38 +163,39 @@ if apiKey == "" {
 - `SALAD_API_KEY`: Salad API key (optional if platform provides keys)
 
 **Optional:**
-- `NODE_NAME`: Kubernetes node name (default: "conduit-kubelet")
+- `CLUSTER_NAME`: Cluster name reported to the platform (default: "default")
+- `NODE_NAME`: Kubernetes node name (default: "virtual-proxy")
 - `NAMESPACE`: Kubernetes namespace (default: "kube-system")
 - `LOG_LEVEL`: Logging level (default: "info")
-- `KEY_MODE`: Key management mode - "local", "platform", or "hybrid" (default: "hybrid")
+
+The key mode reported in the registration is derived: "local" if any provider key is configured, otherwise "platform".
 
 ### Command Line Flags
 - `--kubeconfig`: Path to kubeconfig file
 - `--backend-url`: Backend WebSocket URL
 - `--backend-api-key`: Backend authentication key
 - `--nodename`: Node name for Kubernetes
+- `--cluster-name`: Cluster name reported to the platform
 - `--log-level`: Set to "debug" for WebSocket message tracing
 
 ## WebSocket Protocol
 
-### Message Types
-- **Commands** (Platform → Kubelet): `deploy`, `terminate`, `status`, `ping`
-- **Events** (Kubelet → Platform): `pod_created`, `pod_deleted`, `kubelet_registration`
-- **Responses** (Kubelet → Platform): `result`, `error`
-- **Rejections** (Platform → Kubelet): `rejection` with error codes (plan limits, quota, credits)
+Protocol v2 (`pkg/websocket/protocol.go`, mirrored by `conduit-service/src/conduit/websocket/protocol.py`). Every frame is an envelope `{id, type, payload, timestamp, kubelet_id}`; `kubelet_id` is the backend API token because the service identifies kubelets by token.
+
+### Envelope Types
+- **`command`** (Platform → Kubelet): payload `{type: deploy|terminate|status|ping|reject, data}`; envelope `id` is the command id
+- **`response`** (Kubelet → Platform): `{command_id, status: "success"|"error", data|null, error: {code, message, provider_error?}|null}`
+- **`event`** (Kubelet → Platform): `{type: pod_created|pod_deleted|pod_status_change|kubelet_ready|kubelet_error, data}`; `pod_created` carries `pod_name, namespace, uid, pod_spec, annotations`
+- **`heartbeat`** (Kubelet → Platform, every 30s): `{timestamp, kubelet_id, status: "alive"}`
+- **`kubelet_registration`** (Kubelet → Platform, after every connect): `{id, type: "conduit-kubelet", cluster_name, node_name, namespace, capabilities, metadata: {version, internal_ip, key_mode}}`
 
 ### Rejection Handling
-When the platform rejects a deployment (e.g., plan limit exceeded), the kubelet:
-1. Receives rejection message with error code and remediation info
-2. Creates Kubernetes Event with reason and message
-3. Keeps pod in Pending state (does not fail it)
-4. User sees event in `kubectl describe pod`
+When the platform refuses a pod it sends a `reject` command (`{pod_name, namespace, code, message, upgrade_url?}`). The kubelet:
+1. Sets the K8s pod phase to `Failed` with `reason` = code and `message` = message
+2. Responds `{"status": "success", "data": {}}`
+3. User sees the reason and message in `kubectl describe pod`
 
-**Common Rejection Codes:**
-- `PLAN_LIMIT_EXCEEDED` - User at concurrent pod limit
-- `QUOTA_EXCEEDED` - User/team quota exceeded
-- `INSUFFICIENT_CREDITS` - Not enough balance
-- `COST_LIMIT_EXCEEDED` - Pod exceeds cost limits
+**Reject Codes:** `quota_exceeded`, `no_api_key`, `unsupported_provider`, `provider_error`, `conversion_error`
 
 ### Debug WebSocket Communication
 ```bash
@@ -296,14 +297,14 @@ The platform service must implement:
 - Send `deploy` commands with provider name + API key (if platform-managed)
 - Send `terminate` commands on pod deletion or quota enforcement
 - Send `status` commands to poll provider status
-- Send `rejection` messages when plan limits/quotas exceeded
+- Send `reject` commands when plan limits/quotas exceeded or conversion/provider errors occur
 
 ### Kubelet → Platform Communication
 - Send `pod_created` events with full pod spec + annotations
 - Send `pod_deleted` events when K8s deletes pod
-- Send `kubelet_registration` on startup with capabilities
-- Send `result` responses with deployment outcomes
-- Send `error` responses on failures
+- Send `kubelet_registration` after every connect with capabilities and key mode
+- Send `heartbeat` every 30s
+- Send `response` envelopes (`status: success|error`) with command outcomes
 
 ## Security Considerations
 

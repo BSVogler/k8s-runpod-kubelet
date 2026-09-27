@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -13,14 +14,19 @@ import (
 
 // ClientConfig holds configuration for the WebSocket client
 type ClientConfig struct {
-	URL                string
-	APIToken           string
-	ReconnectInterval  time.Duration
-	MaxReconnectDelay  time.Duration
-	PingInterval       time.Duration
-	PongTimeout        time.Duration
-	WriteTimeout       time.Duration
-	ReadTimeout        time.Duration
+	URL      string
+	APIToken string
+
+	// KubeletID is sent in every envelope and in the heartbeat. The service
+	// identifies a kubelet by its API token, so this must equal APIToken.
+	KubeletID string
+
+	ReconnectInterval time.Duration
+	MaxReconnectDelay time.Duration
+	HeartbeatInterval time.Duration
+	PongTimeout       time.Duration
+	WriteTimeout      time.Duration
+	ReadTimeout       time.Duration
 }
 
 // DefaultClientConfig returns a default configuration
@@ -28,7 +34,7 @@ func DefaultClientConfig() *ClientConfig {
 	return &ClientConfig{
 		ReconnectInterval: 5 * time.Second,
 		MaxReconnectDelay: 300 * time.Second,
-		PingInterval:      30 * time.Second,
+		HeartbeatInterval: 30 * time.Second,
 		PongTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		ReadTimeout:       60 * time.Second,
@@ -37,23 +43,26 @@ func DefaultClientConfig() *ClientConfig {
 
 // Client represents a WebSocket client for communicating with the backend
 type Client struct {
-	config     *ClientConfig
-	conn       *websocket.Conn
-	connMutex  sync.RWMutex
-	logger     *slog.Logger
+	config    *ClientConfig
+	conn      *websocket.Conn
+	connMutex sync.RWMutex
+	logger    *slog.Logger
 
 	// Channels for communication
-	commandCh   chan *Message
-	responseCh  chan *Message
-	eventCh     chan *Message
+	commandCh  chan *Envelope
+	outboundCh chan *Envelope
 
 	// Control channels
-	reconnectCh chan struct{}
-	closeCh     chan struct{}
+	closeCh chan struct{}
 
 	// Connection state
 	connected   bool
 	connectedAt time.Time
+
+	// Called (in its own goroutine) after every successful (re)connect,
+	// used by the kubelet to register itself.
+	onConnect      func()
+	onConnectMutex sync.RWMutex
 
 	// Context for graceful shutdown
 	ctx    context.Context
@@ -67,30 +76,63 @@ type Client struct {
 func NewClient(config *ClientConfig, logger *slog.Logger) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	return &Client{
-		config:      config,
-		logger:      logger,
-		commandCh:   make(chan *Message, 100),
-		responseCh:  make(chan *Message, 100),
-		eventCh:     make(chan *Message, 100),
-		reconnectCh: make(chan struct{}, 1),
-		closeCh:     make(chan struct{}),
-		ctx:         ctx,
-		cancel:      cancel,
+	// Zero timeouts would make every write fail immediately, so fill unset
+	// fields from the defaults.
+	defaults := DefaultClientConfig()
+	if config.HeartbeatInterval <= 0 {
+		config.HeartbeatInterval = defaults.HeartbeatInterval
 	}
+	if config.ReconnectInterval <= 0 {
+		config.ReconnectInterval = defaults.ReconnectInterval
+	}
+	if config.MaxReconnectDelay <= 0 {
+		config.MaxReconnectDelay = defaults.MaxReconnectDelay
+	}
+	if config.PongTimeout <= 0 {
+		config.PongTimeout = defaults.PongTimeout
+	}
+	if config.WriteTimeout <= 0 {
+		config.WriteTimeout = defaults.WriteTimeout
+	}
+	if config.ReadTimeout <= 0 {
+		config.ReadTimeout = defaults.ReadTimeout
+	}
+	if config.KubeletID == "" {
+		config.KubeletID = config.APIToken
+	}
+
+	return &Client{
+		config:     config,
+		logger:     logger,
+		commandCh:  make(chan *Envelope, 100),
+		outboundCh: make(chan *Envelope, 200),
+		closeCh:    make(chan struct{}),
+		ctx:        ctx,
+		cancel:     cancel,
+	}
+}
+
+// SetOnConnect registers a callback invoked after each successful connect.
+func (c *Client) SetOnConnect(fn func()) {
+	c.onConnectMutex.Lock()
+	c.onConnect = fn
+	c.onConnectMutex.Unlock()
+}
+
+// KubeletID returns the id this client stamps on outgoing envelopes.
+func (c *Client) KubeletID() string {
+	return c.config.KubeletID
 }
 
 // Start begins the WebSocket connection and starts background goroutines
 func (c *Client) Start() error {
-	c.logger.Info("Starting WebSocket client", "url", c.config.URL)
+	c.logger.Info("Starting WebSocket client", "url", redactURL(c.config.URL))
 
-	// Start the connection manager
 	c.wg.Add(1)
 	go c.connectionManager()
 
-	// Start the ping routine
 	c.wg.Add(1)
-	go c.pingRoutine()
+	go c.heartbeatRoutine()
 
 	return nil
 }
@@ -102,34 +144,56 @@ func (c *Client) Stop() error {
 	c.cancel()
 	close(c.closeCh)
 
-	// Close connection if open
 	c.connMutex.Lock()
 	if c.conn != nil {
 		c.conn.Close()
 	}
 	c.connMutex.Unlock()
 
-	// Wait for all goroutines to finish
 	c.wg.Wait()
 
 	c.logger.Info("WebSocket client stopped")
 	return nil
 }
 
-// SendResponse sends a response message to the backend
+// SendResponse sends a command response to the backend
 func (c *Client) SendResponse(response *Response) error {
-	msg := NewMessage(response.CommandID, ResponseResult, response)
-	return c.sendMessage(msg)
+	env, err := NewEnvelope(EnvelopeResponse, response, c.config.KubeletID)
+	if err != nil {
+		return err
+	}
+	return c.sendEnvelope(env)
 }
 
-// SendEvent sends an event message to the backend
+// SendEvent sends an event to the backend
 func (c *Client) SendEvent(event *Event) error {
-	msg := NewMessage("", event.Type, event)
-	return c.sendMessage(msg)
+	env, err := NewEnvelope(EnvelopeEvent, event, c.config.KubeletID)
+	if err != nil {
+		return err
+	}
+	return c.sendEnvelope(env)
 }
 
-// Commands returns a channel for receiving command messages
-func (c *Client) Commands() <-chan *Message {
+// SendRegistration sends the kubelet registration to the backend
+func (c *Client) SendRegistration(reg *Registration) error {
+	env, err := NewEnvelope(EnvelopeRegistration, reg, c.config.KubeletID)
+	if err != nil {
+		return err
+	}
+	return c.sendEnvelope(env)
+}
+
+// SendHeartbeat sends a heartbeat to the backend
+func (c *Client) SendHeartbeat() error {
+	env, err := NewEnvelope(EnvelopeHeartbeat, NewHeartbeat(c.config.KubeletID), c.config.KubeletID)
+	if err != nil {
+		return err
+	}
+	return c.sendEnvelope(env)
+}
+
+// Commands returns a channel delivering "command" envelopes from the backend
+func (c *Client) Commands() <-chan *Envelope {
 	return c.commandCh
 }
 
@@ -163,35 +227,59 @@ func (c *Client) connectionManager() {
 			case <-c.ctx.Done():
 				return
 			case <-time.After(reconnectDelay):
-				// Exponential backoff with jitter
 				reconnectDelay = min(reconnectDelay*2, c.config.MaxReconnectDelay)
 			}
 			continue
 		}
 
-		// Reset reconnect delay on successful connection
 		reconnectDelay = c.config.ReconnectInterval
 
-		// Handle messages until connection fails
+		c.onConnectMutex.RLock()
+		onConnect := c.onConnect
+		c.onConnectMutex.RUnlock()
+		if onConnect != nil {
+			go onConnect()
+		}
+
 		c.messageLoop()
 
-		c.logger.Warn("Connection lost, attempting to reconnect")
+		select {
+		case <-c.ctx.Done():
+			return
+		default:
+			c.logger.Warn("Connection lost, attempting to reconnect")
+		}
 	}
 }
 
-// connect establishes a WebSocket connection to the backend
+// connect establishes a WebSocket connection to the backend.
+// The token is sent both as the api_key query parameter and as a bearer
+// header; the service accepts either.
 func (c *Client) connect() error {
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 30 * time.Second,
 	}
 
+	dialURL, err := buildDialURL(c.config.URL, c.config.APIToken)
+	if err != nil {
+		return err
+	}
+
 	headers := http.Header{}
 	headers.Add("Authorization", "Bearer "+c.config.APIToken)
 
-	conn, _, err := dialer.Dial(c.config.URL, headers)
+	conn, _, err := dialer.Dial(dialURL, headers)
 	if err != nil {
 		return fmt.Errorf("failed to dial WebSocket: %w", err)
 	}
+
+	readTimeout := c.config.ReadTimeout
+	conn.SetPongHandler(func(string) error {
+		if readTimeout > 0 {
+			return conn.SetReadDeadline(time.Now().Add(readTimeout))
+		}
+		return nil
+	})
 
 	c.connMutex.Lock()
 	c.conn = conn
@@ -202,6 +290,36 @@ func (c *Client) connect() error {
 	c.logger.Info("WebSocket connection established")
 
 	return nil
+}
+
+// buildDialURL appends the api_key query parameter unless one is present.
+func buildDialURL(rawURL, token string) (string, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid backend URL: %w", err)
+	}
+	q := u.Query()
+	if q.Get("api_key") == "" && q.Get("token") == "" {
+		q.Set("api_key", token)
+	}
+	u.RawQuery = q.Encode()
+	return u.String(), nil
+}
+
+// redactURL strips credentials from a URL for logging.
+func redactURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	q := u.Query()
+	for _, k := range []string{"api_key", "token"} {
+		if q.Get(k) != "" {
+			q.Set(k, "***")
+		}
+	}
+	u.RawQuery = q.Encode()
+	return u.Redacted()
 }
 
 // messageLoop handles incoming and outgoing messages
@@ -216,7 +334,6 @@ func (c *Client) messageLoop() {
 		c.connMutex.Unlock()
 	}()
 
-	// Start reader goroutine
 	readerDone := make(chan struct{})
 	c.wg.Add(1)
 	go func() {
@@ -225,7 +342,6 @@ func (c *Client) messageLoop() {
 		c.messageReader()
 	}()
 
-	// Handle outgoing messages and connection events
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -234,14 +350,9 @@ func (c *Client) messageLoop() {
 			return
 		case <-readerDone:
 			return
-		case msg := <-c.responseCh:
-			if err := c.writeMessage(msg); err != nil {
-				c.logger.Error("Failed to send response", "error", err)
-				return
-			}
-		case msg := <-c.eventCh:
-			if err := c.writeMessage(msg); err != nil {
-				c.logger.Error("Failed to send event", "error", err)
+		case env := <-c.outboundCh:
+			if err := c.writeEnvelope(env); err != nil {
+				c.logger.Error("Failed to send message", "type", env.Type, "error", err)
 				return
 			}
 		}
@@ -267,8 +378,9 @@ func (c *Client) messageReader() {
 		default:
 		}
 
-		// Set read deadline
-		conn.SetReadDeadline(time.Now().Add(c.config.ReadTimeout))
+		if c.config.ReadTimeout > 0 {
+			conn.SetReadDeadline(time.Now().Add(c.config.ReadTimeout))
+		}
 
 		_, data, err := conn.ReadMessage()
 		if err != nil {
@@ -278,62 +390,49 @@ func (c *Client) messageReader() {
 			return
 		}
 
-		msg, err := FromJSON(data)
+		env, err := ParseEnvelope(data)
 		if err != nil {
 			c.logger.Error("Failed to parse message", "error", err)
 			continue
 		}
 
-		c.handleIncomingMessage(msg)
+		c.handleIncomingMessage(env)
 	}
 }
 
-// handleIncomingMessage routes incoming messages to appropriate channels
-func (c *Client) handleIncomingMessage(msg *Message) {
-	switch msg.Type {
-	case CommandDeploy, CommandTerminate, CommandStatus:
+// handleIncomingMessage routes incoming envelopes to the appropriate channel
+func (c *Client) handleIncomingMessage(env *Envelope) {
+	switch env.Type {
+	case EnvelopeCommand:
+		c.logger.Debug("Received command", "id", env.ID)
 		select {
-		case c.commandCh <- msg:
+		case c.commandCh <- env:
 		default:
-			c.logger.Warn("Command channel full, dropping message", "type", msg.Type, "id", msg.ID)
+			c.logger.Warn("Command channel full, dropping command", "id", env.ID)
 		}
-	case CommandPing:
-		// Respond to ping immediately
-		pong := NewMessage(msg.ID, EventPong, nil)
-		if err := c.sendMessage(pong); err != nil {
-			c.logger.Error("Failed to send pong", "error", err)
-		}
+	case EnvelopeHeartbeat:
+		c.logger.Debug("Received heartbeat from backend")
 	default:
-		c.logger.Warn("Unknown message type received", "type", msg.Type)
+		c.logger.Warn("Unexpected message type received", "type", env.Type, "id", env.ID)
 	}
 }
 
-// sendMessage queues a message for sending
-func (c *Client) sendMessage(msg *Message) error {
+// sendEnvelope queues an envelope for sending
+func (c *Client) sendEnvelope(env *Envelope) error {
 	if !c.IsConnected() {
 		return fmt.Errorf("not connected")
 	}
 
-	switch msg.Type {
-	case ResponseResult, ResponseError:
-		select {
-		case c.responseCh <- msg:
-			return nil
-		default:
-			return fmt.Errorf("response channel full")
-		}
+	select {
+	case c.outboundCh <- env:
+		return nil
 	default:
-		select {
-		case c.eventCh <- msg:
-			return nil
-		default:
-			return fmt.Errorf("event channel full")
-		}
+		return fmt.Errorf("outbound channel full")
 	}
 }
 
-// writeMessage writes a message to the WebSocket connection
-func (c *Client) writeMessage(msg *Message) error {
+// writeEnvelope writes an envelope to the WebSocket connection
+func (c *Client) writeEnvelope(env *Envelope) error {
 	c.connMutex.RLock()
 	conn := c.conn
 	c.connMutex.RUnlock()
@@ -342,25 +441,35 @@ func (c *Client) writeMessage(msg *Message) error {
 		return fmt.Errorf("connection not available")
 	}
 
-	data, err := msg.ToJSON()
+	data, err := env.ToJSON()
 	if err != nil {
 		return fmt.Errorf("failed to serialize message: %w", err)
 	}
 
+	c.logger.Debug("Sending message", "type", env.Type, "id", env.ID, "bytes", len(data))
+
 	conn.SetWriteDeadline(time.Now().Add(c.config.WriteTimeout))
-	err = conn.WriteMessage(websocket.TextMessage, data)
-	if err != nil {
+	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
 		return fmt.Errorf("failed to write message: %w", err)
+	}
+
+	// Piggyback a protocol-level ping on each heartbeat so the read deadline
+	// is refreshed by the pong even when the backend has nothing to send.
+	if env.Type == EnvelopeHeartbeat {
+		deadline := time.Now().Add(c.config.WriteTimeout)
+		if err := conn.WriteControl(websocket.PingMessage, nil, deadline); err != nil {
+			c.logger.Debug("Failed to send ping frame", "error", err)
+		}
 	}
 
 	return nil
 }
 
-// pingRoutine sends periodic ping messages to keep the connection alive
-func (c *Client) pingRoutine() {
+// heartbeatRoutine sends a heartbeat envelope every HeartbeatInterval
+func (c *Client) heartbeatRoutine() {
 	defer c.wg.Done()
 
-	ticker := time.NewTicker(c.config.PingInterval)
+	ticker := time.NewTicker(c.config.HeartbeatInterval)
 	defer ticker.Stop()
 
 	for {
@@ -371,9 +480,8 @@ func (c *Client) pingRoutine() {
 			return
 		case <-ticker.C:
 			if c.IsConnected() {
-				ping := NewMessage("ping", CommandPing, nil)
-				if err := c.sendMessage(ping); err != nil {
-					c.logger.Error("Failed to send ping", "error", err)
+				if err := c.SendHeartbeat(); err != nil {
+					c.logger.Error("Failed to send heartbeat", "error", err)
 				}
 			}
 		}

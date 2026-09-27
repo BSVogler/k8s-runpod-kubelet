@@ -57,20 +57,20 @@ type GPUType struct {
 
 // DetailedStatus represents detailed pod status from RunPod
 type DetailedStatus struct {
-	ID                     string            `json:"id"`
-	Name                   string            `json:"name"`
-	DesiredStatus          string            `json:"desiredStatus"`
-	CurrentStatus          string            `json:"currentStatus,omitempty"`
-	CostPerHr              float64           `json:"costPerHr"`
-	Image                  string            `json:"image"`
-	Env                    map[string]string `json:"env"`
-	MachineID              string            `json:"machineId"`
-	PortMappings           map[string]int    `json:"portMappings"`
-	Runtime                *RuntimeInfo      `json:"runtime,omitempty"`
-	Machine                *MachineInfo      `json:"machine,omitempty"`
-	LastError              string            `json:"lastError,omitempty"`
-	ContainerRegistryAuthId string           `json:"containerRegistryAuthId,omitempty"`
-	TemplateId             string            `json:"templateId,omitempty"`
+	ID                      string            `json:"id"`
+	Name                    string            `json:"name"`
+	DesiredStatus           string            `json:"desiredStatus"`
+	CurrentStatus           string            `json:"currentStatus,omitempty"`
+	CostPerHr               float64           `json:"costPerHr"`
+	Image                   string            `json:"image"`
+	Env                     map[string]string `json:"env"`
+	MachineID               string            `json:"machineId"`
+	PortMappings            map[string]int    `json:"portMappings"`
+	Runtime                 *RuntimeInfo      `json:"runtime,omitempty"`
+	Machine                 *MachineInfo      `json:"machine,omitempty"`
+	LastError               string            `json:"lastError,omitempty"`
+	ContainerRegistryAuthId string            `json:"containerRegistryAuthId,omitempty"`
+	TemplateId              string            `json:"templateId,omitempty"`
 }
 
 // RuntimeInfo represents runtime information from RunPod
@@ -123,18 +123,52 @@ func (c *Client) Deploy(ctx context.Context, params *websocket.DeployParams) (*w
 	runpodParams := c.convertDeployParams(params)
 
 	// Deploy using REST API with the API key
-	podID, costPerHour, err := c.deployPodRESTWithKey(runpodParams, apiKey)
+	created, err := c.deployPodRESTWithKey(runpodParams, apiKey)
 	if err != nil {
 		return nil, providers.NewProviderError("runpod", "deployment_failed", err.Error(), true)
 	}
 
+	status := created.DesiredStatus
+	if status == "" {
+		status = string(PodStarting)
+	}
+
 	result := &websocket.DeployResult{
-		ProviderPodID: podID,
-		CostPerHour:   costPerHour,
-		Status:        string(PodStarting),
+		ProviderPodID: created.ID,
+		Provider:      c.GetName(),
+		Status:        providers.GetStandardStatus(status, "runpod"),
+		CostPerHour:   created.CostPerHr,
+		MachineID:     created.MachineID,
+		Ports:         proxyPortURLs(created.ID, params.Ports),
+	}
+	if created.Machine != nil {
+		result.GPUType = created.Machine.GPUTypeID
+		result.DatacenterID = created.Machine.DataCenterID
 	}
 
 	return result, nil
+}
+
+// proxyPortURLs builds the external URL map for HTTP ports exposed through the
+// RunPod proxy (https://{podId}-{port}.proxy.runpod.net). TCP ports are only
+// reachable once the pod reports its public IP and are left out.
+func proxyPortURLs(podID string, ports []string) map[string]string {
+	if podID == "" || len(ports) == 0 {
+		return nil
+	}
+	urls := make(map[string]string)
+	for _, spec := range ports {
+		port, proto, _ := strings.Cut(spec, "/")
+		port = strings.TrimSpace(port)
+		if port == "" || !strings.EqualFold(strings.TrimSpace(proto), "http") {
+			continue
+		}
+		urls[port] = fmt.Sprintf("https://%s-%s.proxy.runpod.net", podID, port)
+	}
+	if len(urls) == 0 {
+		return nil
+	}
+	return urls
 }
 
 // GetStatus retrieves the current status of a RunPod instance
@@ -153,20 +187,26 @@ func (c *Client) GetStatus(ctx context.Context, params *websocket.StatusParams) 
 
 	if status == nil {
 		return &websocket.StatusResult{
-			Status:       string(PodNotFound),
-			IsRunning:    false,
-			IsTerminated: true,
-			IsSuccessful: false,
-			LastUpdated:  time.Now(),
+			ProviderPodID: params.ProviderPodID,
+			Provider:      c.GetName(),
+			Status:        string(PodNotFound),
+			Phase:         providers.PhaseFailed,
+			IsRunning:     false,
+			IsTerminated:  true,
+			Message:       "pod not found on RunPod",
 		}, nil
 	}
 
+	standardStatus := providers.GetStandardStatus(status.DesiredStatus, "runpod")
+	successful := c.isSuccessfulCompletion(status)
+
 	result := &websocket.StatusResult{
-		Status:       providers.GetStandardStatus(status.DesiredStatus, "runpod"),
-		LastUpdated:  time.Now(),
-		IsRunning:    status.DesiredStatus == string(PodRunning),
-		IsTerminated: status.DesiredStatus == string(PodTerminated) || status.DesiredStatus == string(PodExited),
-		IsSuccessful: c.isSuccessfulCompletion(status),
+		ProviderPodID: params.ProviderPodID,
+		Provider:      c.GetName(),
+		Status:        standardStatus,
+		Phase:         providers.PhaseForStatus(standardStatus, successful),
+		IsRunning:     status.DesiredStatus == string(PodRunning),
+		IsTerminated:  status.DesiredStatus == string(PodTerminated) || status.DesiredStatus == string(PodExited),
 	}
 
 	if status.Runtime != nil {
@@ -263,7 +303,34 @@ func (c *Client) convertDeployParams(params *websocket.DeployParams) map[string]
 		runpodParams["minRAMPerGPU"] = params.MinRAMPerGPU
 	}
 
+	applyContainerSpec(runpodParams, params)
+
 	return runpodParams
+}
+
+// applyContainerSpec maps command, args and GPU count onto RunPod REST parameters.
+// K8s command overrides the image ENTRYPOINT and args override CMD, matching RunPod's
+// dockerEntrypoint and dockerStartCmd. Unset fields keep the image defaults; a GPU
+// count of 0 is omitted so RunPod applies its default of one.
+func applyContainerSpec(runpodParams map[string]interface{}, params *websocket.DeployParams) {
+	if len(params.Command) > 0 {
+		runpodParams["dockerEntrypoint"] = params.Command
+	}
+	if len(params.Args) > 0 {
+		runpodParams["dockerStartCmd"] = params.Args
+	}
+	if params.GPUCount > 0 {
+		runpodParams["gpuCount"] = params.GPUCount
+	}
+}
+
+// createPodResponse is the subset of the RunPod REST create-pod response we use.
+type createPodResponse struct {
+	ID            string       `json:"id"`
+	CostPerHr     float64      `json:"costPerHr"`
+	DesiredStatus string       `json:"desiredStatus"`
+	MachineID     string       `json:"machineId"`
+	Machine       *MachineInfo `json:"machine,omitempty"`
 }
 
 func (c *Client) executeGraphQL(query string, variables map[string]interface{}, response interface{}) error {
@@ -359,45 +426,41 @@ func (c *Client) getGPUTypes(minRAMPerGPU int, maxPrice float64, cloudType strin
 	return filteredGPUs, nil
 }
 
-func (c *Client) deployPodREST(params map[string]interface{}) (string, float64, error) {
+func (c *Client) deployPodREST(params map[string]interface{}) (*createPodResponse, error) {
 	return c.deployPodRESTWithKey(params, c.apiKey)
 }
 
-func (c *Client) deployPodRESTWithKey(params map[string]interface{}, apiKey string) (string, float64, error) {
+func (c *Client) deployPodRESTWithKey(params map[string]interface{}, apiKey string) (*createPodResponse, error) {
 	reqBody, err := json.Marshal(params)
 	if err != nil {
-		return "", 0, fmt.Errorf("failed to marshal request: %w", err)
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
 	resp, err := c.makeRESTRequestWithKey("POST", "pods", bytes.NewBuffer(reqBody), apiKey)
 	if err != nil {
-		return "", 0, fmt.Errorf("API request failed: %w", err)
+		return nil, fmt.Errorf("API request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", 0, fmt.Errorf("failed to read response body: %w", err)
+		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
 	if resp.StatusCode >= 400 {
-		return "", 0, fmt.Errorf("API returned error: %d %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("API returned error: %d %s", resp.StatusCode, string(body))
 	}
 
-	var response struct {
-		ID        string  `json:"id"`
-		CostPerHr float64 `json:"costPerHr"`
-	}
-
+	var response createPodResponse
 	if err := json.Unmarshal(body, &response); err != nil {
-		return "", 0, fmt.Errorf("failed to parse response: %w", err)
+		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
 	if response.ID == "" {
-		return "", 0, fmt.Errorf("pod deployment failed: %s", string(body))
+		return nil, fmt.Errorf("pod deployment failed: %s", string(body))
 	}
 
-	return response.ID, response.CostPerHr, nil
+	return &response, nil
 }
 
 func (c *Client) getDetailedPodStatus(podID string) (*DetailedStatus, error) {
@@ -439,16 +502,28 @@ func (c *Client) terminatePod(podID string) error {
 	return c.terminatePodWithKey(podID, c.apiKey)
 }
 
+// terminatePodWithKey deletes the pod. DELETE is used instead of /stop because a
+// stopped pod stays in the account and keeps billing for its disk.
 func (c *Client) terminatePodWithKey(podID string, apiKey string) error {
-	endpoint := fmt.Sprintf("pods/%s/stop", podID)
+	if strings.TrimSpace(podID) == "" {
+		return fmt.Errorf("invalid pod ID: %q", podID)
+	}
 
-	resp, err := c.makeRESTRequestWithKey("POST", endpoint, nil, apiKey)
+	endpoint := fmt.Sprintf("pods/%s", podID)
+
+	resp, err := c.makeRESTRequestWithKey("DELETE", endpoint, nil, apiKey)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	// Already gone counts as terminated
+	if resp.StatusCode == http.StatusNotFound {
+		c.logger.Info("RunPod instance already deleted", "provider_pod_id", podID)
+		return nil
+	}
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("failed to terminate pod, status: %d, response: %s", resp.StatusCode, string(body))
 	}

@@ -36,6 +36,7 @@ var (
 	kubeconfig        string
 	configPath        string
 	nodeName          string
+	clusterName       string
 	operatingSystem   string
 	internalIP        string
 	listenPort        int
@@ -52,6 +53,7 @@ func init() {
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig file")
 	flag.StringVar(&configPath, "config", "", "Path to configuration file")
 	flag.StringVar(&nodeName, "nodename", "virtual-proxy", "Kubernetes node name")
+	flag.StringVar(&clusterName, "cluster-name", "", "Cluster name reported to the platform (env: CLUSTER_NAME, default: \"default\")")
 	flag.StringVar(&operatingSystem, "operating-system", "Linux", "Operating system (Linux, Windows)")
 	flag.StringVar(&internalIP, "internal-ip", "127.0.0.1", "Internal IP address")
 	flag.IntVar(&listenPort, "listen-port", 10250, "Port to listen on")
@@ -97,6 +99,8 @@ func main() {
 
 	logger.Info("Starting proxy kubelet",
 		"node_name", cfg.NodeName,
+		"cluster_name", cfg.ClusterName,
+		"key_mode", cfg.KeyMode(),
 		"backend_url", cfg.BackendURL,
 		"enabled_providers", cfg.Providers.EnabledProviders)
 
@@ -228,6 +232,9 @@ func loadConfiguration(logger *slog.Logger) *config.Config {
 func overrideConfiguration(cfg *config.Config) {
 	if nodeName != "" {
 		cfg.NodeName = nodeName
+	}
+	if clusterName != "" {
+		cfg.ClusterName = clusterName
 	}
 	if operatingSystem != "" {
 		cfg.OperatingSystem = operatingSystem

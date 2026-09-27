@@ -169,6 +169,10 @@ kubectl create secret generic conduit-kubelet-auth \
 
 Get your API key from: [conduit.example.com/settings/api-keys](https://conduit.example.com/settings/api-keys)
 
+Optionally name the cluster as it should appear in the Conduit dashboard with
+`--cluster-name` (or the `CLUSTER_NAME` environment variable; default `default`).
+The node name is set with `--nodename` / `NODE_NAME`.
+
 ### Optional: Local Provider Keys
 
 For self-hosted deployments or hybrid scenarios, you can store provider API keys locally:
@@ -314,10 +318,15 @@ kubectl exec -n kube-system deployment/conduit-kubelet -- \
   curl -I https://api.conduit.example.com/health
 ```
 
-### Pod Stuck in Pending
+### Pod Failed or Stuck in Pending
+
+If the platform rejects a pod (quota exceeded, no provider key, unsupported
+provider, conversion or provider error) the pod is marked `Failed`; the reason
+code and message are shown by `kubectl describe pod`. A pod that stays
+`Pending` has not been answered by the platform yet.
 
 ```bash
-# Check for rejection events
+# Check the rejection reason and message
 kubectl describe pod <pod-name>
 
 # View kubelet logs

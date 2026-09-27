@@ -39,17 +39,13 @@ type Provider struct {
 	providerManager *providers.Manager
 
 	// Pod tracking
-	pods        map[string]*v1.Pod               // Map of podKey -> Pod
-	podStatus   map[string]*PodInstanceInfo     // Map of podKey -> Instance info
-	podsMutex   sync.RWMutex                    // Mutex for thread-safe access
+	pods      map[string]*v1.Pod          // Map of podKey -> Pod
+	podStatus map[string]*PodInstanceInfo // Map of podKey -> Instance info
+	podsMutex sync.RWMutex                // Mutex for thread-safe access
 
 	// Notification callback for pod status changes
 	notifyFunc  func(*v1.Pod)
 	notifyMutex sync.RWMutex
-
-	// Backend registration
-	registeredWithBackend bool
-	registrationMutex     sync.Mutex
 
 	// Context and cancellation
 	ctx    context.Context
@@ -58,16 +54,20 @@ type Provider struct {
 
 // PodInstanceInfo stores information about a deployed pod instance
 type PodInstanceInfo struct {
-	PodID           string                     // Kubernetes pod ID
-	ProviderPodID   string                     // Provider-specific pod ID
-	Provider        string                     // Provider name (runpod, vastai, etc.)
-	Status          string                     // Current status
-	CostPerHour     float64                   // Cost per hour
-	MachineID       string                    // Machine/instance ID
-	Location        string                    // Datacenter location
-	CreationTime    time.Time                 // When the instance was created
-	LastStatusCheck time.Time                 // Last time status was checked
-	StatusResult    *websocket.StatusResult   // Last status result from provider
+	PodID           string                  // Kubernetes pod UID
+	ProviderPodID   string                  // Provider-specific pod ID
+	Provider        string                  // Provider name (runpod, vastai, etc.)
+	Status          string                  // Current status
+	CostPerHour     float64                 // Cost per hour
+	MachineID       string                  // Machine/instance ID
+	Location        string                  // Datacenter location
+	CreationTime    time.Time               // When the instance was created
+	LastStatusCheck time.Time               // Last time status was checked
+	StatusResult    *websocket.StatusResult // Last status result from provider
+
+	// Set when the platform rejected the pod; the pod is reported as Failed.
+	RejectCode    string
+	RejectMessage string
 }
 
 // NewProvider creates a new proxy virtual kubelet provider
@@ -88,13 +88,15 @@ func NewProvider(ctx context.Context, nodeName, operatingSystem, internalIP stri
 	// Create command handler
 	commandHandler := command.NewHandler(providerManager, logger)
 
-	// Create WebSocket client configuration
+	// Create WebSocket client configuration.
+	// The platform identifies a kubelet by its API token, so that is the kubelet id.
 	wsConfig := &websocket.ClientConfig{
 		URL:               cfg.GetWebSocketURL(),
 		APIToken:          cfg.BackendAPIKey,
+		KubeletID:         cfg.BackendAPIKey,
 		ReconnectInterval: cfg.WebSocket.ReconnectInterval,
 		MaxReconnectDelay: cfg.WebSocket.MaxReconnectDelay,
-		PingInterval:      cfg.WebSocket.PingInterval,
+		HeartbeatInterval: cfg.WebSocket.PingInterval,
 		PongTimeout:       cfg.WebSocket.PongTimeout,
 		WriteTimeout:      cfg.WebSocket.WriteTimeout,
 		ReadTimeout:       cfg.WebSocket.ReadTimeout,
@@ -120,6 +122,12 @@ func NewProvider(ctx context.Context, nodeName, operatingSystem, internalIP stri
 		cancel:             cancel,
 	}
 
+	// Platform rejections are applied to the Kubernetes pod
+	commandHandler.SetRejectHandler(provider.handleReject)
+
+	// Register with the backend after every (re)connect
+	wsClient.SetOnConnect(provider.registerWithBackend)
+
 	// Start WebSocket client
 	if err := wsClient.Start(); err != nil {
 		cancel()
@@ -128,9 +136,6 @@ func NewProvider(ctx context.Context, nodeName, operatingSystem, internalIP stri
 
 	// Start command processing goroutine
 	go provider.processCommands()
-
-	// Register with backend
-	go provider.registerWithBackend()
 
 	return provider, nil
 }
@@ -153,13 +158,18 @@ func (p *Provider) CreatePod(ctx context.Context, pod *v1.Pod) error {
 	}
 	p.podsMutex.Unlock()
 
-	// Send pod creation event to backend
+	// Send pod creation event to backend. Objects from the informer carry no
+	// TypeMeta, so restore it for the platform's manifest parser.
+	podSpec := pod.DeepCopy()
+	podSpec.APIVersion = "v1"
+	podSpec.Kind = "Pod"
 	event := &websocket.Event{
-		Type:      websocket.EventPodCreated,
-		PodID:     podKey,
-		Namespace: pod.Namespace,
+		Type: websocket.EventPodCreated,
 		Data: &websocket.PodCreatedEvent{
-			PodSpec:     pod,
+			PodName:     pod.Name,
+			Namespace:   pod.Namespace,
+			UID:         string(pod.UID),
+			PodSpec:     podSpec,
 			Annotations: pod.Annotations,
 		},
 	}
@@ -171,7 +181,7 @@ func (p *Provider) CreatePod(ctx context.Context, pod *v1.Pod) error {
 	}
 
 	// Update pod status to pending
-	p.updatePodStatus(pod, v1.PodPending, "Pod creation event sent to backend")
+	p.updatePodStatus(pod, v1.PodPending, "", "Pod creation event sent to backend")
 
 	return nil
 }
@@ -197,24 +207,28 @@ func (p *Provider) DeletePod(ctx context.Context, pod *v1.Pod) error {
 
 	p.podsMutex.RLock()
 	instanceInfo, exists := p.podStatus[podKey]
+	providerPodID := ""
+	if exists {
+		providerPodID = instanceInfo.ProviderPodID
+	}
 	p.podsMutex.RUnlock()
 
-	if exists && instanceInfo.ProviderPodID != "" {
-		// Send termination command request to backend
-		// The backend will decide and send us a terminate command
-		event := &websocket.Event{
-			Type:      websocket.EventPodDeleted,
-			PodID:     podKey,
-			Namespace: pod.Namespace,
-			Data: &websocket.PodDeletedEvent{
-				ProviderPodID: instanceInfo.ProviderPodID,
-				Reason:        "Pod deleted by Kubernetes",
-			},
-		}
+	// Notify the backend; it decides whether to send a terminate command.
+	// The event is sent even without a provider pod id so the platform can
+	// close its record by pod name.
+	event := &websocket.Event{
+		Type: websocket.EventPodDeleted,
+		Data: &websocket.PodDeletedEvent{
+			PodName:       pod.Name,
+			Namespace:     pod.Namespace,
+			UID:           string(pod.UID),
+			ProviderPodID: providerPodID,
+			Reason:        "Pod deleted by Kubernetes",
+		},
+	}
 
-		if err := p.wsClient.SendEvent(event); err != nil {
-			p.logger.Error("Failed to send pod deletion event", "error", err, "pod", pod.Name)
-		}
+	if err := p.wsClient.SendEvent(event); err != nil {
+		p.logger.Error("Failed to send pod deletion event", "error", err, "pod", pod.Name)
 	}
 
 	// Remove from local cache
@@ -265,23 +279,26 @@ func (p *Provider) GetPodStatus(ctx context.Context, namespace, name string) (*v
 		},
 	}
 
+	if infoExists && instanceInfo.RejectCode != "" {
+		status.Phase = v1.PodFailed
+		status.Reason = instanceInfo.RejectCode
+		status.Message = instanceInfo.RejectMessage
+		return status, nil
+	}
+
 	if infoExists && instanceInfo.StatusResult != nil {
 		// Convert provider status to Kubernetes pod status
-		switch instanceInfo.StatusResult.Status {
-		case "RUNNING":
+		switch instanceInfo.StatusResult.Phase {
+		case providers.PhaseRunning:
 			status.Phase = v1.PodRunning
 			status.Conditions = append(status.Conditions, v1.PodCondition{
 				Type:               v1.PodReady,
 				Status:             v1.ConditionTrue,
 				LastTransitionTime: metav1.Now(),
 			})
-		case "TERMINATED", "EXITED":
-			if instanceInfo.StatusResult.IsSuccessful {
-				status.Phase = v1.PodSucceeded
-			} else {
-				status.Phase = v1.PodFailed
-			}
-		case "FAILED":
+		case providers.PhaseSucceeded:
+			status.Phase = v1.PodSucceeded
+		case providers.PhaseFailed:
 			status.Phase = v1.PodFailed
 		}
 
@@ -458,85 +475,120 @@ func (p *Provider) processCommands() {
 		select {
 		case <-p.ctx.Done():
 			return
-		case msg := <-p.wsClient.Commands():
-			response := p.commandHandler.ExecuteCommand(p.ctx, msg)
+		case env := <-p.wsClient.Commands():
+			response := p.commandHandler.ExecuteCommand(p.ctx, env)
 
-			// Handle deploy command success - update pod status
-			if msg.Type == websocket.CommandDeploy && response.Success {
-				if cmd, err := msg.ParseCommand(); err == nil {
-					if result, ok := response.Result.(*websocket.DeployResult); ok {
-						p.handleDeploymentSuccess(cmd.PodID, cmd.Provider, result)
+			// Handle deploy command success - update pod bookkeeping
+			if response.Success() {
+				if result, ok := response.Data.(*websocket.DeployResult); ok {
+					var cmd websocket.Command
+					var params websocket.DeployParams
+					if err := env.DecodePayload(&cmd); err == nil && cmd.Type == websocket.CommandDeploy {
+						if err := cmd.DecodeData(&params); err == nil {
+							p.handleDeploymentSuccess(&params, result)
+						}
 					}
 				}
 			}
 
 			// Send response back to backend
 			if err := p.wsClient.SendResponse(response); err != nil {
-				p.logger.Error("Failed to send command response", "error", err)
+				p.logger.Error("Failed to send command response", "error", err, "command_id", env.ID)
 			}
 		}
 	}
 }
 
-func (p *Provider) handleDeploymentSuccess(podID string, provider websocket.ProviderType, result *websocket.DeployResult) {
+func (p *Provider) handleDeploymentSuccess(params *websocket.DeployParams, result *websocket.DeployResult) {
+	podKey := websocket.PodKey(params.Namespace, params.PodName)
+
 	p.podsMutex.Lock()
-	if instanceInfo, exists := p.podStatus[podID]; exists {
+	if instanceInfo, exists := p.podStatus[podKey]; exists {
 		instanceInfo.ProviderPodID = result.ProviderPodID
-		instanceInfo.Provider = string(provider)
+		instanceInfo.Provider = result.Provider
+		if instanceInfo.Provider == "" {
+			instanceInfo.Provider = params.Provider
+		}
 		instanceInfo.Status = result.Status
 		instanceInfo.CostPerHour = result.CostPerHour
 		instanceInfo.MachineID = result.MachineID
-		instanceInfo.Location = result.Location
+		instanceInfo.Location = result.DatacenterID
 		instanceInfo.LastStatusCheck = time.Now()
+	} else {
+		p.logger.Warn("Deploy result for unknown pod", "pod", podKey, "provider_pod_id", result.ProviderPodID)
 	}
+	pod, podExists := p.pods[podKey]
 	p.podsMutex.Unlock()
 
 	// Update Kubernetes pod status
-	if pod, exists := p.pods[podID]; exists {
-		p.updatePodStatus(pod, v1.PodPending, "Instance deployed, waiting for startup")
+	if podExists {
+		p.updatePodStatus(pod, v1.PodPending, "", "Instance deployed, waiting for startup")
 	}
 }
 
+// handleReject applies a platform rejection: the pod is marked Failed with
+// reason=code and the platform's message.
+func (p *Provider) handleReject(_ context.Context, params *websocket.RejectParams) error {
+	podKey := websocket.PodKey(params.Namespace, params.PodName)
+
+	p.podsMutex.Lock()
+	pod, podExists := p.pods[podKey]
+	if info, exists := p.podStatus[podKey]; exists {
+		info.RejectCode = params.Code
+		info.RejectMessage = params.Message
+		info.Status = "REJECTED"
+	}
+	p.podsMutex.Unlock()
+
+	if !podExists {
+		return fmt.Errorf("pod %s not found", podKey)
+	}
+
+	p.updatePodStatus(pod, v1.PodFailed, params.Code, params.Message)
+	return nil
+}
+
+// registerWithBackend sends the kubelet registration and the ready event.
+// It runs after every successful connect.
 func (p *Provider) registerWithBackend() {
-	p.registrationMutex.Lock()
-	defer p.registrationMutex.Unlock()
-
-	if p.registeredWithBackend {
-		return
-	}
-
-	// Wait for WebSocket connection
-	for !p.wsClient.IsConnected() {
-		select {
-		case <-p.ctx.Done():
-			return
-		case <-time.After(5 * time.Second):
-		}
-	}
-
-	// Send registration event
-	event := &websocket.Event{
-		Type: "kubelet_registration",
-		Data: map[string]interface{}{
-			"node_name":     p.nodeName,
-			"cluster_name":  "proxy-cluster", // TODO: make configurable
-			"capabilities":  p.commandHandler.GetAvailableProviders(),
-			"version":       "1.0.0",
-			"internal_ip":   p.internalIP,
-			"listen_port":   p.daemonEndpointPort,
+	reg := &websocket.Registration{
+		ID:           p.wsClient.KubeletID(),
+		Type:         websocket.KubeletType,
+		ClusterName:  p.config.ClusterName,
+		NodeName:     p.nodeName,
+		Namespace:    p.config.Namespace,
+		Capabilities: p.commandHandler.GetAvailableProviders(),
+		Metadata: websocket.RegistrationMetadata{
+			Version:    websocket.ProtocolVersion,
+			InternalIP: p.internalIP,
+			KeyMode:    p.config.KeyMode(),
 		},
 	}
+	if reg.Capabilities == nil {
+		reg.Capabilities = []string{}
+	}
 
-	if err := p.wsClient.SendEvent(event); err != nil {
+	if err := p.wsClient.SendRegistration(reg); err != nil {
 		p.logger.Error("Failed to register with backend", "error", err)
 		return
 	}
 
-	p.registeredWithBackend = true
-	p.logger.Info("Successfully registered with backend")
+	p.logger.Info("Registered with backend",
+		"cluster_name", reg.ClusterName,
+		"node_name", reg.NodeName,
+		"capabilities", reg.Capabilities,
+		"key_mode", reg.Metadata.KeyMode)
+
+	ready := &websocket.Event{
+		Type: websocket.EventKubeletReady,
+		Data: &websocket.KubeletReadyEvent{NodeName: p.nodeName},
+	}
+	if err := p.wsClient.SendEvent(ready); err != nil {
+		p.logger.Error("Failed to send kubelet_ready event", "error", err)
+	}
 }
 
-func (p *Provider) updatePodStatus(pod *v1.Pod, phase v1.PodPhase, message string) {
+func (p *Provider) updatePodStatus(pod *v1.Pod, phase v1.PodPhase, reason, message string) {
 	p.notifyMutex.RLock()
 	notifyFunc := p.notifyFunc
 	p.notifyMutex.RUnlock()
@@ -544,6 +596,7 @@ func (p *Provider) updatePodStatus(pod *v1.Pod, phase v1.PodPhase, message strin
 	if notifyFunc != nil {
 		// Update pod status
 		pod.Status.Phase = phase
+		pod.Status.Reason = reason
 		pod.Status.Message = message
 
 		// Notify the kubelet controller

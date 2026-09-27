@@ -2,7 +2,7 @@ package command
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -11,10 +11,26 @@ import (
 	"github.com/bsvogler/conduit-kubelet/pkg/websocket"
 )
 
+// Error codes used in error responses.
+const (
+	ErrCodeInvalidCommand    = "invalid_command"
+	ErrCodeInvalidParams     = "invalid_params"
+	ErrCodeUnknownCommand    = "unknown_command"
+	ErrCodeDeploymentFailed  = "deployment_failed"
+	ErrCodeTerminationFailed = "termination_failed"
+	ErrCodeStatusFailed      = "status_failed"
+	ErrCodeRejectFailed      = "reject_failed"
+)
+
+// RejectFunc is invoked when the platform rejects a pod. The kubelet marks
+// the Kubernetes pod as Failed with reason=code and the given message.
+type RejectFunc func(ctx context.Context, params *websocket.RejectParams) error
+
 // Handler processes WebSocket commands from the backend
 type Handler struct {
 	providerManager *providers.Manager
 	logger          *slog.Logger
+	rejectFunc      RejectFunc
 }
 
 // NewHandler creates a new command handler
@@ -25,272 +41,202 @@ func NewHandler(providerManager *providers.Manager, logger *slog.Logger) *Handle
 	}
 }
 
-// HandleCommand processes a command message and returns a response
-func (h *Handler) HandleCommand(ctx context.Context, msg *websocket.Message) *websocket.Response {
-	h.logger.Debug("Processing command", "type", msg.Type, "id", msg.ID)
+// SetRejectHandler registers the callback for "reject" commands.
+func (h *Handler) SetRejectHandler(fn RejectFunc) {
+	h.rejectFunc = fn
+}
 
-	cmd, err := msg.ParseCommand()
-	if err != nil {
-		h.logger.Error("Failed to parse command", "error", err, "message_id", msg.ID)
-		return &websocket.Response{
-			CommandID: msg.ID,
-			Success:   false,
-			Error:     fmt.Sprintf("Failed to parse command: %v", err),
-		}
+// HandleCommand decodes a "command" envelope and returns the response.
+func (h *Handler) HandleCommand(ctx context.Context, env *websocket.Envelope) *websocket.Response {
+	var cmd websocket.Command
+	if err := env.DecodePayload(&cmd); err != nil {
+		h.logger.Error("Failed to parse command", "error", err, "command_id", env.ID)
+		return websocket.NewErrorResponse(env.ID, ErrCodeInvalidCommand,
+			fmt.Sprintf("failed to parse command: %v", err), "")
 	}
 
-	switch msg.Type {
+	return h.Handle(ctx, env.ID, &cmd)
+}
+
+// Handle dispatches an already decoded command.
+func (h *Handler) Handle(ctx context.Context, commandID string, cmd *websocket.Command) *websocket.Response {
+	h.logger.Debug("Processing command", "type", cmd.Type, "command_id", commandID)
+
+	switch cmd.Type {
 	case websocket.CommandDeploy:
-		return h.handleDeploy(ctx, cmd)
+		return h.handleDeploy(ctx, commandID, cmd)
 	case websocket.CommandTerminate:
-		return h.handleTerminate(ctx, cmd)
+		return h.handleTerminate(ctx, commandID, cmd)
 	case websocket.CommandStatus:
-		return h.handleStatus(ctx, cmd)
+		return h.handleStatus(ctx, commandID, cmd)
 	case websocket.CommandPing:
-		return h.handlePing(ctx, cmd)
+		return h.handlePing(ctx, commandID)
+	case websocket.CommandReject:
+		return h.handleReject(ctx, commandID, cmd)
 	default:
-		h.logger.Warn("Unknown command type", "type", msg.Type, "id", msg.ID)
-		return &websocket.Response{
-			CommandID: cmd.ID,
-			Success:   false,
-			Error:     fmt.Sprintf("Unknown command type: %s", msg.Type),
-		}
+		h.logger.Warn("Unknown command type", "type", cmd.Type, "command_id", commandID)
+		return websocket.NewErrorResponse(commandID, ErrCodeUnknownCommand,
+			fmt.Sprintf("unknown command type: %s", cmd.Type), "")
 	}
 }
 
 // handleDeploy processes a deploy command
-func (h *Handler) handleDeploy(ctx context.Context, cmd *websocket.Command) *websocket.Response {
-	h.logger.Info("Handling deploy command",
-		"command_id", cmd.ID,
-		"provider", cmd.Provider,
-		"pod_id", cmd.PodID)
-
-	// Parse deploy parameters
-	params, err := h.parseDeployParams(cmd.Params)
-	if err != nil {
-		h.logger.Error("Failed to parse deploy parameters",
-			"command_id", cmd.ID,
-			"error", err)
-		return &websocket.Response{
-			CommandID: cmd.ID,
-			Success:   false,
-			Error:     fmt.Sprintf("Failed to parse deploy parameters: %v", err),
-		}
+func (h *Handler) handleDeploy(ctx context.Context, commandID string, cmd *websocket.Command) *websocket.Response {
+	var params websocket.DeployParams
+	if err := cmd.DecodeData(&params); err != nil {
+		h.logger.Error("Failed to parse deploy parameters", "command_id", commandID, "error", err)
+		return websocket.NewErrorResponse(commandID, ErrCodeInvalidParams,
+			fmt.Sprintf("failed to parse deploy parameters: %v", err), "")
 	}
 
-	// Execute deployment
-	result, err := h.providerManager.Deploy(ctx, string(cmd.Provider), params)
+	h.logger.Info("Handling deploy command",
+		"command_id", commandID,
+		"provider", params.Provider,
+		"pod", websocket.PodKey(params.Namespace, params.PodName),
+		"image", params.Image)
+
+	result, err := h.providerManager.Deploy(ctx, params.Provider, &params)
 	if err != nil {
 		h.logger.Error("Deployment failed",
-			"command_id", cmd.ID,
-			"provider", cmd.Provider,
-			"pod_id", cmd.PodID,
+			"command_id", commandID,
+			"provider", params.Provider,
+			"pod", websocket.PodKey(params.Namespace, params.PodName),
 			"error", err)
-		return &websocket.Response{
-			CommandID: cmd.ID,
-			Success:   false,
-			Error:     err.Error(),
-		}
+		return errorResponse(commandID, ErrCodeDeploymentFailed, err)
+	}
+
+	if result.Provider == "" {
+		result.Provider = params.Provider
 	}
 
 	h.logger.Info("Deployment successful",
-		"command_id", cmd.ID,
-		"provider", cmd.Provider,
-		"pod_id", cmd.PodID,
+		"command_id", commandID,
+		"provider", params.Provider,
+		"pod", websocket.PodKey(params.Namespace, params.PodName),
 		"provider_pod_id", result.ProviderPodID,
 		"cost_per_hour", result.CostPerHour)
 
-	return &websocket.Response{
-		CommandID: cmd.ID,
-		Success:   true,
-		Result:    result,
-	}
+	return websocket.NewSuccessResponse(commandID, result)
 }
 
 // handleTerminate processes a terminate command
-func (h *Handler) handleTerminate(ctx context.Context, cmd *websocket.Command) *websocket.Response {
-	h.logger.Info("Handling terminate command",
-		"command_id", cmd.ID,
-		"provider", cmd.Provider,
-		"pod_id", cmd.PodID)
-
-	// Parse terminate parameters
-	params, err := h.parseTerminateParams(cmd.Params)
-	if err != nil {
-		h.logger.Error("Failed to parse terminate parameters",
-			"command_id", cmd.ID,
-			"error", err)
-		return &websocket.Response{
-			CommandID: cmd.ID,
-			Success:   false,
-			Error:     fmt.Sprintf("Failed to parse terminate parameters: %v", err),
-		}
+func (h *Handler) handleTerminate(ctx context.Context, commandID string, cmd *websocket.Command) *websocket.Response {
+	var params websocket.TerminateParams
+	if err := cmd.DecodeData(&params); err != nil {
+		h.logger.Error("Failed to parse terminate parameters", "command_id", commandID, "error", err)
+		return websocket.NewErrorResponse(commandID, ErrCodeInvalidParams,
+			fmt.Sprintf("failed to parse terminate parameters: %v", err), "")
 	}
 
-	// Execute termination
-	err = h.providerManager.Terminate(ctx, string(cmd.Provider), params)
-	if err != nil {
+	h.logger.Info("Handling terminate command",
+		"command_id", commandID,
+		"provider", params.Provider,
+		"pod", websocket.PodKey(params.Namespace, params.PodName),
+		"provider_pod_id", params.ProviderPodID)
+
+	if err := h.providerManager.Terminate(ctx, params.Provider, &params); err != nil {
 		h.logger.Error("Termination failed",
-			"command_id", cmd.ID,
-			"provider", cmd.Provider,
-			"pod_id", cmd.PodID,
+			"command_id", commandID,
+			"provider", params.Provider,
 			"provider_pod_id", params.ProviderPodID,
 			"error", err)
-		return &websocket.Response{
-			CommandID: cmd.ID,
-			Success:   false,
-			Error:     err.Error(),
-		}
+		return errorResponse(commandID, ErrCodeTerminationFailed, err)
 	}
 
 	h.logger.Info("Termination successful",
-		"command_id", cmd.ID,
-		"provider", cmd.Provider,
-		"pod_id", cmd.PodID,
+		"command_id", commandID,
+		"provider", params.Provider,
 		"provider_pod_id", params.ProviderPodID)
 
-	return &websocket.Response{
-		CommandID: cmd.ID,
-		Success:   true,
-		Result: map[string]interface{}{
-			"terminated": true,
-		},
-	}
+	return websocket.NewSuccessResponse(commandID, &websocket.TerminateResult{Terminated: true})
 }
 
 // handleStatus processes a status command
-func (h *Handler) handleStatus(ctx context.Context, cmd *websocket.Command) *websocket.Response {
-	h.logger.Debug("Handling status command",
-		"command_id", cmd.ID,
-		"provider", cmd.Provider,
-		"pod_id", cmd.PodID)
-
-	// Parse status parameters
-	params, err := h.parseStatusParams(cmd.Params)
-	if err != nil {
-		h.logger.Error("Failed to parse status parameters",
-			"command_id", cmd.ID,
-			"error", err)
-		return &websocket.Response{
-			CommandID: cmd.ID,
-			Success:   false,
-			Error:     fmt.Sprintf("Failed to parse status parameters: %v", err),
-		}
+func (h *Handler) handleStatus(ctx context.Context, commandID string, cmd *websocket.Command) *websocket.Response {
+	var params websocket.StatusParams
+	if err := cmd.DecodeData(&params); err != nil {
+		h.logger.Error("Failed to parse status parameters", "command_id", commandID, "error", err)
+		return websocket.NewErrorResponse(commandID, ErrCodeInvalidParams,
+			fmt.Sprintf("failed to parse status parameters: %v", err), "")
 	}
 
-	// Get status
-	result, err := h.providerManager.GetStatus(ctx, string(cmd.Provider), params)
+	h.logger.Debug("Handling status command",
+		"command_id", commandID,
+		"provider", params.Provider,
+		"provider_pod_id", params.ProviderPodID)
+
+	result, err := h.providerManager.GetStatus(ctx, params.Provider, &params)
 	if err != nil {
 		h.logger.Error("Status check failed",
-			"command_id", cmd.ID,
-			"provider", cmd.Provider,
-			"pod_id", cmd.PodID,
+			"command_id", commandID,
+			"provider", params.Provider,
 			"provider_pod_id", params.ProviderPodID,
 			"error", err)
-		return &websocket.Response{
-			CommandID: cmd.ID,
-			Success:   false,
-			Error:     err.Error(),
-		}
+		return errorResponse(commandID, ErrCodeStatusFailed, err)
+	}
+
+	result.PodName = params.PodName
+	result.ProviderPodID = params.ProviderPodID
+	if result.Provider == "" {
+		result.Provider = params.Provider
 	}
 
 	h.logger.Debug("Status check successful",
-		"command_id", cmd.ID,
-		"provider", cmd.Provider,
-		"pod_id", cmd.PodID,
+		"command_id", commandID,
+		"provider", params.Provider,
 		"provider_pod_id", params.ProviderPodID,
 		"status", result.Status)
 
-	return &websocket.Response{
-		CommandID: cmd.ID,
-		Success:   true,
-		Result:    result,
-	}
+	return websocket.NewSuccessResponse(commandID, result)
 }
 
-// handlePing processes a ping command
-func (h *Handler) handlePing(ctx context.Context, cmd *websocket.Command) *websocket.Response {
-	h.logger.Debug("Handling ping command", "command_id", cmd.ID)
+// handlePing answers a ping command with an empty success response
+func (h *Handler) handlePing(_ context.Context, commandID string) *websocket.Response {
+	h.logger.Debug("Handling ping command", "command_id", commandID)
+	return websocket.NewSuccessResponse(commandID, map[string]interface{}{})
+}
 
-	// Test connectivity to all providers or specific provider
-	if cmd.Provider != "" {
-		// Test specific provider
-		provider, err := h.providerManager.GetProvider(string(cmd.Provider))
-		if err != nil {
-			return &websocket.Response{
-				CommandID: cmd.ID,
-				Success:   false,
-				Error:     err.Error(),
-			}
+// handleReject processes a reject command
+func (h *Handler) handleReject(ctx context.Context, commandID string, cmd *websocket.Command) *websocket.Response {
+	var params websocket.RejectParams
+	if err := cmd.DecodeData(&params); err != nil {
+		h.logger.Error("Failed to parse reject parameters", "command_id", commandID, "error", err)
+		return websocket.NewErrorResponse(commandID, ErrCodeInvalidParams,
+			fmt.Sprintf("failed to parse reject parameters: %v", err), "")
+	}
+
+	h.logger.Warn("Platform rejected pod",
+		"command_id", commandID,
+		"pod", websocket.PodKey(params.Namespace, params.PodName),
+		"code", params.Code,
+		"message", params.Message)
+
+	if h.rejectFunc == nil {
+		return websocket.NewErrorResponse(commandID, ErrCodeRejectFailed,
+			"no reject handler configured", "")
+	}
+
+	if err := h.rejectFunc(ctx, &params); err != nil {
+		h.logger.Error("Failed to apply rejection",
+			"command_id", commandID,
+			"pod", websocket.PodKey(params.Namespace, params.PodName),
+			"error", err)
+		return websocket.NewErrorResponse(commandID, ErrCodeRejectFailed, err.Error(), "")
+	}
+
+	return websocket.NewSuccessResponse(commandID, map[string]interface{}{})
+}
+
+// errorResponse builds an error response, surfacing provider error details when present.
+func errorResponse(commandID, code string, err error) *websocket.Response {
+	var providerErr *providers.ProviderError
+	if errors.As(err, &providerErr) {
+		if providerErr.Code != "" {
+			code = providerErr.Code
 		}
-
-		err = provider.Ping(ctx)
-		if err != nil {
-			return &websocket.Response{
-				CommandID: cmd.ID,
-				Success:   false,
-				Error:     err.Error(),
-			}
-		}
-
-		return &websocket.Response{
-			CommandID: cmd.ID,
-			Success:   true,
-			Result: map[string]interface{}{
-				"provider": cmd.Provider,
-				"status":   "healthy",
-				"timestamp": time.Now(),
-			},
-		}
+		return websocket.NewErrorResponse(commandID, code, providerErr.Error(), providerErr.Message)
 	}
-
-	// Test all providers
-	healthStatus := h.providerManager.HealthCheck(ctx)
-
-	return &websocket.Response{
-		CommandID: cmd.ID,
-		Success:   true,
-		Result: map[string]interface{}{
-			"providers": healthStatus,
-			"timestamp": time.Now(),
-		},
-	}
-}
-
-// parseDeployParams parses deploy parameters from command data
-func (h *Handler) parseDeployParams(params interface{}) (*websocket.DeployParams, error) {
-	data, err := json.Marshal(params)
-	if err != nil {
-		return nil, err
-	}
-
-	var deployParams websocket.DeployParams
-	err = json.Unmarshal(data, &deployParams)
-	return &deployParams, err
-}
-
-// parseTerminateParams parses terminate parameters from command data
-func (h *Handler) parseTerminateParams(params interface{}) (*websocket.TerminateParams, error) {
-	data, err := json.Marshal(params)
-	if err != nil {
-		return nil, err
-	}
-
-	var terminateParams websocket.TerminateParams
-	err = json.Unmarshal(data, &terminateParams)
-	return &terminateParams, err
-}
-
-// parseStatusParams parses status parameters from command data
-func (h *Handler) parseStatusParams(params interface{}) (*websocket.StatusParams, error) {
-	data, err := json.Marshal(params)
-	if err != nil {
-		return nil, err
-	}
-
-	var statusParams websocket.StatusParams
-	err = json.Unmarshal(data, &statusParams)
-	return &statusParams, err
+	return websocket.NewErrorResponse(commandID, code, err.Error(), "")
 }
 
 // GetProviderManager returns the provider manager (for testing)
@@ -308,18 +254,16 @@ func (h *Handler) GetAvailableProviders() []string {
 	return h.providerManager.ListProviders()
 }
 
-// ExecuteCommand is a convenience method that handles the full command processing pipeline
-func (h *Handler) ExecuteCommand(ctx context.Context, msg *websocket.Message) *websocket.Response {
+// ExecuteCommand handles a command envelope and logs the execution time
+func (h *Handler) ExecuteCommand(ctx context.Context, env *websocket.Envelope) *websocket.Response {
 	startTime := time.Now()
 
-	response := h.HandleCommand(ctx, msg)
+	response := h.HandleCommand(ctx, env)
 
-	duration := time.Since(startTime)
 	h.logger.Debug("Command execution completed",
-		"command_id", msg.ID,
-		"command_type", msg.Type,
-		"success", response.Success,
-		"duration_ms", duration.Milliseconds())
+		"command_id", env.ID,
+		"status", response.Status,
+		"duration_ms", time.Since(startTime).Milliseconds())
 
 	return response
 }

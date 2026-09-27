@@ -80,6 +80,35 @@ const (
 	StatusUnknown     = "UNKNOWN"
 )
 
+// Kubernetes pod phases reported in StatusResult.Phase
+const (
+	PhasePending   = "Pending"
+	PhaseRunning   = "Running"
+	PhaseSucceeded = "Succeeded"
+	PhaseFailed    = "Failed"
+	PhaseUnknown   = "Unknown"
+)
+
+// PhaseForStatus maps a standardized provider status to a Kubernetes pod phase.
+// successful decides between Succeeded and Failed for terminal statuses.
+func PhaseForStatus(standardStatus string, successful bool) string {
+	switch standardStatus {
+	case StatusPending, StatusStarting:
+		return PhasePending
+	case StatusRunning, StatusTerminating:
+		return PhaseRunning
+	case StatusTerminated, StatusExited:
+		if successful {
+			return PhaseSucceeded
+		}
+		return PhaseFailed
+	case StatusFailed:
+		return PhaseFailed
+	default:
+		return PhaseUnknown
+	}
+}
+
 // GetStandardStatus returns a standardized status from provider-specific status
 func GetStandardStatus(providerStatus string, provider string) string {
 	// This can be expanded to handle provider-specific mappings

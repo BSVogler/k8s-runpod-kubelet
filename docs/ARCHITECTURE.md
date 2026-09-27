@@ -240,14 +240,16 @@ This architecture enables:
      - Insufficient credits
      - Provider unavailable
      - Cost exceeds limits
-   - Send structured error response:
+   - Send a `reject` command:
      ```json
      {
-       "type": "error",
-       "code": "PLAN_LIMIT_EXCEEDED",
-       "message": "Free plan allows 2 concurrent pods. Upgrade to deploy more.",
-       "action": "keep_pending",
-       "upgrade_url": "https://platform.example.com/upgrade"
+       "type": "reject",
+       "data": {
+         "pod_name": "gpu-job-1", "namespace": "default",
+         "code": "quota_exceeded",
+         "message": "GPU hours quota exceeded. Upgrade at https://gpuconduit.io/dashboard/billing/",
+         "upgrade_url": "https://gpuconduit.io/dashboard/billing/"
+       }
      }
      ```
 
@@ -345,15 +347,17 @@ This architecture enables:
 ┌───────────────────────────────────────────────────────────────┐
 │  Conduit Kubelet                                              │
 │                                                               │
-│  11. Receive CommandDeploy:                                   │
+│  11. Receive deploy command:                                  │
 │      {                                                        │
 │        "type": "deploy",                                      │
-│        "provider": "vastai",                                  │
-│        "params": {                                            │
-│          "api_key": "encrypted_key_from_platform",            │
+│        "data": {                                              │
+│          "pod_name": "gpu-job-1", "namespace": "default",     │
+│          "provider": "vastai",                                │
+│          "api_key": "key_from_platform",   // platform mode   │
 │          "image": "pytorch/pytorch:latest",                   │
-│          "gpu_type": "RTX_4090",                              │
+│          "gpu_type_ids": ["RTX 4090"],                        │
 │          "gpu_count": 2,                                      │
+│          "command": ["python"], "args": ["train.py"],         │
 │          ...                                                  │
 │        }                                                      │
 │      }                                                        │
@@ -437,17 +441,17 @@ This architecture enables:
 │     ✗ Free plan (2 concurrent pods allowed)                   │
 │     ✗ Currently 2 pods running                                │
 │     ✗ LIMIT EXCEEDED                                          │
-│  7. Reject deployment - NO COMMAND SENT                       │
-│  8. Send rejection response:                                  │
+│  7. Reject deployment - NO DEPLOY COMMAND SENT                │
+│  8. Send reject command:                                      │
 │     {                                                         │
-│       "type": "rejection",                                    │
-│       "code": "PLAN_LIMIT_EXCEEDED",                          │
-│       "message": "Free plan allows 2 concurrent pods...",     │
-│       "action": "keep_pending",                               │
-│       "pod_name": "gpu-training-job-4",                       │
-│       "current_usage": 2,                                     │
-│       "plan_limit": 2,                                        │
-│       "upgrade_url": "https://..."                            │
+│       "type": "reject",                                       │
+│       "data": {                                               │
+│         "pod_name": "gpu-training-job-4",                     │
+│         "namespace": "default",                               │
+│         "code": "quota_exceeded",                             │
+│         "message": "Free plan allows 2 concurrent pods...",   │
+│         "upgrade_url": "https://..."                          │
+│       }                                                       │
 │     }                                                         │
 └───────────────────────────────────────────────────────────────┘
          │
@@ -457,14 +461,14 @@ This architecture enables:
 ┌───────────────────────────────────────────────────────────────┐
 │  Conduit Kubelet                                              │
 │                                                               │
-│  9. Receive rejection                                         │
-│  10. Create Kubernetes Event:                                 │
-│      Event Type: Warning                                      │
-│      Reason: PlanLimitExceeded                                │
+│  9. Receive reject command                                    │
+│  10. Set pod status:                                          │
+│      Phase:   Failed                                          │
+│      Reason:  quota_exceeded                                  │
 │      Message: "Free plan allows 2 concurrent pods.            │
 │               Upgrade to deploy more. https://..."            │
-│  11. Keep pod in PENDING state (do not fail)                  │
-│  12. User sees event in kubectl describe pod                  │
+│  11. Respond {"status": "success", "data": {}}                │
+│  12. User sees reason/message in kubectl describe pod         │
 └───────────────────────────────────────────────────────────────┘
          │
          │
@@ -476,7 +480,7 @@ This architecture enables:
 │  NAME                  STATUS    AGE                          │
 │  gpu-training-job-1    Running   10m                          │
 │  gpu-training-job-2    Running   5m                           │
-│  gpu-training-job-3    Pending   30s  ← Rejected             │
+│  gpu-training-job-3    Failed    30s  ← Rejected             │
 │                                                               │
 │  $ kubectl describe pod gpu-training-job-3                    │
 │  ...                                                          │
@@ -548,74 +552,74 @@ func (p *RunPodProvider) Deploy(ctx context.Context, params *DeployParams) (*Dep
 
 ---
 
-## Error Handling
+## WebSocket Protocol (v2)
 
-### Error Codes
-
-Platform can reject deployments with these codes:
-
-| Code | Description | Action |
-|------|-------------|--------|
-| `PLAN_LIMIT_EXCEEDED` | User has reached plan's concurrent pod limit | Keep pod pending, suggest upgrade |
-| `QUOTA_EXCEEDED` | User/team quota exceeded | Keep pod pending, notify admin |
-| `INSUFFICIENT_CREDITS` | Not enough credits/balance | Keep pod pending, request payment |
-| `PROVIDER_UNAVAILABLE` | Requested provider not available | Keep pod pending, may auto-resolve |
-| `COST_LIMIT_EXCEEDED` | Pod would exceed cost limits | Keep pod pending, adjust limits |
-| `REGION_RESTRICTED` | Provider not available in region | Keep pod pending, change region |
-| `GPU_NOT_AVAILABLE` | Requested GPU type unavailable | Keep pod pending, may auto-resolve |
-| `INVALID_CONFIGURATION` | Pod spec invalid | Fail pod, fix spec |
-
-### Rejection Response Format
+The kubelet and the platform exchange JSON envelopes over a single WebSocket
+(`wss://<host>/api/kubelet/ws?api_key=<token>`, bearer header also sent). The
+platform identifies the kubelet by its API token; that token is the `kubelet_id`.
 
 ```json
-{
-  "type": "rejection",
-  "code": "PLAN_LIMIT_EXCEEDED",
-  "message": "Human-readable error message",
-  "action": "keep_pending",           // or "fail_pod"
-  "pod_name": "gpu-job-123",
-  "details": {
-    "current_usage": 2,
-    "limit": 2,
-    "plan": "free"
-  },
-  "remediation": {
-    "title": "Upgrade to Pro",
-    "description": "Pro plan includes 10 concurrent pods",
-    "url": "https://platform.example.com/upgrade",
-    "cta": "Upgrade Now"
-  }
-}
+{"id": "<uuid>", "type": "command|response|event|heartbeat|kubelet_registration",
+ "payload": { ... }, "timestamp": "<RFC3339>", "kubelet_id": "<token>"}
 ```
 
-### Kubelet Rejection Handling
+| Envelope type          | Direction          | Payload |
+|------------------------|--------------------|---------|
+| `kubelet_registration` | kubelet → platform | `{id, type: "conduit-kubelet", cluster_name, node_name, namespace, capabilities, metadata: {version, internal_ip, key_mode}}` — sent after every (re)connect |
+| `heartbeat`            | kubelet → platform | `{timestamp, kubelet_id, status: "alive"}` every 30s |
+| `event`                | kubelet → platform | `{type: pod_created\|pod_deleted\|pod_status_change\|kubelet_ready\|kubelet_error, data}` |
+| `command`              | platform → kubelet | `{type: deploy\|terminate\|status\|ping\|reject, data}`; the envelope `id` is the command id |
+| `response`             | kubelet → platform | `{command_id, status: "success"\|"error", data \| null, error: {code, message, provider_error?} \| null}` |
 
-```go
-func (h *CommandHandler) handleRejection(rejection *Rejection) error {
-    // Create Kubernetes event
-    event := &corev1.Event{
-        Type:    corev1.EventTypeWarning,
-        Reason:  rejection.Code,
-        Message: rejection.Message,
-    }
-    h.kubeClient.CreateEvent(event)
+`deploy` data is flat and provider specific (the platform already converted the
+pod spec): `pod_name, namespace, provider, api_key?, image, name, env, ports,
+container_disk_in_gb, volume_in_gb, gpu_type_ids, gpu_count, min_ram_per_gpu,
+cloud_type, datacenter_ids, template_id, container_auth_id, max_price, command, args`.
+For RunPod, `command` → `dockerEntrypoint`, `args` → `dockerStartCmd`,
+`gpu_count` → `gpuCount` (omitted when 0), and terminate is `DELETE pods/{id}`
+(404/204 count as success).
 
-    // Update pod status based on action
-    switch rejection.Action {
-    case "keep_pending":
-        // Leave pod in Pending state
-        // Platform may resolve issue and retry
-        return nil
+`metadata.key_mode` is `local` when a provider key is configured on the kubelet
+(e.g. `RUNPOD_API_KEY`) and `platform` otherwise; in platform mode every
+command carries `api_key`.
 
-    case "fail_pod":
-        // Set pod status to Failed
-        pod.Status.Phase = corev1.PodFailed
-        pod.Status.Reason = rejection.Code
-        pod.Status.Message = rejection.Message
-        return h.kubeClient.UpdatePodStatus(pod)
-    }
-}
+The full contract lives in `pkg/websocket/protocol.go`; the Python side mirrors
+it in `conduit-service/src/conduit/websocket/protocol.py`.
+
+---
+
+## Error Handling
+
+### Rejections
+
+The platform refuses a pod with a `reject` command instead of `deploy`:
+
+```json
+{"type": "reject", "data": {
+  "pod_name": "gpu-job-123", "namespace": "default",
+  "code": "quota_exceeded",
+  "message": "GPU hours quota exceeded (10/10 h this month). Upgrade at https://gpuconduit.io/dashboard/billing/",
+  "upgrade_url": "https://gpuconduit.io/dashboard/billing/"}}
 ```
+
+| Code                   | Meaning |
+|------------------------|---------|
+| `quota_exceeded`       | Active instance limit or monthly GPU hours exhausted |
+| `no_api_key`           | Kubelet runs in platform key mode but no key is stored for the provider |
+| `unsupported_provider` | `conduit.io/provider` annotation names a provider the platform cannot drive |
+| `conversion_error`     | The pod spec could not be converted into provider parameters |
+| `provider_error`       | The provider call failed (message carries the provider error) |
+
+The kubelet sets the Kubernetes pod to `Failed` with `reason` = code and
+`message` = message, and answers `{"status": "success", "data": {}}`. The
+reason and message show up in `kubectl describe pod`.
+
+### Command errors
+
+Failed commands return `status: "error"` with a structured error:
+`{"code": "deployment_failed", "message": "runpod error deployment_failed: ...", "provider_error": "..."}`.
+For a failed `deploy`, the platform marks its record failed and follows up
+with `reject provider_error`.
 
 ---
 
@@ -696,6 +700,7 @@ func (h *CommandHandler) handleRejection(rejection *Rejection) error {
 # Environment Variables
 BACKEND_URL: "wss://platform.example.com/api/kubelet/ws"
 BACKEND_API_KEY: "kubelet_auth_token_xyz"
+CLUSTER_NAME: "prod-eu"          # reported in the registration (flag: --cluster-name)
 NODE_NAME: "virtual-gpu-node-1"
 LOG_LEVEL: "info"
 
@@ -703,8 +708,8 @@ LOG_LEVEL: "info"
 RUNPOD_API_KEY: "your_runpod_key"
 VASTAI_API_KEY: "your_vastai_key"
 
-# Key management mode
-KEY_MODE: "platform"  # or "local" or "hybrid"
+# Key mode is derived, not configured: "local" if any provider key above is
+# set, otherwise "platform" (the platform must send api_key with each command).
 ```
 
 ### Platform Configuration
